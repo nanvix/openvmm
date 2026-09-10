@@ -1145,6 +1145,7 @@ impl VmService {
         };
 
         let mut config = Config {
+            microvm_network: None,
             // TODO: devices, other stuff
             machine_profile,
             load_mode,
@@ -1385,6 +1386,9 @@ impl VmService {
         // Build VmController with no paravisor-specific fields.
         let controller = VmController {
             microvm_console_attachment: None,
+            microvm_network: None,
+            microvm_egress_policy: None,
+            microvm_network_attachment: None,
             microvm_console_socket_cleanup: None,
             snapshot_memory_handle: None,
             snapshot_requests: None,
@@ -1904,6 +1908,8 @@ fn parse_nic_config(
                 .map(parse_port_config)
                 .collect::<anyhow::Result<_>>()?,
             recv,
+
+            static_ipv4: None,
         }
         .into_resource(),
         _ => anyhow::bail!("unsupported backend"),
@@ -2405,6 +2411,11 @@ async fn build_virtio_device(
                     .parse::<MacAddress>()
                     .context("invalid mac address")?,
                 endpoint,
+
+                egress_policy: None,
+                save_restore: false,
+                static_ipv4: None,
+                effective_features: None,
             }
             .into_resource()
         }
@@ -2510,6 +2521,8 @@ fn build_nic_backend(
                     .map(parse_port_config)
                     .collect::<anyhow::Result<_>>()?,
                 recv: None,
+
+                static_ipv4: None,
             }
             .into_resource()
         }
