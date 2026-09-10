@@ -1084,6 +1084,7 @@ impl VmService {
         };
 
         let mut config = Config {
+            microvm_filesystem: None,
             microvm_network: None,
             // TODO: devices, other stuff
             machine_profile,
@@ -1325,6 +1326,9 @@ impl VmService {
         // Build VmController with no paravisor-specific fields.
         let controller = VmController {
             microvm_console_attachment: None,
+            microvm_filesystem: None,
+            microvm_filesystem_root_path: None,
+            microvm_filesystem_attachment: None,
             microvm_network: None,
             microvm_egress_policy: None,
             microvm_network_attachment: None,
@@ -2364,6 +2368,7 @@ fn build_virtio_fs(
                 String::new()
             },
         },
+        profile: virtio_resources::fs::VirtioFsProfile::Standard,
     })
 }
 
