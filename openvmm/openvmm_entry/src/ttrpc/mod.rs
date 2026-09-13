@@ -1416,6 +1416,7 @@ impl VmService {
             }
         };
 
+        let has_microvm_portb_output = ports[0].is_some();
         let microvm_portb = if machine_profile == OpenvmmMachineProfile::Microvm {
             if ports.iter().skip(1).any(Option::is_some) {
                 bail!("microVM accepts only serial port 0 as its portb endpoint");
@@ -1452,7 +1453,13 @@ impl VmService {
         let mut chipset = chipset_builder
             .build()
             .context("failed to build vm configuration")?;
+        let mut microvm_output_drain = None;
         if let Some(io) = microvm_portb {
+            let output_drain = has_microvm_portb_output.then(|| {
+                let (drain, requests) = crate::microvm_output::MicrovmOutputDrain::new(None);
+                microvm_output_drain = Some(drain);
+                requests
+            });
             let restore_memory_ranges = authoritative_restore
                 .as_ref()
                 .map(|restore| restore.restore_memory_ranges.as_slice())
@@ -1479,6 +1486,7 @@ impl VmService {
                         io,
                         generation_id,
                         restore_entropy,
+                        output_drain,
                     }
                     .into_resource(),
                 },
@@ -2210,6 +2218,7 @@ impl VmService {
             microvm_filesystem_root_path,
             microvm_filesystem_attachment,
             microvm_console_socket_cleanup,
+            microvm_output_drain,
             snapshot_memory_file,
             _private_scratch_dir: None,
             guest_power_actions,
