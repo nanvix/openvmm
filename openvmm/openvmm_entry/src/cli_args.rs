@@ -1679,10 +1679,6 @@ impl Options {
         }
 
         anyhow::ensure!(
-            cfg!(guest_arch = "x86_64"),
-            "microVM requires an x86-64 guest"
-        );
-        anyhow::ensure!(
             openvmm_defs::config::microvm_processor_count_supported(self.processors),
             "microVM does not support {} vCPUs",
             self.processors
@@ -1692,12 +1688,26 @@ impl Options {
             "microVM does not support custom NUMA topology"
         );
         anyhow::ensure!(
-            self.vps_per_socket.is_none()
-                && self.smt == SmtConfigCli::Auto
-                && self.apic_id_offset == 0
-                && matches!(self.x2apic, X2ApicConfig::Auto),
-            "microVM owns CPU topology and APIC configuration"
+            self.vps_per_socket.is_none() && self.smt == SmtConfigCli::Auto,
+            "microVM owns CPU topology"
         );
+        #[cfg(guest_arch = "x86_64")]
+        anyhow::ensure!(
+            self.apic_id_offset == 0 && matches!(self.x2apic, X2ApicConfig::Auto),
+            "microVM owns APIC configuration"
+        );
+        #[cfg(guest_arch = "aarch64")]
+        anyhow::ensure!(
+            matches!(self.gic_msi, GicMsiCli::Auto) && self.smmu.is_empty(),
+            "microVM owns GIC configuration"
+        );
+        #[cfg(guest_arch = "aarch64")]
+        if let Some(hypervisor) = self.hypervisor.as_deref() {
+            anyhow::ensure!(
+                hypervisor.split(':').next() == Some("kvm"),
+                "aarch64 microVM requires the KVM hypervisor"
+            );
+        }
         if self.snapshot_destination.is_some() {
             anyhow::ensure!(
                 !self.private_memory(),
@@ -1748,7 +1758,7 @@ impl Options {
         }
         anyhow::ensure!(
             !self.uefi && !self.pcat && self.igvm.is_none() && !self.device_tree,
-            "microVM requires Xen PVH direct boot"
+            "microVM owns its architecture-specific direct boot mode"
         );
         anyhow::ensure!(
             !self.uefi_debug
@@ -1942,15 +1952,16 @@ impl Options {
                 || self.restore_snapshot.is_some(),
             "--allow-host, --block-host, and --allow-endpoint require --net or a networked snapshot restore"
         );
+        let pcie_is_empty = self.cxl_test.is_empty()
+            && self.pcie_root_complex.is_empty()
+            && self.pcie_root_port.is_empty()
+            && self.pcie_switch.is_empty()
+            && self.pcie_generic_initiator.is_empty()
+            && self.pcie_remote.is_empty();
+        #[cfg(guest_arch = "x86_64")]
+        let pcie_is_empty = pcie_is_empty && self.amd_iommu.is_empty() && self.intel_vtd.is_empty();
         anyhow::ensure!(
-            self.cxl_test.is_empty()
-                && self.pcie_root_complex.is_empty()
-                && self.pcie_root_port.is_empty()
-                && self.pcie_switch.is_empty()
-                && self.pcie_generic_initiator.is_empty()
-                && self.pcie_remote.is_empty()
-                && self.amd_iommu.is_empty()
-                && self.intel_vtd.is_empty(),
+            pcie_is_empty,
             "microVM does not support PCIe or IOMMU devices"
         );
         #[cfg(windows)]

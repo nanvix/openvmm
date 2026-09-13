@@ -630,6 +630,8 @@ pub(crate) enum VmmTestTargetCli {
     WindowsX64,
     /// Linux X64
     LinuxX64,
+    /// Linux Aarch64
+    LinuxAarch64,
     /// Linux Aarch64 (musl, for incubator cross-compilation)
     LinuxAarch64Musl,
 }
@@ -649,6 +651,7 @@ pub(crate) fn resolve_target(
             (FlowArch::Aarch64, FlowPlatform::Windows) => VmmTestTargetCli::WindowsAarch64,
             (FlowArch::X86_64, FlowPlatform::Windows) => VmmTestTargetCli::WindowsX64,
             (FlowArch::X86_64, FlowPlatform::Linux(_)) => VmmTestTargetCli::LinuxX64,
+            (FlowArch::Aarch64, FlowPlatform::Linux(_)) => VmmTestTargetCli::LinuxAarch64,
             _ => anyhow::bail!("unsupported host"),
         }
     };
@@ -657,6 +660,7 @@ pub(crate) fn resolve_target(
         VmmTestTargetCli::WindowsAarch64 => CommonTriple::AARCH64_WINDOWS_MSVC,
         VmmTestTargetCli::WindowsX64 => CommonTriple::X86_64_WINDOWS_MSVC,
         VmmTestTargetCli::LinuxX64 => CommonTriple::X86_64_LINUX_GNU,
+        VmmTestTargetCli::LinuxAarch64 => CommonTriple::AARCH64_LINUX_GNU,
         VmmTestTargetCli::LinuxAarch64Musl => CommonTriple::AARCH64_LINUX_MUSL,
     })
 }

@@ -25,11 +25,8 @@ vm_resource::register_static_resolvers! {
     chipset_legacy::i440bx_host_pci_bridge::resolver::I440BxHostPciBridgeResolver,
     #[cfg(guest_arch = "x86_64")]
     chipset::pit::resolver::PitResolver,
-    #[cfg(guest_arch = "x86_64")]
     chipset::microvm::resolver::MicrovmPortbResolver,
-    #[cfg(guest_arch = "x86_64")]
     chipset::microvm::resolver::MicrovmShutdownResolver,
-    #[cfg(guest_arch = "x86_64")]
     chipset::microvm::resolver::MicrovmSnapshotRequestResolver,
     #[cfg(guest_arch = "x86_64")]
     chipset::pic::resolver::PicResolver,

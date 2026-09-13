@@ -250,6 +250,8 @@ fn build_dt(
     cfg: &KernelConfig<'_>,
     _gm: &GuestMemory,
     enable_serial: bool,
+    microvm: bool,
+    microvm_virtio_devices: &[(u64, u32)],
     processor_topology: &ProcessorTopology<Aarch64Topology>,
     pcie_host_bridges: &[PcieHostBridge],
     smmu_configs: &[vmm_core::acpi_builder::AcpiSmmuConfig],
@@ -413,6 +415,45 @@ fn build_dt(
         mem = mem.add_str(p_device_type, "memory")?;
         mem = mem.add_u64_array(p_reg, &[start, len])?;
         root_builder = mem.end_node()?;
+    }
+
+    if microvm {
+        for &(base, irq) in microvm_virtio_devices {
+            let device = root_builder
+                .start_node(&format!("virtio_mmio@{base:x}"))?
+                .add_str(p_compatible, "virtio,mmio")?
+                .add_u64_array(
+                    p_reg,
+                    &[base, openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN],
+                )?
+                .add_u32_array(p_interrupts, &[GIC_SPI, irq, IRQ_TYPE_LEVEL_HIGH])?
+                .add_null(p_dma_coherent)?;
+            root_builder = device.end_node()?;
+        }
+
+        for (base, compatible) in [
+            (
+                openvmm_defs::config::MICROVM_CONTROL_MMIO_BASE,
+                "microsoft,nvx-control",
+            ),
+            (
+                openvmm_defs::config::MICROVM_SHUTDOWN_MMIO_BASE,
+                "microsoft,nvx-shutdown",
+            ),
+            (
+                openvmm_defs::config::MICROVM_SNAPSHOT_MMIO_BASE,
+                "microsoft,nvx-snapshot",
+            ),
+        ] {
+            let device = root_builder
+                .start_node(&format!("nvx@{base:x}"))?
+                .add_str(p_compatible, compatible)?
+                .add_u64_array(
+                    p_reg,
+                    &[base, openvmm_defs::config::MICROVM_CONTROL_MMIO_LEN],
+                )?;
+            root_builder = device.end_node()?;
+        }
     }
 
     // Advanced Bus Peripheral Clock.
@@ -974,6 +1015,8 @@ pub fn load_linux_arm64(
     cfg: &KernelConfig<'_>,
     gm: &GuestMemory,
     enable_serial: bool,
+    microvm: bool,
+    microvm_virtio_devices: &[(u64, u32)],
     processor_topology: &ProcessorTopology<Aarch64Topology>,
     pcie_host_bridges: &[PcieHostBridge],
     smmu_configs: &[vmm_core::acpi_builder::AcpiSmmuConfig],
@@ -1037,6 +1080,8 @@ pub fn load_linux_arm64(
             cfg,
             gm,
             enable_serial,
+            microvm,
+            microvm_virtio_devices,
             processor_topology,
             pcie_host_bridges,
             smmu_configs,

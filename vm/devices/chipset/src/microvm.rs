@@ -10,6 +10,7 @@ use chipset_device::io::IoError;
 use chipset_device::io::IoResult;
 use chipset_device::io::deferred::DeferredWrite;
 use chipset_device::io::deferred::defer_write;
+use chipset_device::mmio::MmioIntercept;
 use chipset_device::pio::PortIoIntercept;
 use chipset_device::poll_device::PollDevice;
 use futures::AsyncRead;
@@ -36,9 +37,15 @@ const DATA_PORT: u16 = 0xe9;
 const STATUS_PORT: u16 = 0xea;
 const SHUTDOWN_PORT: u16 = 0x604;
 const SNAPSHOT_PORT: u16 = 0x605;
+const CONTROL_MMIO_BASE: u64 = 0xd000_7000;
+const SHUTDOWN_MMIO_BASE: u64 = 0xd000_8000;
+const SNAPSHOT_MMIO_BASE: u64 = 0xd000_9000;
+const CONTROL_MMIO_SIZE: u64 = 0x1000;
 const RESTORE_ENTROPY_SELECT: u8 = 0xa5;
 const GENERATION_ID_SELECT: u8 = 0xa6;
+const WALL_CLOCK_SELECT: u8 = 0xa7;
 const GENERATION_ID_SIZE: usize = 16;
+const WALL_CLOCK_SIZE: usize = size_of::<u64>();
 const RESTORE_PROCESSOR_TARGET_PACKET_HEADER: &[u8] = b"OPENVMM_ENTROPY_V2\0";
 const RESTORE_MEMORY_TARGET_PACKET_HEADER: &[u8] = b"OPENVMM_ENTROPY_V3\0";
 const STATUS_INPUT_AVAILABLE: u8 = 1 << 0;
@@ -54,6 +61,8 @@ const BUFFER_MAX: usize = 1024 * 1024;
 pub struct MicrovmPortb {
     #[inspect(skip)]
     io_region: (&'static str, RangeInclusive<u16>),
+    #[inspect(skip)]
+    mmio_region: (&'static str, RangeInclusive<u64>),
     #[inspect(mut)]
     io: Box<dyn SerialIo>,
     #[inspect(with = "VecDeque::len")]
@@ -62,6 +71,8 @@ pub struct MicrovmPortb {
     tx_buffer: VecDeque<u8>,
     generation_id: [u8; GENERATION_ID_SIZE],
     generation_id_read_index: Option<usize>,
+    wall_clock: [u8; WALL_CLOCK_SIZE],
+    wall_clock_read_index: Option<usize>,
     #[inspect(with = "VecDeque::len")]
     restore_entropy: VecDeque<u8>,
     restore_entropy_selected: bool,
@@ -95,11 +106,17 @@ impl MicrovmPortb {
             .is_some_and(|range_count| restore_memory_target_available && *range_count != 0);
         Self {
             io_region: ("microvm-portb", DATA_PORT..=STATUS_PORT),
+            mmio_region: (
+                "microvm-control",
+                CONTROL_MMIO_BASE..=CONTROL_MMIO_BASE + CONTROL_MMIO_SIZE - 1,
+            ),
             io,
             rx_buffer: VecDeque::new(),
             tx_buffer: VecDeque::new(),
             generation_id,
             generation_id_read_index: None,
+            wall_clock: [0; WALL_CLOCK_SIZE],
+            wall_clock_read_index: None,
             restore_entropy: restore_entropy.into(),
             restore_entropy_selected: false,
             restore_processor_target_available,
@@ -199,6 +216,7 @@ impl ChangeDeviceState for MicrovmPortb {
         self.tx_buffer.clear();
         self.restore_entropy.clear();
         self.generation_id_read_index = None;
+        self.wall_clock_read_index = None;
         self.restore_entropy_selected = false;
         self.restore_processor_target_available = false;
         self.restore_memory_target_available = false;
@@ -209,7 +227,11 @@ impl ChangeDeviceState for MicrovmPortb {
 
 impl ChipsetDevice for MicrovmPortb {
     fn supports_pio(&mut self) -> Option<&mut dyn PortIoIntercept> {
-        Some(self)
+        cfg!(guest_arch = "x86_64").then_some(self)
+    }
+
+    fn supports_mmio(&mut self) -> Option<&mut dyn MmioIntercept> {
+        cfg!(guest_arch = "aarch64").then_some(self)
     }
 
     fn supports_poll_device(&mut self) -> Option<&mut dyn PollDevice> {
@@ -244,13 +266,64 @@ impl PortIoIntercept for MicrovmPortb {
         if data.is_empty() {
             return IoResult::Err(IoError::InvalidAccessSize);
         }
+        let register = match io_port {
+            DATA_PORT => 0,
+            STATUS_PORT => 1,
+            _ => return IoResult::Err(IoError::InvalidRegister),
+        };
+        self.read_register(register, data)
+    }
+
+    fn io_write(&mut self, io_port: u16, data: &[u8]) -> IoResult {
+        let register = match io_port {
+            DATA_PORT => 0,
+            STATUS_PORT => 1,
+            _ => return IoResult::Err(IoError::InvalidRegister),
+        };
+        self.write_register(register, data)
+    }
+
+    fn get_static_regions(&mut self) -> &[(&str, RangeInclusive<u16>)] {
+        std::slice::from_ref(&self.io_region)
+    }
+}
+
+impl MmioIntercept for MicrovmPortb {
+    fn mmio_read(&mut self, addr: u64, data: &mut [u8]) -> IoResult {
+        if data.is_empty() {
+            return IoResult::Err(IoError::InvalidAccessSize);
+        }
+        let Some(register) = addr.checked_sub(CONTROL_MMIO_BASE) else {
+            return IoResult::Err(IoError::InvalidRegister);
+        };
+        self.read_register(register, data)
+    }
+
+    fn mmio_write(&mut self, addr: u64, data: &[u8]) -> IoResult {
+        let Some(register) = addr.checked_sub(CONTROL_MMIO_BASE) else {
+            return IoResult::Err(IoError::InvalidRegister);
+        };
+        self.write_register(register, data)
+    }
+
+    fn get_static_regions(&mut self) -> &[(&str, RangeInclusive<u64>)] {
+        std::slice::from_ref(&self.mmio_region)
+    }
+}
+
+impl MicrovmPortb {
+    fn read_register(&mut self, register: u64, data: &mut [u8]) -> IoResult {
         data.fill(0);
-        match io_port {
-            DATA_PORT => {
+        match register {
+            0 => {
                 if let Some(index) = self.generation_id_read_index {
                     data[0] = self.generation_id[index];
                     self.generation_id_read_index =
                         (index + 1 < self.generation_id.len()).then_some(index + 1);
+                } else if let Some(index) = self.wall_clock_read_index {
+                    data[0] = self.wall_clock[index];
+                    self.wall_clock_read_index =
+                        (index + 1 < self.wall_clock.len()).then_some(index + 1);
                 } else if self.restore_entropy_selected {
                     data[0] = self.restore_entropy.pop_front().unwrap_or(0);
                     if self.restore_entropy.is_empty() {
@@ -264,9 +337,10 @@ impl PortIoIntercept for MicrovmPortb {
                     self.wake_rx();
                 }
             }
-            STATUS_PORT => {
+            1 => {
                 data[0] = if !self.input_gated
                     && self.generation_id_read_index.is_none()
+                    && self.wall_clock_read_index.is_none()
                     && !self.restore_entropy_selected
                     && !self.rx_buffer.is_empty()
                 {
@@ -293,9 +367,9 @@ impl PortIoIntercept for MicrovmPortb {
         IoResult::Ok
     }
 
-    fn io_write(&mut self, io_port: u16, data: &[u8]) -> IoResult {
-        match io_port {
-            DATA_PORT => {
+    fn write_register(&mut self, register: u64, data: &[u8]) -> IoResult {
+        match register {
+            0 => {
                 let available = BUFFER_MAX - self.tx_buffer.len();
                 self.tx_buffer.extend(data.iter().copied().take(available));
                 if data.len() > available {
@@ -306,24 +380,32 @@ impl PortIoIntercept for MicrovmPortb {
                 }
                 self.wake_tx();
             }
-            STATUS_PORT => match data.first() {
+            1 => match data.first() {
                 Some(&RESTORE_ENTROPY_SELECT) if !self.restore_entropy.is_empty() => {
                     self.generation_id_read_index = None;
+                    self.wall_clock_read_index = None;
                     self.restore_entropy_selected = true;
                 }
                 Some(&GENERATION_ID_SELECT) => {
                     self.restore_entropy_selected = false;
+                    self.wall_clock_read_index = None;
                     self.generation_id_read_index = Some(0);
+                }
+                Some(&WALL_CLOCK_SELECT) => {
+                    self.restore_entropy_selected = false;
+                    self.generation_id_read_index = None;
+                    let seconds = std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    self.wall_clock = seconds.to_le_bytes();
+                    self.wall_clock_read_index = Some(0);
                 }
                 _ => {}
             },
             _ => return IoResult::Err(IoError::InvalidRegister),
         }
         IoResult::Ok
-    }
-
-    fn get_static_regions(&mut self) -> &[(&str, RangeInclusive<u16>)] {
-        std::slice::from_ref(&self.io_region)
     }
 }
 
@@ -350,6 +432,7 @@ impl SaveRestore for MicrovmPortb {
         self.rx_buffer = state.rx_buffer.into();
         self.tx_buffer = state.tx_buffer.into();
         self.generation_id_read_index = None;
+        self.wall_clock_read_index = None;
         self.restore_entropy_selected = false;
         Ok(())
     }
@@ -373,6 +456,8 @@ pub struct MicrovmShutdown {
     #[inspect(skip)]
     io_region: (&'static str, RangeInclusive<u16>),
     #[inspect(skip)]
+    mmio_region: (&'static str, RangeInclusive<u64>),
+    #[inspect(skip)]
     power_request: PowerRequestClient,
 }
 
@@ -381,6 +466,10 @@ impl MicrovmShutdown {
     pub fn new(power_request: PowerRequestClient) -> Self {
         Self {
             io_region: ("microvm-shutdown", SHUTDOWN_PORT..=SHUTDOWN_PORT),
+            mmio_region: (
+                "microvm-shutdown",
+                SHUTDOWN_MMIO_BASE..=SHUTDOWN_MMIO_BASE + CONTROL_MMIO_SIZE - 1,
+            ),
             power_request,
         }
     }
@@ -394,7 +483,36 @@ impl ChangeDeviceState for MicrovmShutdown {
 
 impl ChipsetDevice for MicrovmShutdown {
     fn supports_pio(&mut self) -> Option<&mut dyn PortIoIntercept> {
-        Some(self)
+        cfg!(guest_arch = "x86_64").then_some(self)
+    }
+
+    fn supports_mmio(&mut self) -> Option<&mut dyn MmioIntercept> {
+        cfg!(guest_arch = "aarch64").then_some(self)
+    }
+}
+
+impl MmioIntercept for MicrovmShutdown {
+    fn mmio_read(&mut self, addr: u64, data: &mut [u8]) -> IoResult {
+        if addr != SHUTDOWN_MMIO_BASE {
+            return IoResult::Err(IoError::InvalidRegister);
+        }
+        data.fill(0xff);
+        IoResult::Ok
+    }
+
+    fn mmio_write(&mut self, addr: u64, data: &[u8]) -> IoResult {
+        if addr != SHUTDOWN_MMIO_BASE {
+            return IoResult::Err(IoError::InvalidRegister);
+        }
+        self.power_request
+            .power_request(PowerRequest::PowerOffWithStatus {
+                code: data.first().copied().unwrap_or(0),
+            });
+        IoResult::Ok
+    }
+
+    fn get_static_regions(&mut self) -> &[(&str, RangeInclusive<u64>)] {
+        std::slice::from_ref(&self.mmio_region)
     }
 }
 
@@ -441,6 +559,8 @@ pub struct MicrovmSnapshotRequest {
     #[inspect(skip)]
     io_region: (&'static str, RangeInclusive<u16>),
     #[inspect(skip)]
+    mmio_region: (&'static str, RangeInclusive<u64>),
+    #[inspect(skip)]
     notify: Option<mesh::Sender<chipset_resources::microvm::MicrovmSnapshotBoundaryRequest>>,
     input_gate_timeout: std::time::Duration,
     #[inspect(skip)]
@@ -465,11 +585,56 @@ impl MicrovmSnapshotRequest {
     ) -> Self {
         Self {
             io_region: ("microvm-snapshot-request", SNAPSHOT_PORT..=SNAPSHOT_PORT),
+            mmio_region: (
+                "microvm-snapshot-request",
+                SNAPSHOT_MMIO_BASE..=SNAPSHOT_MMIO_BASE + CONTROL_MMIO_SIZE - 1,
+            ),
             notify,
             input_gate_timeout,
             pending: None,
             poll_waker: None,
         }
+    }
+
+    fn request_snapshot(&mut self, data: &[u8]) -> IoResult {
+        use mesh::rpc::RpcSend;
+
+        if self.pending.is_some() {
+            tracelimit::warn_ratelimited!("coalescing duplicate microVM snapshot request");
+            return IoResult::Ok;
+        }
+        if let Some(notify) = &self.notify {
+            let scratch_policy = if data.first().copied().unwrap_or(0) == 0 {
+                chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Fresh
+            } else {
+                chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Paired
+            };
+            let (deferred_write, token) = defer_write();
+            let (release_write, release_recv) = mesh::oneshot();
+            let (write_completed, write_completed_recv) = mesh::oneshot();
+            let transaction_complete = notify.call(
+                |transaction_complete| chipset_resources::microvm::MicrovmSnapshotBoundaryRequest {
+                    scratch_policy,
+                    release_write,
+                    write_completed: write_completed_recv,
+                    input_gate_timeout: self.input_gate_timeout,
+                    transaction_complete,
+                },
+                (),
+            );
+            self.pending = Some(PendingSnapshotWrite {
+                release_write: release_recv,
+                deferred_write: Some(deferred_write),
+                write_completed: Some(write_completed),
+                transaction_complete,
+                write_released: false,
+            });
+            if let Some(waker) = &self.poll_waker {
+                waker.wake_by_ref();
+            }
+            return IoResult::Defer(token);
+        }
+        IoResult::Ok
     }
 }
 
@@ -499,7 +664,11 @@ impl ChangeDeviceState for MicrovmSnapshotRequest {
 
 impl ChipsetDevice for MicrovmSnapshotRequest {
     fn supports_pio(&mut self) -> Option<&mut dyn PortIoIntercept> {
-        Some(self)
+        cfg!(guest_arch = "x86_64").then_some(self)
+    }
+
+    fn supports_mmio(&mut self) -> Option<&mut dyn MmioIntercept> {
+        cfg!(guest_arch = "aarch64").then_some(self)
     }
 
     fn supports_poll_device(&mut self) -> Option<&mut dyn PollDevice> {
@@ -544,51 +713,35 @@ impl PortIoIntercept for MicrovmSnapshotRequest {
     }
 
     fn io_write(&mut self, io_port: u16, data: &[u8]) -> IoResult {
-        use mesh::rpc::RpcSend;
-
         if io_port != SNAPSHOT_PORT {
             return IoResult::Err(IoError::InvalidRegister);
         }
-        if self.pending.is_some() {
-            tracelimit::warn_ratelimited!("coalescing duplicate microVM snapshot request");
-            return IoResult::Ok;
-        }
-        if let Some(notify) = &self.notify {
-            let scratch_policy = if data.first().copied().unwrap_or(0) == 0 {
-                chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Fresh
-            } else {
-                chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Paired
-            };
-            let (deferred_write, token) = defer_write();
-            let (release_write, release_recv) = mesh::oneshot();
-            let (write_completed, write_completed_recv) = mesh::oneshot();
-            let transaction_complete = notify.call(
-                |transaction_complete| chipset_resources::microvm::MicrovmSnapshotBoundaryRequest {
-                    scratch_policy,
-                    release_write,
-                    write_completed: write_completed_recv,
-                    input_gate_timeout: self.input_gate_timeout,
-                    transaction_complete,
-                },
-                (),
-            );
-            self.pending = Some(PendingSnapshotWrite {
-                release_write: release_recv,
-                deferred_write: Some(deferred_write),
-                write_completed: Some(write_completed),
-                transaction_complete,
-                write_released: false,
-            });
-            if let Some(waker) = &self.poll_waker {
-                waker.wake_by_ref();
-            }
-            return IoResult::Defer(token);
-        }
-        IoResult::Ok
+        self.request_snapshot(data)
     }
 
     fn get_static_regions(&mut self) -> &[(&str, RangeInclusive<u16>)] {
         std::slice::from_ref(&self.io_region)
+    }
+}
+
+impl MmioIntercept for MicrovmSnapshotRequest {
+    fn mmio_read(&mut self, addr: u64, data: &mut [u8]) -> IoResult {
+        if addr != SNAPSHOT_MMIO_BASE {
+            return IoResult::Err(IoError::InvalidRegister);
+        }
+        data.fill(0xff);
+        IoResult::Ok
+    }
+
+    fn mmio_write(&mut self, addr: u64, data: &[u8]) -> IoResult {
+        if addr != SNAPSHOT_MMIO_BASE {
+            return IoResult::Err(IoError::InvalidRegister);
+        }
+        self.request_snapshot(data)
+    }
+
+    fn get_static_regions(&mut self) -> &[(&str, RangeInclusive<u64>)] {
+        std::slice::from_ref(&self.mmio_region)
     }
 }
 

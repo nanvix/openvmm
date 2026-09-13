@@ -42,6 +42,8 @@ pub const MICROVM_MEMORY_BLOCK_SIZE_BYTES: u64 =
     openvmm_defs::config::MICROVM_MEMORY_BLOCK_SIZE_BYTES;
 /// Snapshot contract name for shared-status edge interrupts.
 pub const MICROVM_SHARED_STATUS_INTERRUPT_MODE: &str = "edge-shared-status";
+/// Snapshot contract name for conventional level-triggered virtio-mmio interrupts.
+pub const MICROVM_LEGACY_INTERRUPT_MODE: &str = "level-legacy";
 /// Clock policy applied when a snapshot is restored.
 pub const ADVANCE_BY_HOST_DOWNTIME: &str = "advance_by_host_downtime";
 /// Fleet-wide snapshot captured before image and sandbox configuration is consumed.
@@ -748,10 +750,17 @@ pub fn microvm_machine_contract(
     apic_frequency_hz: Option<u64>,
     cpu_contract: Vec<u8>,
 ) -> anyhow::Result<SnapshotMachineContract> {
-    anyhow::ensure!(
-        matches!(source_hypervisor, "kvm" | "mshv" | "whp"),
-        "microVM snapshots require the KVM, MSHV, or WHP hypervisor"
-    );
+    if cfg!(guest_arch = "aarch64") {
+        anyhow::ensure!(
+            source_hypervisor == "kvm",
+            "aarch64 microVM snapshots require the KVM hypervisor"
+        );
+    } else {
+        anyhow::ensure!(
+            matches!(source_hypervisor, "kvm" | "mshv" | "whp"),
+            "microVM snapshots require the KVM, MSHV, or WHP hypervisor"
+        );
+    }
     let topology = microvm_snapshot_topology(processor_count)?;
     let boot_online_vp_count =
         microvm_boot_online_vp_count(processor_count, &effective_command_line)?;
@@ -813,57 +822,113 @@ pub fn microvm_machine_contract(
         device("partition", "partition", "partition", Vec::new(), None, 0),
         device("vp0", "partition", "vcpu", Vec::new(), None, 1),
         device("vmtime", "vmtime", "clock", Vec::new(), None, 2),
-        device(
-            "pic",
-            "pic",
-            "pic",
-            vec![pmio(0x20, 2), pmio(0xa0, 2)],
-            None,
-            3,
-        ),
-        device(
-            "ioapic",
-            "ioapic",
-            "ioapic",
-            vec![mmio(0xfec0_0000, 0x1000)],
-            None,
-            4,
-        ),
-        device(
-            "lapic",
-            "partition",
-            "lapic",
-            vec![mmio(0xfee0_0000, 0x1000)],
-            None,
-            5,
-        ),
-        device("pit", "pit", "pit", vec![pmio(0x40, 4)], Some(0), 6),
-        device("rtc", "rtc", "rtc", vec![pmio(0x70, 2)], Some(8), 7),
-        device(
-            "microvm-portb",
-            "microvm-portb",
-            "portb",
-            vec![pmio(0xe9, 2)],
-            None,
-            8,
-        ),
-        device(
-            "microvm-shutdown",
-            "microvm-shutdown",
-            "shutdown",
-            vec![pmio(0x604, 1)],
-            None,
-            9,
-        ),
-        device(
-            "microvm-snapshot-request",
-            "microvm-snapshot-request",
-            "snapshot-request",
-            vec![pmio(0x605, 1)],
-            None,
-            10,
-        ),
     ];
+    if cfg!(guest_arch = "x86_64") {
+        devices.extend([
+            device(
+                "pic",
+                "pic",
+                "pic",
+                vec![pmio(0x20, 2), pmio(0xa0, 2)],
+                None,
+                3,
+            ),
+            device(
+                "ioapic",
+                "ioapic",
+                "ioapic",
+                vec![mmio(0xfec0_0000, 0x1000)],
+                None,
+                4,
+            ),
+            device(
+                "lapic",
+                "partition",
+                "lapic",
+                vec![mmio(0xfee0_0000, 0x1000)],
+                None,
+                5,
+            ),
+            device("pit", "pit", "pit", vec![pmio(0x40, 4)], Some(0), 6),
+            device("rtc", "rtc", "rtc", vec![pmio(0x70, 2)], Some(8), 7),
+            device(
+                "microvm-portb",
+                "microvm-portb",
+                "portb",
+                vec![pmio(0xe9, 2)],
+                None,
+                8,
+            ),
+            device(
+                "microvm-shutdown",
+                "microvm-shutdown",
+                "shutdown",
+                vec![pmio(0x604, 1)],
+                None,
+                9,
+            ),
+            device(
+                "microvm-snapshot-request",
+                "microvm-snapshot-request",
+                "snapshot-request",
+                vec![pmio(0x605, 1)],
+                None,
+                10,
+            ),
+        ]);
+    } else {
+        devices.extend([
+            device(
+                "com1",
+                "com1",
+                "pl011",
+                vec![mmio(0xeffe_c000, 0x1000)],
+                Some(1),
+                3,
+            ),
+            device(
+                "com2",
+                "com2",
+                "pl011",
+                vec![mmio(0xeffe_b000, 0x1000)],
+                Some(2),
+                4,
+            ),
+            device(
+                "microvm-portb",
+                "microvm-portb",
+                "control-console",
+                vec![mmio(
+                    openvmm_defs::config::MICROVM_CONTROL_MMIO_BASE,
+                    openvmm_defs::config::MICROVM_CONTROL_MMIO_LEN,
+                )],
+                None,
+                5,
+            ),
+            device(
+                "microvm-shutdown",
+                "microvm-shutdown",
+                "shutdown",
+                vec![mmio(
+                    openvmm_defs::config::MICROVM_SHUTDOWN_MMIO_BASE,
+                    openvmm_defs::config::MICROVM_CONTROL_MMIO_LEN,
+                )],
+                None,
+                6,
+            ),
+            device(
+                "microvm-snapshot-request",
+                "microvm-snapshot-request",
+                "snapshot-request",
+                vec![mmio(
+                    openvmm_defs::config::MICROVM_SNAPSHOT_MMIO_BASE,
+                    openvmm_defs::config::MICROVM_CONTROL_MMIO_LEN,
+                )],
+                None,
+                7,
+            ),
+        ]);
+    }
     let mut attachments = Vec::new();
     let microvm_network = if let Some((network, egress_policy, attachment)) = network {
         let policy_is_valid = matches!(source_hypervisor, "kvm" | "mshv" | "whp")
@@ -882,16 +947,19 @@ pub fn microvm_machine_contract(
             "microVM network attachment has an unsupported endpoint policy"
         );
         let irq = openvmm_defs::config::microvm_virtio_net_irq(Some(source_hypervisor))?;
-        let discovery = format!(
-            "virtio_mmio.device={:#x}@{:#x}:{irq}",
-            openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
-            openvmm_defs::config::MICROVM_VIRTIO_NET_MMIO_BASE,
-        );
         let tokens = effective_command_line
             .split_ascii_whitespace()
             .collect::<HashSet<_>>();
         anyhow::ensure!(
-            tokens.contains(discovery.as_str())
+            (!cfg!(guest_arch = "x86_64")
+                || tokens.contains(
+                    format!(
+                        "virtio_mmio.device={:#x}@{:#x}:{irq}",
+                        openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+                        openvmm_defs::config::MICROVM_VIRTIO_NET_MMIO_BASE,
+                    )
+                    .as_str()
+                ))
                 && network
                     .command_line_fragment()
                     .split_ascii_whitespace()
@@ -929,18 +997,20 @@ pub fn microvm_machine_contract(
         "microVM filesystem policy requires the reserved virtio-fs slot"
     );
     if filesystem_slot {
-        let discovery = format!(
-            "virtio_mmio.device={:#x}@{:#x}:{}",
-            openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
-            openvmm_defs::config::MICROVM_VIRTIO_FS_MMIO_BASE,
-            openvmm_defs::config::MICROVM_VIRTIO_FS_IRQ,
-        );
-        anyhow::ensure!(
-            effective_command_line
-                .split_ascii_whitespace()
-                .any(|token| token == discovery),
-            "microVM virtio-fs slot is missing from the effective command line"
-        );
+        if cfg!(guest_arch = "x86_64") {
+            let discovery = format!(
+                "virtio_mmio.device={:#x}@{:#x}:{}",
+                openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+                openvmm_defs::config::MICROVM_VIRTIO_FS_MMIO_BASE,
+                openvmm_defs::config::MICROVM_VIRTIO_FS_IRQ,
+            );
+            anyhow::ensure!(
+                effective_command_line
+                    .split_ascii_whitespace()
+                    .any(|token| token == discovery),
+                "microVM virtio-fs slot is missing from the effective command line"
+            );
+        }
         devices.push(SnapshotDevice {
             stable_id: "fs:microvm0".to_owned(),
             state_unit_name: format!(
@@ -1077,19 +1147,21 @@ pub fn microvm_machine_contract(
             "scratch" => openvmm_defs::config::MicrovmSandboxBlockRole::Scratch,
             role => anyhow::bail!("snapshot sandbox block role '{role}' is unsupported"),
         };
-        let discovery = format!(
-            "virtio_mmio.device={:#x}@{:#x}:{}",
-            openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
-            role.mmio_base(),
-            role.irq(),
-        );
-        anyhow::ensure!(
-            effective_command_line
-                .split_ascii_whitespace()
-                .any(|token| token == discovery),
-            "microVM sandbox block '{}' is missing from the effective command line",
-            block.role
-        );
+        if cfg!(guest_arch = "x86_64") {
+            let discovery = format!(
+                "virtio_mmio.device={:#x}@{:#x}:{}",
+                openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+                role.mmio_base(),
+                role.irq(),
+            );
+            anyhow::ensure!(
+                effective_command_line
+                    .split_ascii_whitespace()
+                    .any(|token| token == discovery),
+                "microVM sandbox block '{}' is missing from the effective command line",
+                block.role
+            );
+        }
         let features = openvmm_defs::config::microvm_sandbox_block_features(role);
         devices.push(SnapshotDevice {
             stable_id: format!("blk:sandbox:{}", role.as_str()),
@@ -1136,9 +1208,22 @@ pub fn microvm_machine_contract(
             0
         },
         boot_online_vp_count,
-        virtio_interrupt_mode: MICROVM_SHARED_STATUS_INTERRUPT_MODE.to_owned(),
-        virtio_shared_status_page_gpa: openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA,
-        virtio_shared_status_page_size: openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_SIZE,
+        virtio_interrupt_mode: if cfg!(guest_arch = "aarch64") {
+            MICROVM_LEGACY_INTERRUPT_MODE
+        } else {
+            MICROVM_SHARED_STATUS_INTERRUPT_MODE
+        }
+        .to_owned(),
+        virtio_shared_status_page_gpa: if cfg!(guest_arch = "aarch64") {
+            0
+        } else {
+            openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA
+        },
+        virtio_shared_status_page_size: if cfg!(guest_arch = "aarch64") {
+            0
+        } else {
+            openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_SIZE
+        },
         memory_expansion_version,
         memory_capacity_bytes,
         memory_block_size_bytes,
@@ -3430,13 +3515,20 @@ fn validate_machine_contract_shape(
     vp_count: u32,
 ) -> anyhow::Result<()> {
     validate_supported_microvm_contract(contract)?;
+    let expected_interrupt_contract = if cfg!(guest_arch = "aarch64") {
+        (MICROVM_LEGACY_INTERRUPT_MODE, 0, 0)
+    } else {
+        (
+            MICROVM_SHARED_STATUS_INTERRUPT_MODE,
+            openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA,
+            openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_SIZE,
+        )
+    };
     anyhow::ensure!(
-        contract.virtio_interrupt_mode == MICROVM_SHARED_STATUS_INTERRUPT_MODE
-            && contract.virtio_shared_status_page_gpa
-                == openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA
-            && contract.virtio_shared_status_page_size
-                == openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_SIZE,
-        "snapshot microVM shared-status interrupt contract is invalid"
+        contract.virtio_interrupt_mode == expected_interrupt_contract.0
+            && contract.virtio_shared_status_page_gpa == expected_interrupt_contract.1
+            && contract.virtio_shared_status_page_size == expected_interrupt_contract.2,
+        "snapshot microVM interrupt contract is invalid"
     );
     anyhow::ensure!(
         contract.clock_policy == ADVANCE_BY_HOST_DOWNTIME,
@@ -3460,10 +3552,17 @@ fn validate_machine_contract_shape(
         &contract.effective_command_line_sha256,
         "effective command line",
     )?;
-    anyhow::ensure!(
-        contract.tsc_frequency_hz != 0,
-        "snapshot TSC frequency must be nonzero"
-    );
+    if cfg!(guest_arch = "x86_64") {
+        anyhow::ensure!(
+            contract.tsc_frequency_hz != 0,
+            "snapshot TSC frequency must be nonzero"
+        );
+    } else {
+        anyhow::ensure!(
+            contract.tsc_frequency_hz == 0 && contract.apic_frequency_hz.is_none(),
+            "aarch64 snapshot must not contain x86 clock-frequency contracts"
+        );
+    }
     if let Some(apic_frequency_hz) = contract.apic_frequency_hz {
         anyhow::ensure!(
             apic_frequency_hz != 0,
@@ -3471,7 +3570,12 @@ fn validate_machine_contract_shape(
         );
     }
     anyhow::ensure!(
-        !contract.cpu_contract.is_empty() && contract.cpu_contract.len() <= MAX_CPU_CONTRACT_BYTES,
+        if cfg!(guest_arch = "x86_64") {
+            !contract.cpu_contract.is_empty()
+                && contract.cpu_contract.len() <= MAX_CPU_CONTRACT_BYTES
+        } else {
+            contract.cpu_contract.is_empty()
+        },
         "snapshot CPU contract size is invalid"
     );
     validate_sha256(&contract.cpu_contract_sha256, "CPU contract")?;
@@ -4018,31 +4122,35 @@ fn validate_snapshot_tier(manifest: &SnapshotManifest) -> anyhow::Result<()> {
         manifest.snapshot_tier,
     );
     if manifest.snapshot_tier == SNAPSHOT_TIER_PLATFORM {
-        let expected_tsc_frequency = format!("tsc_early_khz={}", contract.tsc_frequency_hz / 1000);
-        let tsc_frequency_tokens = contract
-            .effective_command_line
-            .split_ascii_whitespace()
-            .filter(|token| token.starts_with("tsc_early_khz="))
-            .collect::<Vec<_>>();
-        anyhow::ensure!(
-            tsc_frequency_tokens == [expected_tsc_frequency.as_str()],
-            "platform snapshot command line TSC frequency does not match its machine contract"
-        );
-        let apic_frequency_tokens = contract
-            .effective_command_line
-            .split_ascii_whitespace()
-            .filter(|token| token.starts_with("lapic_timer_hz="))
-            .collect::<Vec<_>>();
-        if !apic_frequency_tokens.is_empty() {
-            let expected = contract
-                .apic_frequency_hz
-                .map(|frequency| format!("lapic_timer_hz={frequency}"));
+        #[cfg(guest_arch = "x86_64")]
+        {
+            let expected_tsc_frequency =
+                format!("tsc_early_khz={}", contract.tsc_frequency_hz / 1000);
+            let tsc_frequency_tokens = contract
+                .effective_command_line
+                .split_ascii_whitespace()
+                .filter(|token| token.starts_with("tsc_early_khz="))
+                .collect::<Vec<_>>();
             anyhow::ensure!(
-                expected
-                    .as_deref()
-                    .is_some_and(|expected| apic_frequency_tokens == [expected]),
-                "platform snapshot command line LAPIC frequency does not match its machine contract"
+                tsc_frequency_tokens == [expected_tsc_frequency.as_str()],
+                "platform snapshot command line TSC frequency does not match its machine contract"
             );
+            let apic_frequency_tokens = contract
+                .effective_command_line
+                .split_ascii_whitespace()
+                .filter(|token| token.starts_with("lapic_timer_hz="))
+                .collect::<Vec<_>>();
+            if !apic_frequency_tokens.is_empty() {
+                let expected = contract
+                    .apic_frequency_hz
+                    .map(|frequency| format!("lapic_timer_hz={frequency}"));
+                anyhow::ensure!(
+                    expected
+                        .as_deref()
+                        .is_some_and(|expected| apic_frequency_tokens == [expected]),
+                    "platform snapshot command line LAPIC frequency does not match its machine contract"
+                );
+            }
         }
         anyhow::ensure!(
             contract
@@ -4061,6 +4169,7 @@ fn platform_command_line_token_is_invariant(token: &str) -> bool {
         "earlycon=xe9"
             | "console=hvc0"
             | "console=hvc1"
+            | "console=ttyAMA0"
             | "reboot=t"
             | "panic=-1"
             | "nvx_sandbox=1"

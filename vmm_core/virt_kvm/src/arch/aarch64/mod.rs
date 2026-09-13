@@ -30,8 +30,12 @@ use inspect::InspectMut;
 use kvm::KVM_CAP_ARM_VM_IPA_SIZE;
 use kvm::KVM_DEV_ARM_VGIC_CTRL_INIT;
 use kvm::KVM_DEV_ARM_VGIC_GRP_ADDR;
+use kvm::KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS;
 use kvm::KVM_DEV_ARM_VGIC_GRP_CTRL;
+use kvm::KVM_DEV_ARM_VGIC_GRP_DIST_REGS;
 use kvm::KVM_DEV_ARM_VGIC_GRP_NR_IRQS;
+use kvm::KVM_DEV_ARM_VGIC_GRP_REDIST_REGS;
+use kvm::KVM_DEV_ARM_VGIC_SAVE_PENDING_TABLES;
 use kvm::KVM_VGIC_ITS_ADDR_TYPE;
 use kvm::KVM_VGIC_V2_ADDR_TYPE_CPU;
 use kvm::KVM_VGIC_V2_ADDR_TYPE_DIST;
@@ -54,6 +58,8 @@ use virt::StopVp;
 use virt::VpHaltReason;
 use virt::VpIndex;
 use virt::io::CpuIo;
+use virt::vp::OpaqueDeviceRegister;
+use virt::vp::OpaqueRegister;
 use virt::vp::Registers;
 use virt::vp::SystemRegisters;
 use virt::x86::DebugState;
@@ -61,6 +67,20 @@ use vm_topology::processor::aarch64::Aarch64VpInfo;
 use vm_topology::processor::aarch64::GicMsiController;
 use vmcore::reference_time::ReferenceTimeSource;
 use vmcore::vmtime::VmTimeAccess;
+
+fn host_counter_frequency_hz() -> u64 {
+    let frequency;
+    // SAFETY: CNTFRQ_EL0 is an EL0-readable architectural identification
+    // register and this function has no memory or stack side effects.
+    unsafe {
+        std::arch::asm!(
+            "mrs {frequency}, cntfrq_el0",
+            frequency = out(reg) frequency,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    frequency
+}
 
 // linux/arch/arm64/include/asm/sysreg.h
 
@@ -192,6 +212,22 @@ open_enum::open_enum! {
         SYS_MAIR_EL1 = sys_reg64(SystemReg::MAIR_EL1),
         SYS_SPSR_EL1 = sys_reg64(SystemReg::SPSR_EL1),
         SYS_VBAR_EL1 = sys_reg64(SystemReg::VBAR),
+        SYS_CONTEXTIDR_EL1 = sys_reg64(SystemReg::CONTEXTIDR_EL1),
+        SYS_TPIDR_EL0 = sys_reg64(SystemReg::TPIDR_EL0),
+        SYS_TPIDRRO_EL0 = sys_reg64(SystemReg::TPIDRRO_EL0),
+        SYS_TPIDR_EL1 = sys_reg64(SystemReg::TPIDR_EL1),
+        SYS_CPACR_EL1 = sys_reg64(SystemReg::CPACR),
+        SYS_CNTKCTL_EL1 = sys_reg64(SystemReg::CNTKCTL),
+        SYS_CNTFRQ_EL0 = sys_reg64(SystemReg::CNTFRQ_EL0),
+        SYS_CNTV_CTL_EL0 = sys_reg64(SystemReg::CNTV_CTL_EL0),
+        // KVM's established UAPI accidentally swaps the virtual timer count
+        // and compare-value encodings. This ID accesses CNTVCT_EL0.
+        SYS_CNTV_CVAL_EL0 = sys_reg64(SystemReg::CNTV_CVAL_EL0),
+        // This ID accesses CNTV_CVAL_EL0 through KVM's swapped UAPI.
+        SYS_CNTVCT_EL0 = sys_reg64(SystemReg::CNTVCT_EL0),
+        SYS_CNTP_CTL_EL0 = sys_reg64(SystemReg::CNTP_CTL_EL0),
+        SYS_CNTP_CVAL_EL0 = sys_reg64(SystemReg::CNTP_CVAL_EL0),
+        SYS_CNTPCT_EL0 = sys_reg64(SystemReg::CNTPCT_EL0),
         SYS_ID_AA64PFR0_EL1 = sys_reg64(SystemReg::ID_AA64PFR0_EL1),
         SYS_MPIDR_EL1 = sys_reg64(SystemReg::MPIDR_EL1),
     }
@@ -288,6 +324,214 @@ pub struct KvmProcessor<'a> {
     vmtime: &'a mut VmTimeAccess,
 }
 
+impl KvmProcessor<'_> {
+    fn vgic_mpidr_prefix(mpidr: aarch64defs::MpidrEl1) -> u64 {
+        (u64::from(mpidr.aff3()) << 56)
+            | (u64::from(mpidr.aff2()) << 48)
+            | (u64::from(mpidr.aff1()) << 40)
+            | (u64::from(mpidr.aff0()) << 32)
+    }
+
+    fn push_gic_range(
+        &self,
+        registers: &mut Vec<OpaqueDeviceRegister>,
+        group: u32,
+        attr_prefix: u64,
+        start: u64,
+        size: u64,
+        chunk_size: usize,
+        optional: bool,
+    ) -> Result<(), KvmError> {
+        for offset in (start..start + size).step_by(chunk_size) {
+            match self.partition.gic_device.get_device_attr_bytes(
+                group,
+                attr_prefix | offset,
+                chunk_size,
+            ) {
+                Ok(value) => registers.push(OpaqueDeviceRegister {
+                    group,
+                    attr: attr_prefix | offset,
+                    value,
+                }),
+                Err(kvm::Error::GetDeviceAttr(
+                    nix::errno::Errno::EINVAL
+                    | nix::errno::Errno::ENXIO
+                    | nix::errno::Errno::ENOENT,
+                )) if optional => {}
+                Err(error) => {
+                    tracing::error!(
+                        vp = self.vpindex.index(),
+                        group,
+                        attr = attr_prefix | offset,
+                        ?error,
+                        "failed to save KVM VGIC register"
+                    );
+                    return Err(KvmError::Kvm(error));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn vgic_sys_reg(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
+        ((op0 << kvm::KVM_REG_ARM64_SYSREG_OP0_SHIFT) & kvm::KVM_REG_ARM64_SYSREG_OP0_MASK as u64)
+            | ((op1 << kvm::KVM_REG_ARM64_SYSREG_OP1_SHIFT)
+                & kvm::KVM_REG_ARM64_SYSREG_OP1_MASK as u64)
+            | ((crn << kvm::KVM_REG_ARM64_SYSREG_CRN_SHIFT)
+                & kvm::KVM_REG_ARM64_SYSREG_CRN_MASK as u64)
+            | ((crm << kvm::KVM_REG_ARM64_SYSREG_CRM_SHIFT)
+                & kvm::KVM_REG_ARM64_SYSREG_CRM_MASK as u64)
+            | ((op2 << kvm::KVM_REG_ARM64_SYSREG_OP2_SHIFT)
+                & kvm::KVM_REG_ARM64_SYSREG_OP2_MASK as u64)
+    }
+
+    fn save_gic_registers(&self) -> Result<Vec<OpaqueDeviceRegister>, KvmError> {
+        if !matches!(self.partition.gic_version, GicVersion::V3 { .. }) {
+            return Err(KvmError::NotSupported);
+        }
+
+        // SAFETY: the VGIC control attribute carries no payload.
+        unsafe {
+            self.partition
+                .gic_device
+                .set_device_attr::<()>(
+                    KVM_DEV_ARM_VGIC_GRP_CTRL,
+                    KVM_DEV_ARM_VGIC_SAVE_PENDING_TABLES,
+                    &(),
+                    0,
+                )
+                .map_err(kvm::Error::SetDeviceAttr)?;
+        }
+
+        let mut registers = Vec::new();
+        if self.vpindex == VpIndex::BSP {
+            self.push_gic_range(
+                &mut registers,
+                KVM_DEV_ARM_VGIC_GRP_DIST_REGS,
+                0,
+                0x0,
+                4,
+                4,
+                false,
+            )?;
+            self.push_gic_range(
+                &mut registers,
+                KVM_DEV_ARM_VGIC_GRP_DIST_REGS,
+                0,
+                0x10,
+                4,
+                4,
+                false,
+            )?;
+            let shared_irq_count = u64::from(self.partition.gic_nr_irqs - 32);
+            for (offset, bits_per_irq) in [
+                (0x180, 1),
+                (0x100, 1),
+                (0x080, 1),
+                (0x6000, 64),
+                (0x0c00, 2),
+                (0x280, 1),
+                (0x200, 1),
+                (0x380, 1),
+                (0x300, 1),
+                (0x400, 8),
+            ] {
+                let start = offset + 32 * bits_per_irq / 8;
+                let size = (shared_irq_count * bits_per_irq).div_ceil(8);
+                self.push_gic_range(
+                    &mut registers,
+                    KVM_DEV_ARM_VGIC_GRP_DIST_REGS,
+                    0,
+                    start,
+                    size,
+                    4,
+                    false,
+                )?;
+            }
+        }
+
+        let mpidr_prefix = Self::vgic_mpidr_prefix(self.inner.vp_info.mpidr);
+        for (start, size) in [
+            (0x10, 4),
+            (0x14, 4),
+            (0x70, 8),
+            (0x78, 8),
+            (0x0, 4),
+            (0x1_0080, 4),
+            (0x1_0180, 4),
+            (0x1_0100, 4),
+            (0x1_0c00, 8),
+            (0x1_0280, 4),
+            (0x1_0200, 4),
+            (0x1_0380, 4),
+            (0x1_0300, 4),
+            (0x1_0400, 32),
+        ] {
+            self.push_gic_range(
+                &mut registers,
+                KVM_DEV_ARM_VGIC_GRP_REDIST_REGS,
+                mpidr_prefix,
+                start,
+                size,
+                4,
+                false,
+            )?;
+        }
+
+        for attr in [
+            Self::vgic_sys_reg(3, 0, 12, 12, 5),
+            Self::vgic_sys_reg(3, 0, 12, 12, 4),
+            Self::vgic_sys_reg(3, 0, 12, 12, 6),
+            Self::vgic_sys_reg(3, 0, 12, 12, 7),
+            Self::vgic_sys_reg(3, 0, 4, 6, 0),
+            Self::vgic_sys_reg(3, 0, 12, 8, 3),
+            Self::vgic_sys_reg(3, 0, 12, 12, 3),
+        ] {
+            self.push_gic_range(
+                &mut registers,
+                KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS,
+                mpidr_prefix,
+                attr,
+                8,
+                8,
+                false,
+            )?;
+        }
+        for attr in [
+            Self::vgic_sys_reg(3, 0, 12, 8, 4),
+            Self::vgic_sys_reg(3, 0, 12, 8, 5),
+            Self::vgic_sys_reg(3, 0, 12, 8, 6),
+            Self::vgic_sys_reg(3, 0, 12, 8, 7),
+            Self::vgic_sys_reg(3, 0, 12, 9, 0),
+            Self::vgic_sys_reg(3, 0, 12, 9, 1),
+            Self::vgic_sys_reg(3, 0, 12, 9, 2),
+            Self::vgic_sys_reg(3, 0, 12, 9, 3),
+        ] {
+            self.push_gic_range(
+                &mut registers,
+                KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS,
+                mpidr_prefix,
+                attr,
+                8,
+                8,
+                true,
+            )?;
+        }
+        Ok(registers)
+    }
+
+    fn restore_gic_registers(&self, registers: &[OpaqueDeviceRegister]) -> Result<(), KvmError> {
+        for register in registers {
+            self.partition.gic_device.set_device_attr_bytes(
+                register.group,
+                register.attr,
+                &register.value,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 impl virt::vp::AccessVpState for &'_ mut KvmProcessor<'_> {
     type Error = KvmError;
 
@@ -300,6 +544,7 @@ impl virt::vp::AccessVpState for &'_ mut KvmProcessor<'_> {
     }
 
     fn registers(&mut self) -> Result<Registers, Self::Error> {
+        let _guard = self.partition.vp_state_lock.lock();
         let get_reg = |id: KvmRegisterId| -> Result<u64, KvmError> {
             // tracing::warn!("get_reg: {:?}", id);
             self.kvm.get_reg64(id.into()).map_err(KvmError::Kvm)
@@ -346,6 +591,7 @@ impl virt::vp::AccessVpState for &'_ mut KvmProcessor<'_> {
     }
 
     fn set_registers(&mut self, value: &Registers) -> Result<(), Self::Error> {
+        let _guard = self.partition.vp_state_lock.lock();
         let set_reg = |id: KvmRegisterId, value: u64| -> Result<(), KvmError> {
             // tracing::warn!("set_reg: {:?} = {:x}", id, value);
             self.kvm.set_reg64(id.into(), value).map_err(KvmError::Kvm)
@@ -391,11 +637,33 @@ impl virt::vp::AccessVpState for &'_ mut KvmProcessor<'_> {
     }
 
     fn system_registers(&mut self) -> Result<SystemRegisters, Self::Error> {
+        let _guard = self.partition.vp_state_lock.lock();
         let get_reg = |id: KvmRegisterId| -> Result<u64, KvmError> {
             // tracing::warn!("get_sreg: {:?}({:#?})", id, id.0);
             self.kvm.get_reg64(id.into()).map_err(KvmError::Kvm)
         };
+        let get_optional_reg = |id: KvmRegisterId| -> Result<u64, KvmError> {
+            match self.kvm.get_reg64(id.into()) {
+                Ok(value) => Ok(value),
+                Err(kvm::Error::GetRegs(nix::errno::Errno::ENOENT)) => Ok(0),
+                Err(error) => Err(KvmError::Kvm(error)),
+            }
+        };
 
+        let opaque_registers = self
+            .kvm
+            .get_register_ids()?
+            .into_iter()
+            .filter(|id| {
+                *id != KvmRegisterId::SYS_CNTPCT_EL0.0 && *id != KvmRegisterId::SYS_CNTV_CVAL_EL0.0
+            })
+            .map(|id| {
+                Ok(OpaqueRegister {
+                    id,
+                    value: self.kvm.get_reg_bytes(id)?,
+                })
+            })
+            .collect::<Result<Vec<_>, KvmError>>()?;
         let sregs = SystemRegisters {
             sctlr_el1: get_reg(KvmRegisterId::SYS_SCTLR_EL1)?,
             ttbr0_el1: get_reg(KvmRegisterId::SYS_TTBR0_EL1)?,
@@ -406,14 +674,39 @@ impl virt::vp::AccessVpState for &'_ mut KvmProcessor<'_> {
             mair_el1: get_reg(KvmRegisterId::SYS_MAIR_EL1)?,
             elr_el1: get_reg(KvmRegisterId::ELR_EL1)?,
             vbar_el1: get_reg(KvmRegisterId::SYS_VBAR_EL1)?,
+            spsr_el1: get_optional_reg(KvmRegisterId::SYS_SPSR_EL1)?,
+            par_el1: get_optional_reg(KvmRegisterId::SYS_PAR_EL1)?,
+            contextidr_el1: get_optional_reg(KvmRegisterId::SYS_CONTEXTIDR_EL1)?,
+            tpidr_el0: get_optional_reg(KvmRegisterId::SYS_TPIDR_EL0)?,
+            tpidrro_el0: get_optional_reg(KvmRegisterId::SYS_TPIDRRO_EL0)?,
+            tpidr_el1: get_optional_reg(KvmRegisterId::SYS_TPIDR_EL1)?,
+            cpacr_el1: get_optional_reg(KvmRegisterId::SYS_CPACR_EL1)?,
+            cntkctl_el1: get_optional_reg(KvmRegisterId::SYS_CNTKCTL_EL1)?,
+            cntv_ctl_el0: get_optional_reg(KvmRegisterId::SYS_CNTV_CTL_EL0)?,
+            cntv_cval_el0: get_optional_reg(KvmRegisterId::SYS_CNTVCT_EL0)?,
+            cntp_ctl_el0: get_optional_reg(KvmRegisterId::SYS_CNTP_CTL_EL0)?,
+            cntp_cval_el0: get_optional_reg(KvmRegisterId::SYS_CNTP_CVAL_EL0)?,
+            mp_state: self.kvm.get_mp_state()?,
+            opaque_registers,
+            gic_registers: self.save_gic_registers()?,
+            cntv_count_el0: get_optional_reg(KvmRegisterId::SYS_CNTV_CVAL_EL0)?,
+            cntfrq_el0: get_optional_reg(KvmRegisterId::SYS_CNTFRQ_EL0)?,
         };
         Ok(sregs)
     }
 
     fn set_system_registers(&mut self, value: &SystemRegisters) -> Result<(), Self::Error> {
+        let _guard = self.partition.vp_state_lock.lock();
         let set_reg = |id: KvmRegisterId, value: u64| -> Result<(), KvmError> {
             // tracing::warn!("set_sreg: {:?}({:#x}) = {:x}", id, id.0, value);
             self.kvm.set_reg64(id.into(), value).map_err(KvmError::Kvm)
+        };
+        let set_optional_reg = |id: KvmRegisterId, value: u64| -> Result<(), KvmError> {
+            match self.kvm.set_reg64(id.into(), value) {
+                Ok(()) => Ok(()),
+                Err(kvm::Error::SetRegs(nix::errno::Errno::ENOENT)) => Ok(()),
+                Err(error) => Err(KvmError::Kvm(error)),
+            }
         };
 
         set_reg(KvmRegisterId::SYS_SCTLR_EL1, value.sctlr_el1)?;
@@ -425,6 +718,24 @@ impl virt::vp::AccessVpState for &'_ mut KvmProcessor<'_> {
         set_reg(KvmRegisterId::SYS_MAIR_EL1, value.mair_el1)?;
         set_reg(KvmRegisterId::ELR_EL1, value.elr_el1)?;
         set_reg(KvmRegisterId::SYS_VBAR_EL1, value.vbar_el1)?;
+        set_optional_reg(KvmRegisterId::SYS_SPSR_EL1, value.spsr_el1)?;
+        set_optional_reg(KvmRegisterId::SYS_PAR_EL1, value.par_el1)?;
+        set_optional_reg(KvmRegisterId::SYS_CONTEXTIDR_EL1, value.contextidr_el1)?;
+        set_optional_reg(KvmRegisterId::SYS_TPIDR_EL0, value.tpidr_el0)?;
+        set_optional_reg(KvmRegisterId::SYS_TPIDRRO_EL0, value.tpidrro_el0)?;
+        set_optional_reg(KvmRegisterId::SYS_TPIDR_EL1, value.tpidr_el1)?;
+        set_optional_reg(KvmRegisterId::SYS_CPACR_EL1, value.cpacr_el1)?;
+        set_optional_reg(KvmRegisterId::SYS_CNTKCTL_EL1, value.cntkctl_el1)?;
+        set_optional_reg(KvmRegisterId::SYS_CNTV_CTL_EL0, value.cntv_ctl_el0)?;
+        set_optional_reg(KvmRegisterId::SYS_CNTVCT_EL0, value.cntv_cval_el0)?;
+        set_optional_reg(KvmRegisterId::SYS_CNTP_CTL_EL0, value.cntp_ctl_el0)?;
+        set_optional_reg(KvmRegisterId::SYS_CNTP_CVAL_EL0, value.cntp_cval_el0)?;
+        for register in &value.opaque_registers {
+            self.kvm.set_reg_bytes(register.id, &register.value)?;
+        }
+        set_optional_reg(KvmRegisterId::SYS_CNTV_CVAL_EL0, value.cntv_count_el0)?;
+        self.kvm.set_mp_state(value.mp_state)?;
+        self.restore_gic_registers(&value.gic_registers)?;
 
         Ok(())
     }
@@ -434,11 +745,11 @@ impl virt::vm::AccessVmState for &KvmPartition {
     type Error = KvmError;
 
     fn caps(&self) -> &PartitionCapabilities {
-        unimplemented!()
+        &self.inner.caps
     }
 
     fn commit(&mut self) -> Result<(), Self::Error> {
-        unimplemented!()
+        Ok(())
     }
 }
 
@@ -802,7 +1113,8 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
         }
 
         // Set up the GIC device matching the topology's GIC version.
-        let gic_device = match self.config.processor_topology.gic_version() {
+        let gic_version = self.config.processor_topology.gic_version();
+        let gic_device = match gic_version {
             GicVersion::V3 {
                 redistributors_base,
             } => self.add_gicv3(redistributors_base)?,
@@ -867,7 +1179,9 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
                 .collect(),
             gsi_routing: Mutex::new(GsiRouting::new()),
             caps,
-            _gic_device: gic_device,
+            gic_device,
+            gic_version,
+            vp_state_lock: Mutex::new(()),
             _its_device: its_device,
             gic_msi,
             gic_nr_irqs: self.config.processor_topology.gic_nr_irqs(),
@@ -945,6 +1259,39 @@ impl virt::Partition for KvmPartition {
         if vp.needs_yield.request_yield() {
             self.inner.evaluate_vp(vp_index);
         }
+    }
+
+    fn advance_snapshot_time(&self, duration: std::time::Duration) -> Result<(), Self::Error> {
+        let frequency = host_counter_frequency_hz();
+        let ticks = u64::try_from(
+            duration
+                .as_nanos()
+                .checked_mul(u128::from(frequency))
+                .ok_or(KvmError::SnapshotClockOverflow)?
+                / 1_000_000_000,
+        )
+        .map_err(|_| KvmError::SnapshotClockOverflow)?;
+        let _guard = self.inner.vp_state_lock.lock();
+        for (vp_index, _) in self.inner.vps.iter().enumerate() {
+            let vp = self.inner.kvm.vp(vp_index as u32);
+            let count = vp
+                .get_reg64(KvmRegisterId::SYS_CNTV_CVAL_EL0.into())
+                .map_err(|err| KvmError::SnapshotTimerRegister {
+                    register: "KVM_REG_ARM_TIMER_CNT",
+                    err,
+                })?;
+            vp.set_reg64(
+                KvmRegisterId::SYS_CNTV_CVAL_EL0.into(),
+                count
+                    .checked_add(ticks)
+                    .ok_or(KvmError::SnapshotClockOverflow)?,
+            )
+            .map_err(|err| KvmError::SnapshotTimerRegister {
+                register: "KVM_REG_ARM_TIMER_CNT",
+                err,
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -1182,5 +1529,24 @@ impl virt::Hypervisor for Kvm {
             config,
             ipa_size,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vgic_mpidr_prefix_packs_affinity_levels() {
+        let mpidr = aarch64defs::MpidrEl1::new()
+            .with_aff0(0x78)
+            .with_aff1(0x56)
+            .with_aff2(0x34)
+            .with_aff3(0x12);
+
+        assert_eq!(
+            KvmProcessor::vgic_mpidr_prefix(mpidr),
+            0x1234_5678_0000_0000
+        );
     }
 }

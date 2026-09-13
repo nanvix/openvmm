@@ -7,6 +7,7 @@ use crate::CpuidLeaf;
 use std::cmp::min;
 use thiserror::Error;
 use vm_topology::processor::ProcessorTopology;
+use vm_topology::processor::x86::X86Topology;
 use x86defs::cpuid::CacheParametersEax;
 use x86defs::cpuid::CpuidFunction;
 use x86defs::cpuid::ExtendedAddressSpaceSizesEcx;
@@ -34,7 +35,7 @@ pub struct UnknownVendor(Vendor);
 /// This includes some bits of leaves 01h and 04h, plus all of leaves 0Bh and
 /// 1Fh
 pub fn topology_cpuid<'a>(
-    topology: &'a ProcessorTopology,
+    topology: &'a ProcessorTopology<X86Topology>,
     cpuid: CpuidFn<'a>,
     leaves: &mut Vec<CpuidLeaf>,
 ) -> Result<(), UnknownVendor> {
@@ -101,7 +102,7 @@ pub fn topology_cpuid<'a>(
 ///
 /// Only valid for Intel processors.
 fn cache_parameters_cpuid(
-    topology: &ProcessorTopology,
+    topology: &ProcessorTopology<X86Topology>,
     cpuid: CpuidFn<'_>,
     leaves: &mut Vec<CpuidLeaf>,
 ) {
@@ -153,7 +154,7 @@ fn cache_parameters_cpuid(
 /// The x2APIC values in edx use the BSP identity. The caller must replace
 /// these for each VP.
 fn extended_topology_cpuid(
-    topology: &ProcessorTopology,
+    topology: &ProcessorTopology<X86Topology>,
     function: CpuidFunction,
     leaves: &mut Vec<CpuidLeaf>,
 ) {
@@ -197,7 +198,7 @@ fn extended_topology_cpuid(
 ///
 /// This leaf contains core count and APIC ID size information.
 fn amd_extended_address_space_sizes_cpuid(
-    topology: &ProcessorTopology,
+    topology: &ProcessorTopology<X86Topology>,
     leaves: &mut Vec<CpuidLeaf>,
 ) {
     let nc = (topology.reserved_vps_per_socket() - 1) as u8;
@@ -221,7 +222,7 @@ fn amd_extended_address_space_sizes_cpuid(
 
 /// Adds leaf 8000001Eh (Processor Topology Definition) for AMD processors.
 fn amd_processor_topology_definition_cpuid(
-    topology: &ProcessorTopology,
+    topology: &ProcessorTopology<X86Topology>,
     leaves: &mut Vec<CpuidLeaf>,
 ) {
     let bsp_apic_id = topology.vp_arch(crate::VpIndex::BSP).apic_id;

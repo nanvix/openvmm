@@ -1647,6 +1647,9 @@ fn reopen_flags(saved: u32) -> anyhow::Result<u32> {
     const O_NONBLOCK: u32 = 0x800;
     const O_DSYNC: u32 = 0x1000;
     const O_SYNC: u32 = 0x101000;
+    #[cfg(guest_arch = "aarch64")]
+    const O_LARGEFILE: u32 = 0x20000;
+    #[cfg(not(guest_arch = "aarch64"))]
     const O_LARGEFILE: u32 = 0x8000;
     const O_CLOEXEC: u32 = 0x80000;
     const O_TMPFILE: u32 = 0x410000;

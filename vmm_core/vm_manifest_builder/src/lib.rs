@@ -590,16 +590,23 @@ impl VmManifestBuilder {
                 }
             }
             BaseChipsetType::Microvm => {
-                if self.arch != MachineArch::X86_64 {
-                    return Err(Error(ErrorInner::UnsupportedArch));
-                }
                 result.chipset = BaseChipsetManifest {
-                    with_generic_cmos_rtc: true,
+                    with_generic_cmos_rtc: is_x86,
                     ..BaseChipsetManifest::empty()
                 };
-                result.attach_generic_ioapic();
-                result.attach_pic();
-                result.attach_pit();
+                if is_x86 {
+                    result.attach_generic_ioapic();
+                    result.attach_pic();
+                    result.attach_pit();
+                } else {
+                    result.maybe_attach_arch_serial(
+                        self.arch,
+                        self.serial_wait_for_rts,
+                        self.serial_debugger_mode,
+                        false,
+                        self.serial,
+                    )?;
+                }
             }
             BaseChipsetType::HypervGen2Uefi | BaseChipsetType::HyperVGen2LinuxDirect => {
                 result.chipset = BaseChipsetManifest {
@@ -1065,28 +1072,35 @@ mod tests {
 
     #[test]
     fn microvm_microvm_has_only_allowlisted_base_devices() {
-        let builder = VmManifestBuilder::new(BaseChipsetType::Microvm, MachineArch::X86_64);
-        assert!(!builder.vmbus);
-        assert_eq!(
-            builder.layout_config().chipset_low_mmio_size,
-            1024 * 1024 * 1024
-        );
+        for arch in [MachineArch::X86_64, MachineArch::Aarch64] {
+            let builder = VmManifestBuilder::new(BaseChipsetType::Microvm, arch);
+            assert!(!builder.vmbus);
+            assert_eq!(
+                builder.layout_config().chipset_low_mmio_size,
+                1024 * 1024 * 1024
+            );
 
-        let result = builder.build().unwrap();
-        assert!(result.chipset.with_generic_cmos_rtc);
-        assert_eq!(
-            result
-                .chipset_devices
-                .iter()
-                .map(|device| device.name.as_str())
-                .collect::<Vec<_>>(),
-            ["ioapic", PicDeviceHandle::ID, PitDeviceHandle::ID]
-        );
-        assert!(result.capabilities.with_ioapic);
-        assert!(result.capabilities.with_pic);
-        assert!(result.capabilities.with_pit);
-        assert!(result.pci_chipset_devices.is_empty());
-        assert!(result.isa_dma_controller.is_none());
+            let result = builder.build().unwrap();
+            let is_x86 = arch == MachineArch::X86_64;
+            assert_eq!(result.chipset.with_generic_cmos_rtc, is_x86);
+            assert_eq!(
+                result
+                    .chipset_devices
+                    .iter()
+                    .map(|device| device.name.as_str())
+                    .collect::<Vec<_>>(),
+                if is_x86 {
+                    vec!["ioapic", PicDeviceHandle::ID, PitDeviceHandle::ID]
+                } else {
+                    Vec::new()
+                }
+            );
+            assert_eq!(result.capabilities.with_ioapic, is_x86);
+            assert_eq!(result.capabilities.with_pic, is_x86);
+            assert_eq!(result.capabilities.with_pit, is_x86);
+            assert!(result.pci_chipset_devices.is_empty());
+            assert!(result.isa_dma_controller.is_none());
+        }
     }
 
     #[test]
