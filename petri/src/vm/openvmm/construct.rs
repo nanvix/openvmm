@@ -650,6 +650,7 @@ impl PetriVmConfigOpenVmm {
                         io,
                         generation_id: [0x5a; 16],
                         restore_entropy: Vec::new(),
+                        output_drain: None,
                     }
                     .into_resource(),
                 },

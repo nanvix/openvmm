@@ -149,6 +149,7 @@ pub struct VmController {
     pub(crate) microvm_filesystem_root_path: Option<PathBuf>,
     pub(crate) microvm_filesystem_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     pub(crate) microvm_console_socket_cleanup: Option<crate::MicrovmConsoleSocketCleanup>,
+    pub(crate) microvm_output_drain: Option<crate::microvm_output::MicrovmOutputDrain>,
     pub(crate) snapshot_memory_file: Option<tempfile::NamedTempFile>,
     pub(crate) _private_scratch_dir: Option<tempfile::TempDir>,
     pub(crate) guest_power_actions: GuestPowerActions,
@@ -315,9 +316,7 @@ impl VmController {
                 Event::Halt(reason) => {
                     tracing::info!(?reason, "guest halted");
                     if let HaltReason::PowerOffWithStatus { code } = reason {
-                        event_send.send(VmControllerEvent::ExitRequested {
-                            code: i32::from(code),
-                        });
+                        self.request_exit(i32::from(code), &event_send).await;
                         return;
                     }
                     // On a guest crash, write a `.vmrs` dump (if configured)
@@ -346,9 +345,7 @@ impl VmController {
                             // are parked, so don't stop it here; signal the runner to
                             // exit instead.
                             tracing::info!(exit_code = code, "requesting exit on guest halt");
-                            event_send.send(VmControllerEvent::ExitRequested {
-                                code: i32::from(code),
-                            });
+                            self.request_exit(i32::from(code), &event_send).await;
                             return;
                         }
                         GuestPowerAction::Reset => {
@@ -408,6 +405,22 @@ impl VmController {
         }
 
         self.mesh.shutdown().await;
+    }
+
+    async fn request_exit(&mut self, code: i32, events: &mesh::Sender<VmControllerEvent>) {
+        if let Some(drain) = self.microvm_output_drain.take()
+            && let Err(error) = drain.drain().await
+        {
+            tracing::error!(
+                error = error.as_ref() as &dyn std::error::Error,
+                "failed to drain microVM console output before exit"
+            );
+            events.send(VmControllerEvent::WorkerStopped {
+                error: Some(format!("failed to drain microVM console output: {error:#}")),
+            });
+            return;
+        }
+        events.send(VmControllerEvent::ExitRequested { code });
     }
 
     async fn handle_rpc(&mut self, rpc: VmControllerRpc, quit: &mut bool) {
