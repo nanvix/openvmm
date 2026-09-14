@@ -83,7 +83,7 @@ use openvmm_defs::config::VmbusConfig;
 use openvmm_defs::config::VpAssignment;
 use openvmm_defs::config::VpciDeviceConfig;
 use openvmm_defs::config::X86TopologyConfig;
-use openvmm_defs::config::build_microvm_v2_command_line;
+use openvmm_defs::config::build_microvm_command_line;
 use openvmm_defs::rpc::VmRpc;
 use openvmm_defs::worker::VM_WORKER;
 use openvmm_defs::worker::VmWorkerParameters;
@@ -1333,7 +1333,7 @@ impl VmService {
                         LoadMode::Pvh {
                             kernel,
                             initrd,
-                            cmdline: build_microvm_v2_command_line(
+                            cmdline: build_microvm_command_line(
                                 &[boot.kernel_cmdline],
                                 has_requested_microvm_console,
                             )?,
