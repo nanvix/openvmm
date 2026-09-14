@@ -4323,7 +4323,7 @@ mod tests {
     }
 
     fn canonical_worker_platform_command_line(tsc_frequency_hz: u64) -> String {
-        let mut command_line = openvmm_defs::config::build_microvm_v2_command_line(
+        let mut command_line = openvmm_defs::config::build_microvm_control_command_line(
             &[
                 "nvx_sandbox=1".to_owned(),
                 "nvx_config=0xd0010000,65536".to_owned(),
