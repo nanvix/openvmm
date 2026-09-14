@@ -94,9 +94,17 @@ pub const fn microvm_processor_count_supported(processor_count: u32) -> bool {
 }
 
 /// Command line owned by the microVM profile.
-pub const MICROVM_BASE_COMMAND_LINE: &str = "earlycon=xe9 console=hvc0 reboot=t panic=-1";
+pub const MICROVM_BASE_COMMAND_LINE: &str = if cfg!(guest_arch = "aarch64") {
+    "console=ttyAMA0 reboot=t panic=-1"
+} else {
+    "earlycon=xe9 console=hvc0 reboot=t panic=-1"
+};
 /// Command line when the microVM virtio console is present.
-pub const MICROVM_CONSOLE_COMMAND_LINE: &str = "earlycon=xe9 console=hvc1 reboot=t panic=-1";
+pub const MICROVM_CONSOLE_COMMAND_LINE: &str = if cfg!(guest_arch = "aarch64") {
+    "console=ttyAMA0 reboot=t panic=-1"
+} else {
+    "earlycon=xe9 console=hvc1 reboot=t panic=-1"
+};
 /// Maximum microVM command-line size, including its trailing NUL.
 pub const MICROVM_COMMAND_LINE_MAX_SIZE: usize = 64 * 1024;
 /// Fixed distro virtio-blk MMIO base.
@@ -110,23 +118,31 @@ pub const MICROVM_VIRTIO_CONSOLE_MMIO_BASE: u64 = 0xd000_2000;
 /// Fixed microVM virtio transport window length.
 pub const MICROVM_VIRTIO_MMIO_LEN: u64 = 0x1000;
 /// Fixed distro virtio-blk interrupt.
-pub const MICROVM_VIRTIO_BLK_IRQ: u32 = 4;
+pub const MICROVM_VIRTIO_BLK_IRQ: u32 = if cfg!(guest_arch = "aarch64") { 6 } else { 4 };
 /// Fixed virtio-blk interrupt for the runtime lower layer.
 ///
 /// IRQ 8 is exclusively owned by the microVM RTC.
-pub const MICROVM_VIRTIO_RUNTIME_BLK_IRQ: u32 = 12;
+pub const MICROVM_VIRTIO_RUNTIME_BLK_IRQ: u32 = if cfg!(guest_arch = "aarch64") { 7 } else { 12 };
 /// Fixed virtio-blk interrupt for the custom lower layer.
-pub const MICROVM_VIRTIO_CUSTOM_BLK_IRQ: u32 = 9;
+pub const MICROVM_VIRTIO_CUSTOM_BLK_IRQ: u32 = if cfg!(guest_arch = "aarch64") { 8 } else { 9 };
 /// Fixed virtio-blk interrupt for the writable scratch layer.
-pub const MICROVM_VIRTIO_SCRATCH_BLK_IRQ: u32 = 11;
+pub const MICROVM_VIRTIO_SCRATCH_BLK_IRQ: u32 = if cfg!(guest_arch = "aarch64") { 9 } else { 11 };
 /// Fixed microVM virtio-console interrupt.
-pub const MICROVM_VIRTIO_CONSOLE_IRQ: u32 = 7;
+pub const MICROVM_VIRTIO_CONSOLE_IRQ: u32 = if cfg!(guest_arch = "aarch64") { 5 } else { 7 };
 /// Fixed microVM virtio-fs interrupt.
-pub const MICROVM_VIRTIO_FS_IRQ: u32 = 6;
+pub const MICROVM_VIRTIO_FS_IRQ: u32 = if cfg!(guest_arch = "aarch64") { 4 } else { 6 };
 /// Fixed microVM virtio-net interrupt on KVM.
-pub const MICROVM_VIRTIO_NET_KVM_IRQ: u32 = 10;
+pub const MICROVM_VIRTIO_NET_KVM_IRQ: u32 = if cfg!(guest_arch = "aarch64") { 3 } else { 10 };
 /// Fixed microVM virtio-net interrupt on WHP.
 pub const MICROVM_VIRTIO_NET_WHP_IRQ: u32 = 5;
+/// Fixed aarch64 MMIO console and restore-control window.
+pub const MICROVM_CONTROL_MMIO_BASE: u64 = 0xd000_7000;
+/// Fixed aarch64 MMIO process-status shutdown register.
+pub const MICROVM_SHUTDOWN_MMIO_BASE: u64 = 0xd000_8000;
+/// Fixed aarch64 MMIO snapshot-request register.
+pub const MICROVM_SNAPSHOT_MMIO_BASE: u64 = 0xd000_9000;
+/// Size of each fixed aarch64 microVM control window.
+pub const MICROVM_CONTROL_MMIO_LEN: u64 = 0x1000;
 /// Exact microVM virtio-net feature mask: MAC and virtio version 1.
 pub const MICROVM_VIRTIO_NET_FEATURES: u64 = (1 << 5) | (1 << 32);
 /// Exact microVM virtio-fs feature mask: indirect descriptors, event index,
@@ -488,6 +504,15 @@ impl std::str::FromStr for MicrovmNetworkConfig {
 
 /// Returns the pinned virtio-net IRQ for the selected microVM backend.
 pub fn microvm_virtio_net_irq(hypervisor_id: Option<&str>) -> anyhow::Result<u32> {
+    if cfg!(guest_arch = "aarch64") {
+        return match hypervisor_id {
+            Some("kvm") | None if cfg!(target_os = "linux") => Ok(MICROVM_VIRTIO_NET_KVM_IRQ),
+            Some(other) => {
+                anyhow::bail!("aarch64 microVM virtio-net does not support hypervisor '{other}'")
+            }
+            None => anyhow::bail!("aarch64 microVM virtio-net requires the KVM hypervisor"),
+        };
+    }
     match hypervisor_id {
         Some("kvm" | "mshv") => Ok(MICROVM_VIRTIO_NET_KVM_IRQ),
         Some("whp") => Ok(MICROVM_VIRTIO_NET_WHP_IRQ),
@@ -596,30 +621,34 @@ pub fn append_microvm_virtio_discovery(
             matches!(irq, MICROVM_VIRTIO_NET_KVM_IRQ | MICROVM_VIRTIO_NET_WHP_IRQ),
             "microVM virtio-net IRQ {irq} is not part of the fixed machine contract"
         );
-        write!(
-            cmdline,
-            " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_NET_MMIO_BASE:#x}:{irq}"
-        )?;
+        if cfg!(guest_arch = "x86_64") {
+            write!(
+                cmdline,
+                " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_NET_MMIO_BASE:#x}:{irq}"
+            )?;
+        }
     }
-    if filesystem_slot {
+    if filesystem_slot && cfg!(guest_arch = "x86_64") {
         write!(
             cmdline,
             " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_FS_MMIO_BASE:#x}:{MICROVM_VIRTIO_FS_IRQ}"
         )?;
     }
-    if has_console {
+    if has_console && cfg!(guest_arch = "x86_64") {
         write!(
             cmdline,
             " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_CONSOLE_MMIO_BASE:#x}:{MICROVM_VIRTIO_CONSOLE_IRQ}"
         )?;
     }
-    for block in blocks {
-        write!(
-            cmdline,
-            " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{:#x}:{}",
-            block.role.mmio_base(),
-            block.role.irq()
-        )?;
+    if cfg!(guest_arch = "x86_64") {
+        for block in blocks {
+            write!(
+                cmdline,
+                " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{:#x}:{}",
+                block.role.mmio_base(),
+                block.role.irq()
+            )?;
+        }
     }
     if let Some((network, _, gateway_dns)) = network {
         write!(
@@ -645,8 +674,14 @@ fn validate_microvm_command_line(
     let MachineProfile::Microvm = config.machine_profile else {
         unreachable!("microVM command-line validation requires the microVM profile");
     };
-    let LoadMode::Pvh { cmdline, .. } = &config.load_mode else {
-        anyhow::bail!("microVM requires PVH load mode");
+    let cmdline: &str = match &config.load_mode {
+        LoadMode::Pvh { cmdline, .. } if !cfg!(guest_arch = "aarch64") => cmdline,
+        LoadMode::Linux {
+            cmdline,
+            boot_mode: LinuxDirectBootMode::DeviceTree,
+            ..
+        } if cfg!(guest_arch = "aarch64") => cmdline,
+        _ => anyhow::bail!("microVM requires its architecture-specific direct boot mode"),
     };
     anyhow::ensure!(
         !cmdline.contains('\0'),
@@ -719,11 +754,14 @@ fn validate_microvm_command_line(
             .filter(|token| token.starts_with(prefix))
             .count();
         let expected = match prefix {
-            "virtio_mmio.device=" => config.virtio_devices.len(),
+            "virtio_mmio.device=" => {
+                usize::from(cfg!(guest_arch = "x86_64")) * config.virtio_devices.len()
+            }
             "virtnet_ip=" | "virtnet_mask=" | "virtnet_gw=" => usize::from(has_network),
             "virtfs_dir=" | "virtfs_tag=" | "virtfs_mode=" => {
                 usize::from(config.microvm_filesystem_bootstrap)
             }
+            "earlycon=" => usize::from(!cfg!(guest_arch = "aarch64")),
             _ => 1,
         };
         anyhow::ensure!(
@@ -751,29 +789,31 @@ fn validate_microvm_command_line(
         );
     }
     let mut expected_discovery = Vec::new();
-    if has_network {
-        let irq = microvm_virtio_net_irq(hypervisor_id)?;
-        expected_discovery.push(format!(
-            "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_NET_MMIO_BASE:#x}:{irq}"
-        ));
+    if cfg!(guest_arch = "x86_64") {
+        if has_network {
+            let irq = microvm_virtio_net_irq(hypervisor_id)?;
+            expected_discovery.push(format!(
+                "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_NET_MMIO_BASE:#x}:{irq}"
+            ));
+        }
+        if has_filesystem {
+            expected_discovery.push(format!(
+                "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_FS_MMIO_BASE:#x}:{MICROVM_VIRTIO_FS_IRQ}"
+            ));
+        }
+        if has_console {
+            expected_discovery.push(format!(
+                "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_CONSOLE_MMIO_BASE:#x}:{MICROVM_VIRTIO_CONSOLE_IRQ}"
+            ));
+        }
+        expected_discovery.extend(config.microvm_sandbox_blocks.iter().map(|block| {
+            format!(
+                "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{:#x}:{}",
+                block.role.mmio_base(),
+                block.role.irq()
+            )
+        }));
     }
-    if has_filesystem {
-        expected_discovery.push(format!(
-            "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_FS_MMIO_BASE:#x}:{MICROVM_VIRTIO_FS_IRQ}"
-        ));
-    }
-    if has_console {
-        expected_discovery.push(format!(
-            "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_CONSOLE_MMIO_BASE:#x}:{MICROVM_VIRTIO_CONSOLE_IRQ}"
-        ));
-    }
-    expected_discovery.extend(config.microvm_sandbox_blocks.iter().map(|block| {
-        format!(
-            "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{:#x}:{}",
-            block.role.mmio_base(),
-            block.role.irq()
-        )
-    }));
     if let Some(network) = &config.microvm_network {
         expected_discovery.extend(
             network
@@ -896,34 +936,63 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
 
     validate_microvm_virtio_reservations()?;
     validate_microvm_command_line(config, hypervisor_id)?;
+    let direct_boot_matches = match &config.load_mode {
+        LoadMode::Pvh { .. } => !cfg!(guest_arch = "aarch64"),
+        LoadMode::Linux {
+            enable_serial: true,
+            isolation: LinuxIsolationConfig::None,
+            boot_mode: LinuxDirectBootMode::DeviceTree,
+            ..
+        } => cfg!(guest_arch = "aarch64"),
+        _ => false,
+    };
     anyhow::ensure!(
-        matches!(config.load_mode, LoadMode::Pvh { .. }),
-        "microVM requires PVH load mode"
+        direct_boot_matches,
+        "microVM requires its architecture-specific direct boot mode"
     );
     if let Some(hypervisor_id) = hypervisor_id {
-        anyhow::ensure!(
-            matches!(hypervisor_id, "kvm" | "mshv" | "whp"),
-            "microVM requires the KVM, MSHV, or WHP hypervisor"
-        );
+        if cfg!(guest_arch = "aarch64") {
+            anyhow::ensure!(
+                hypervisor_id == "kvm",
+                "aarch64 microVM requires the KVM hypervisor"
+            );
+        } else {
+            anyhow::ensure!(
+                matches!(hypervisor_id, "kvm" | "mshv" | "whp"),
+                "microVM requires the KVM, MSHV, or WHP hypervisor"
+            );
+        }
     }
     anyhow::ensure!(
         microvm_processor_count_supported(config.processor_topology.proc_count),
         "microVM does not support {} vCPUs",
         config.processor_topology.proc_count
     );
-    let has_expected_topology = config.processor_topology.vps_per_socket
-        == Some(config.processor_topology.proc_count)
-        && config.processor_topology.enable_smt == Some(false)
-        && matches!(
+    let has_expected_arch = if cfg!(guest_arch = "aarch64") {
+        matches!(
+            &config.processor_topology.arch,
+            Some(ArchTopologyConfig::Aarch64(Aarch64TopologyConfig {
+                gic_config: None,
+                pmu_gsiv: PmuGsivConfig::Platform,
+                gic_msi: GicMsiConfig::Auto,
+            }))
+        )
+    } else {
+        matches!(
             &config.processor_topology.arch,
             Some(ArchTopologyConfig::X86(X86TopologyConfig {
                 apic_id_offset: 0,
                 x2apic: X2ApicConfig::Unsupported,
             }))
-        );
+        )
+    };
+    let has_expected_topology = config.processor_topology.vps_per_socket
+        == Some(config.processor_topology.proc_count)
+        && config.processor_topology.enable_smt == Some(false)
+        && has_expected_arch;
     anyhow::ensure!(
         has_expected_topology,
-        "microVM requires its fixed x86 APIC topology"
+        "microVM requires its fixed architecture topology"
     );
     anyhow::ensure!(
         config.numa.nodes.len() == 1 && config.numa.distances.is_empty(),
@@ -956,7 +1025,7 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
     );
 
     let expected_chipset = BaseChipsetManifest {
-        with_generic_cmos_rtc: true,
+        with_generic_cmos_rtc: cfg!(guest_arch = "x86_64"),
         ..BaseChipsetManifest::empty()
     };
     anyhow::ensure!(
@@ -964,9 +1033,9 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
         "microVM chipset is not the microVM allowlist"
     );
     anyhow::ensure!(
-        config.chipset_capabilities.with_ioapic
-            && config.chipset_capabilities.with_pic
-            && config.chipset_capabilities.with_pit
+        config.chipset_capabilities.with_ioapic == cfg!(guest_arch = "x86_64")
+            && config.chipset_capabilities.with_pic == cfg!(guest_arch = "x86_64")
+            && config.chipset_capabilities.with_pit == cfg!(guest_arch = "x86_64")
             && !config.chipset_capabilities.with_generic_isa_dma
             && !config.chipset_capabilities.with_psp
             && !config.chipset_capabilities.with_guest_watchdog
@@ -980,16 +1049,26 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
         .map(|device| (device.name.as_str(), device.resource.id()))
         .collect::<Vec<_>>();
     chipset_ids.sort_unstable();
+    let expected_chipset_ids: &[(&str, &str)] = if cfg!(guest_arch = "x86_64") {
+        &[
+            ("ioapic", "generic-ioapic"),
+            ("microvm-portb", "microvm-portb"),
+            ("microvm-shutdown", "microvm-shutdown"),
+            ("microvm-snapshot-request", "microvm-snapshot-request"),
+            ("pic", "pic"),
+            ("pit", "pit"),
+        ]
+    } else {
+        &[
+            ("com1", "serial_pl011"),
+            ("com2", "serial_pl011"),
+            ("microvm-portb", "microvm-portb"),
+            ("microvm-shutdown", "microvm-shutdown"),
+            ("microvm-snapshot-request", "microvm-snapshot-request"),
+        ]
+    };
     anyhow::ensure!(
-        chipset_ids
-            == [
-                ("ioapic", "generic-ioapic"),
-                ("microvm-portb", "microvm-portb"),
-                ("microvm-shutdown", "microvm-shutdown"),
-                ("microvm-snapshot-request", "microvm-snapshot-request"),
-                ("pic", "pic"),
-                ("pit", "pit"),
-            ],
+        chipset_ids == expected_chipset_ids,
         "microVM chipset-device inventory is not exact"
     );
 
@@ -1081,7 +1160,7 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
         config.layout.chipset_low_mmio_size == 1024 * 1024 * 1024
             && config.layout.chipset_high_mmio_size == 0
             && config.layout.vtl2_chipset_mmio_size == 0,
-        "microVM requires the fixed 3-GiB/4-GiB RAM split"
+        "microVM requires the fixed low-MMIO aperture"
     );
     Ok(())
 }

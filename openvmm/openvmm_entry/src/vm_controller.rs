@@ -682,7 +682,7 @@ impl VmController {
             }
             anyhow::ensure!(
                 self.effective_command_line.is_some(),
-                "microVM snapshot capture requires an effective PVH command line"
+                "microVM snapshot capture requires an effective direct-boot command line"
             );
             Ok(())
         })();
@@ -764,7 +764,7 @@ impl VmController {
                 response.state_unit_names,
                 response.capture_wall_clock,
                 response.tsc_frequency_hz,
-                Some(response.apic_frequency_hz),
+                (response.apic_frequency_hz != 0).then_some(response.apic_frequency_hz),
                 response.cpu_contract,
             )?;
             let manifest = openvmm_helpers::snapshot::SnapshotManifest {

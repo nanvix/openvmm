@@ -547,7 +547,9 @@ impl SerialPl011 {
 impl ChangeDeviceState for SerialPl011 {
     fn start(&mut self) {}
 
-    async fn stop(&mut self) {}
+    async fn stop(&mut self) {
+        let _ = self.poll_tx(&mut Context::from_waker(Waker::noop()));
+    }
 
     async fn reset(&mut self) {
         self.state = State::new(self.io.is_connected());

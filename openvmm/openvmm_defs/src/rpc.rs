@@ -67,11 +67,11 @@ pub struct SnapshotSaveResponse {
     pub saved_state: ProtobufMessage,
     /// Complete state-unit inventory in stable registration order.
     pub state_unit_names: Vec<String>,
-    /// Effective PVH command line loaded into the guest.
+    /// Effective architecture-specific direct-boot command line.
     pub effective_command_line: String,
-    /// Effective guest TSC frequency.
+    /// Effective guest TSC frequency, or zero when the architecture has no TSC.
     pub tsc_frequency_hz: u64,
-    /// Effective local APIC timer frequency.
+    /// Effective local APIC timer frequency, or zero when not applicable.
     pub apic_frequency_hz: u64,
     /// Host wall time at the stopped capture boundary.
     pub capture_wall_clock: mesh::payload::Timestamp,

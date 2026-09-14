@@ -84,6 +84,13 @@ pub enum KvmError {
         #[source]
         err: kvm::Error,
     },
+    #[cfg(guest_arch = "aarch64")]
+    #[error("failed to access ARM snapshot timer register {register}")]
+    SnapshotTimerRegister {
+        register: &'static str,
+        #[source]
+        err: kvm::Error,
+    },
     #[cfg(guest_arch = "x86_64")]
     #[error("nested virtualization was requested but the host does not support it")]
     NestedVirtUnsupported,
@@ -152,7 +159,14 @@ struct KvmPartitionInner {
     /// The GIC device fd, kept alive for the VM lifetime.
     #[cfg(guest_arch = "aarch64")]
     #[inspect(skip)]
-    _gic_device: kvm::Device,
+    gic_device: kvm::Device,
+    /// GIC version selected for the partition.
+    #[cfg(guest_arch = "aarch64")]
+    gic_version: vm_topology::processor::aarch64::GicVersion,
+    /// Serializes ARM64 vCPU state ioctls so VGIC state can lock every vCPU.
+    #[cfg(guest_arch = "aarch64")]
+    #[inspect(skip)]
+    vp_state_lock: Mutex<()>,
     /// The ITS device fd, kept alive for the VM lifetime.
     #[cfg(guest_arch = "aarch64")]
     #[inspect(skip)]

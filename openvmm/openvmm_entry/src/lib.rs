@@ -2052,7 +2052,7 @@ async fn vm_config_from_command_line(
             || opt.vmbus_com2_serial.is_some()
             || opt.debugcon.is_some())
     {
-        bail!("microVM does not expose UART, debugcon, or VMBus serial");
+        bail!("microVM does not permit custom UART, debugcon, or VMBus serial");
     }
 
     let microvm_console = if is_microvm {
@@ -2069,22 +2069,43 @@ async fn vm_config_from_command_line(
         validate_microvm_console_attachment_namespace(attachment, snapshot_dir)?;
     }
 
-    let microvm_portb_cfg = if is_microvm {
-        let backend = if microvm_console
+    let microvm_primary_backend = is_microvm.then(|| {
+        if microvm_console
             .as_ref()
             .is_some_and(|(config, _, _)| matches!(config, SerialConfigCli::Console))
         {
             SerialConfigCli::Stderr
         } else {
             SerialConfigCli::Console
-        };
-        setup_serial("microvm-portb", backend, "hvc0")?
+        }
+    });
+    let microvm_portb_cfg = if is_microvm {
+        if cfg!(guest_arch = "aarch64") {
+            Some(DisconnectedSerialBackendHandle.into_resource())
+        } else {
+            setup_serial(
+                "microvm-portb",
+                microvm_primary_backend
+                    .as_ref()
+                    .expect("microVM primary backend is configured")
+                    .clone(),
+                "hvc0",
+            )?
+        }
     } else {
         None
     };
 
     let serial0_cfg = if is_microvm {
-        None
+        if cfg!(guest_arch = "aarch64") {
+            setup_serial(
+                "microvm-uart",
+                microvm_primary_backend.expect("microVM primary backend is configured"),
+                "ttyAMA0",
+            )?
+        } else {
+            None
+        }
     } else {
         setup_serial(
             "com1",
@@ -3142,11 +3163,8 @@ async fn vm_config_from_command_line(
     }
 
     if is_microvm {
-        if arch != MachineArch::X86_64 {
-            bail!("the microVM profile requires an x86-64 guest");
-        }
         if opt.igvm.is_some() || opt.pcat || opt.uefi {
-            bail!("the microVM profile requires Xen PVH direct boot");
+            bail!("the microVM profile owns its architecture-specific direct boot mode");
         }
 
         let (kernel, initrd, cmdline) = if let Some(contract) = restore_machine_contract {
@@ -3174,11 +3192,26 @@ async fn vm_config_from_command_line(
             )
         };
 
-        load_mode = LoadMode::Pvh {
-            kernel,
-            initrd,
-            cmdline,
-        };
+        #[cfg(guest_arch = "x86_64")]
+        {
+            load_mode = LoadMode::Pvh {
+                kernel,
+                initrd,
+                cmdline,
+            };
+        }
+        #[cfg(guest_arch = "aarch64")]
+        {
+            load_mode = LoadMode::Linux {
+                kernel,
+                initrd,
+                cmdline,
+                enable_serial: true,
+                isolation: openvmm_defs::config::LinuxIsolationConfig::None,
+                boot_mode: openvmm_defs::config::LinuxDirectBootMode::DeviceTree,
+                smbios,
+            };
+        }
         with_hv = false;
     } else if opt.restore_snapshot.is_some() {
         // Snapshot restore: skip firmware loading entirely. Device state and
@@ -3589,11 +3622,15 @@ async fn vm_config_from_command_line(
             // TODO: allow this to be configured from the command line
             gic_config: None,
             pmu_gsiv: openvmm_defs::config::PmuGsivConfig::Platform,
-            gic_msi: match opt.gic_msi {
-                cli_args::GicMsiCli::Auto => openvmm_defs::config::GicMsiConfig::Auto,
-                cli_args::GicMsiCli::Its => openvmm_defs::config::GicMsiConfig::Its,
-                cli_args::GicMsiCli::V2m => {
-                    openvmm_defs::config::GicMsiConfig::V2m { spi_count: None }
+            gic_msi: if is_microvm {
+                openvmm_defs::config::GicMsiConfig::Auto
+            } else {
+                match opt.gic_msi {
+                    cli_args::GicMsiCli::Auto => openvmm_defs::config::GicMsiConfig::Auto,
+                    cli_args::GicMsiCli::Its => openvmm_defs::config::GicMsiConfig::Its,
+                    cli_args::GicMsiCli::V2m => {
+                        openvmm_defs::config::GicMsiConfig::V2m { spi_count: None }
+                    }
                 }
             },
         },
@@ -4152,8 +4189,9 @@ async fn vm_config_from_command_line(
         .as_deref()
         .and_then(|spec| spec.split(':').next());
     if cfg.machine_profile == MachineProfile::Microvm && restore_machine_contract.is_none() {
-        let LoadMode::Pvh { cmdline, .. } = &mut cfg.load_mode else {
-            unreachable!("microVM configuration was constructed with PVH load mode");
+        let cmdline = match &mut cfg.load_mode {
+            LoadMode::Pvh { cmdline, .. } | LoadMode::Linux { cmdline, .. } => cmdline,
+            _ => unreachable!("microVM configuration was constructed with direct boot"),
         };
         let has_console = cfg
             .virtio_devices
@@ -4699,7 +4737,7 @@ fn prepare_snapshot_restore(
         Some((
             expected_hypervisor,
             effective_command_line
-                .context("microVM restore requires an effective PVH command line")?,
+                .context("microVM restore requires an effective direct-boot command line")?,
             network,
             filesystem,
             console_attachment,
@@ -5330,7 +5368,7 @@ async fn run_control_inner(
     )
     .await?;
     let effective_command_line = match &vm_config.load_mode {
-        LoadMode::Pvh { cmdline, .. } => Some(cmdline.clone()),
+        LoadMode::Pvh { cmdline, .. } | LoadMode::Linux { cmdline, .. } => Some(cmdline.clone()),
         _ => None,
     };
     let microvm_sandbox_block_sources =
@@ -5624,11 +5662,15 @@ async fn run_control_inner(
             snapshot_ready,
             snapshot_capture_enabled: snapshot_destination.is_some(),
             restore_downtime: restore_time.as_ref().map(|(downtime, _, _, _)| *downtime),
-            restore_tsc_frequency_hz: restore_time.as_ref().map(|(_, frequency, _, _)| *frequency),
+            restore_tsc_frequency_hz: restore_time
+                .as_ref()
+                .and_then(|(_, frequency, _, _)| (*frequency != 0).then_some(*frequency)),
             restore_apic_frequency_hz: restore_time
                 .as_ref()
                 .and_then(|(_, _, frequency, _)| *frequency),
-            restore_cpu_contract: restore_time.map(|(_, _, _, cpu_contract)| cpu_contract),
+            restore_cpu_contract: restore_time.and_then(|(_, _, _, cpu_contract)| {
+                (!cpu_contract.is_empty()).then_some(cpu_contract)
+            }),
             restore_ready_sink,
             restore_gate_timeout: restore_gate_required
                 .then_some(Duration::from_millis(opt.restore_gate_timeout_ms)),

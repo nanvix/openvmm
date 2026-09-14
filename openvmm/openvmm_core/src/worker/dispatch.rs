@@ -353,16 +353,20 @@ impl Worker for VmWorker {
         let snapshot_restore_guards = parameters.snapshot_restore_guards;
         let restore_ready_sink = parameters.restore_ready_sink;
         let restore_gate_timeout = parameters.restore_gate_timeout;
-        let restore_time = match (
-            parameters.restore_downtime,
-            parameters.restore_tsc_frequency_hz,
-            parameters.restore_apic_frequency_hz,
-        ) {
-            (Some(downtime), Some(tsc_frequency), apic_frequency) => {
-                Some((downtime, tsc_frequency, apic_frequency))
+        let restore_time = match parameters.restore_downtime {
+            Some(downtime) => Some((
+                downtime,
+                parameters.restore_tsc_frequency_hz,
+                parameters.restore_apic_frequency_hz,
+            )),
+            None => {
+                anyhow::ensure!(
+                    parameters.restore_tsc_frequency_hz.is_none()
+                        && parameters.restore_apic_frequency_hz.is_none(),
+                    "restore clock frequencies require restore downtime"
+                );
+                None
             }
-            (None, None, None) => None,
-            _ => anyhow::bail!("restore downtime and TSC frequency must be provided together"),
         };
         tracing::debug!(?restore_time, "received snapshot restore time contract");
         let restore_cpu_contract = parameters.restore_cpu_contract;
@@ -392,28 +396,29 @@ impl Worker for VmWorker {
             manifest,
             shared_memory,
         ))?;
+        #[cfg(guest_arch = "x86_64")]
         if let Some(expected_cpu_contract) = restore_cpu_contract {
-            #[cfg(guest_arch = "x86_64")]
-            {
-                let destination_contract = vm.partition.cpu_compatibility_contract();
-                let destination_cpu_contract = mesh::payload::encode(destination_contract.clone());
-                if destination_cpu_contract != expected_cpu_contract {
-                    let expected_contract: virt::x86::CpuCompatibilityContract =
-                        mesh::payload::decode(&expected_cpu_contract)
-                            .context("failed to decode snapshot CPU contract")?;
-                    let first_cpuid_difference = expected_contract
-                        .cpuid
-                        .iter()
-                        .zip(&destination_contract.cpuid)
-                        .find(|(expected, destination)| expected != destination);
-                    anyhow::bail!(
-                        "destination CPU contract does not match the snapshot; first CPUID difference: {first_cpuid_difference:?}"
-                    );
-                }
+            let destination_contract = vm.partition.cpu_compatibility_contract();
+            let destination_cpu_contract = mesh::payload::encode(destination_contract.clone());
+            if destination_cpu_contract != expected_cpu_contract {
+                let expected_contract: virt::x86::CpuCompatibilityContract =
+                    mesh::payload::decode(&expected_cpu_contract)
+                        .context("failed to decode snapshot CPU contract")?;
+                let first_cpuid_difference = expected_contract
+                    .cpuid
+                    .iter()
+                    .zip(&destination_contract.cpuid)
+                    .find(|(expected, destination)| expected != destination);
+                anyhow::bail!(
+                    "destination CPU contract does not match the snapshot; first CPUID difference: {first_cpuid_difference:?}"
+                );
             }
-            #[cfg(not(guest_arch = "x86_64"))]
-            anyhow::bail!("snapshot CPU contracts are only supported for x86-64 guests");
         }
+        #[cfg(guest_arch = "aarch64")]
+        anyhow::ensure!(
+            restore_cpu_contract.is_none(),
+            "snapshot CPU contracts are only supported for x86-64 guests"
+        );
         let saved_state = parameters
             .saved_state
             .map(|m| m.parse())
@@ -922,6 +927,8 @@ struct LoadedVmInner {
     virtio_mmio_region: MemoryRange,
     #[cfg_attr(not(guest_arch = "x86_64"), expect(dead_code))]
     virtio_mmio_irq: u32,
+    #[cfg_attr(not(guest_arch = "aarch64"), expect(dead_code))]
+    microvm_virtio_mmio_devices: Vec<(u64, u32)>,
     /// Resolved chipset MMIO ranges.
     chipset_mmio: ChipsetMmioRanges,
     /// ((device, function), interrupt)
@@ -1298,7 +1305,8 @@ impl InitializedVm {
                 device_assignment_msi_iova_range,
                 user_mode_memory_faults,
                 lazy_memory_registration,
-                versioned_cpu_contract: cfg.machine_profile == MachineProfile::Microvm,
+                versioned_cpu_contract: cfg!(guest_arch = "x86_64")
+                    && cfg.machine_profile == MachineProfile::Microvm,
             })
             .context("failed to create the prototype partition")?;
         partition_prototype.complete("startup", "partition_prototype", Default::default());
@@ -1357,12 +1365,14 @@ impl InitializedVm {
         //  2. Fix UEFI to allow booting from >0.
         //  3. Install a little bit of low memory, enough for UEFI to get to DXE
         //     (which can run anywhere.)
-        let ram_start_address =
-            if cfg!(guest_arch = "aarch64") && matches!(cfg.load_mode, LoadMode::Linux { .. }) {
-                1024 * 1024 * 1024 // 1 GiB
-            } else {
-                0
-            };
+        let ram_start_address = if cfg!(guest_arch = "aarch64")
+            && cfg.machine_profile != MachineProfile::Microvm
+            && matches!(cfg.load_mode, LoadMode::Linux { .. })
+        {
+            1024 * 1024 * 1024 // 1 GiB
+        } else {
+            0
+        };
 
         let vtl2_framebuffer_size = if cfg.vtl2_gfx {
             cfg.framebuffer
@@ -1738,7 +1748,8 @@ impl InitializedVm {
         self,
         saved_state: Option<SavedState>,
         client_notify_send: mesh::Sender<HaltReason>,
-        restore_time: Option<(Duration, u64, Option<u64>)>,
+        restore_time: Option<(Duration, Option<u64>, Option<u64>)>,
+        #[cfg_attr(guest_arch = "aarch64", expect(unused_variables))]
         snapshot_capture_enabled: bool,
     ) -> Result<LoadedVm, anyhow::Error> {
         use vmotherboard::options::dev;
@@ -2762,6 +2773,7 @@ impl InitializedVm {
                 | LoadMode::Uefi { .. }
                 | LoadMode::Pcat { .. }
                 | LoadMode::Igvm { .. }
+                | LoadMode::Pvh { .. }
                 | LoadMode::None => true,
             };
             match &resolved_iommu {
@@ -3221,6 +3233,7 @@ impl InitializedVm {
         let mut pci_device_number = 10;
         let mut virtio_mmio_index = 0;
         let mut microvm_sandbox_blocks = cfg.microvm_sandbox_blocks.iter();
+        let mut microvm_virtio_mmio_devices = Vec::new();
 
         // Avoid an ISA interrupt to avoid conflicts and to avoid needing to
         // configure the line as level-triggered in the MADT (necessary for
@@ -3294,10 +3307,15 @@ impl InitializedVm {
                             }
                             _ => 1 << 34,
                         };
-                        let interrupt_mode = VirtioMmioInterruptMode::SharedStatus {
-                            status_gpa: openvmm_defs::config::microvm_virtio_status_gpa(start)
-                                .context("microVM slot has no shared-status word")?,
+                        let interrupt_mode = if cfg!(guest_arch = "aarch64") {
+                            VirtioMmioInterruptMode::Legacy
+                        } else {
+                            VirtioMmioInterruptMode::SharedStatus {
+                                status_gpa: openvmm_defs::config::microvm_virtio_status_gpa(start)
+                                    .context("microVM slot has no shared-status word")?,
+                            }
                         };
+                        microvm_virtio_mmio_devices.push((start, irq));
                         (start, len, irq, disabled_features, interrupt_mode)
                     } else {
                         let start = virtio_mmio_region.start() + virtio_mmio_index as u64 * 0x1000;
@@ -3475,6 +3493,7 @@ impl InitializedVm {
                 load_mode: cfg.load_mode,
                 virtio_mmio_region,
                 virtio_mmio_irq,
+                microvm_virtio_mmio_devices,
                 chipset_mmio,
                 pci_legacy_interrupts,
                 igvm_file,
@@ -3501,27 +3520,37 @@ impl InitializedVm {
 
         if let Some(saved_state) = saved_state {
             if let Some((_, saved_frequency, saved_apic_frequency)) = restore_time {
-                let destination_frequency = this
-                    .inner
-                    .partition
-                    .tsc_frequency_hz()?
-                    .context("destination backend does not expose a guest TSC frequency")?;
-                anyhow::ensure!(
-                    destination_frequency == saved_frequency,
-                    "destination TSC frequency {destination_frequency} Hz does not match saved frequency {saved_frequency} Hz"
-                );
-                this.inner.partition.set_tsc_frequency_hz(saved_frequency)?;
-                let destination_apic_frequency = this
-                    .inner
-                    .partition
-                    .apic_frequency_hz()?
-                    .context("destination backend does not expose a local APIC frequency")?;
-                if let Some(saved_apic_frequency) = saved_apic_frequency {
+                #[cfg(guest_arch = "x86_64")]
+                let saved_frequency =
+                    saved_frequency.context("snapshot is missing its TSC frequency contract")?;
+                let destination_frequency = this.inner.partition.tsc_frequency_hz()?;
+                #[cfg(guest_arch = "x86_64")]
+                {
+                    let destination_frequency = destination_frequency
+                        .context("destination backend does not expose a guest TSC frequency")?;
                     anyhow::ensure!(
-                        destination_apic_frequency == saved_apic_frequency,
-                        "destination APIC frequency {destination_apic_frequency} Hz does not match saved frequency {saved_apic_frequency} Hz"
+                        destination_frequency == saved_frequency,
+                        "destination TSC frequency {destination_frequency} Hz does not match saved frequency {saved_frequency} Hz"
                     );
+                    this.inner.partition.set_tsc_frequency_hz(saved_frequency)?;
+                    let destination_apic_frequency =
+                        this.inner.partition.apic_frequency_hz()?.context(
+                            "destination backend does not expose a local APIC frequency",
+                        )?;
+                    if let Some(saved_apic_frequency) = saved_apic_frequency {
+                        anyhow::ensure!(
+                            destination_apic_frequency == saved_apic_frequency,
+                            "destination APIC frequency {destination_apic_frequency} Hz does not match saved frequency {saved_apic_frequency} Hz"
+                        );
+                    }
                 }
+                #[cfg(guest_arch = "aarch64")]
+                anyhow::ensure!(
+                    destination_frequency.is_none()
+                        && saved_frequency.is_none()
+                        && saved_apic_frequency.is_none(),
+                    "aarch64 microVM snapshots must not contain x86 clock-frequency contracts"
+                );
             }
             let saved_state_restore = openvmm_defs::profile::ProfileSpan::start();
             this.restore(saved_state)
@@ -3529,12 +3558,16 @@ impl InitializedVm {
                 .context("loadedvm restore failed")?;
             saved_state_restore.complete("restore", "saved_state_restore", Default::default());
             if let Some((downtime, frequency, saved_apic_frequency)) = restore_time {
+                #[cfg(guest_arch = "aarch64")]
+                let _ = (frequency, saved_apic_frequency);
                 this.state_units
                     .advance_time(downtime)
                     .await
                     .context("failed to advance restored VM time")?;
                 #[cfg(guest_arch = "x86_64")]
                 {
+                    let frequency =
+                        frequency.context("snapshot is missing its TSC frequency contract")?;
                     let apic_frequency = match saved_apic_frequency {
                         Some(frequency) => frequency,
                         None => this.inner.partition.apic_frequency_hz()?.context(
@@ -3611,6 +3644,7 @@ impl LoadedVmInner {
                 }
             })
             .collect();
+        #[cfg(guest_arch = "x86_64")]
         let microvm_level_triggered_irqs: &[u32] = match self.machine_profile {
             MachineProfile::Microvm => &openvmm_defs::config::MICROVM_LEVEL_TRIGGERED_IRQS,
             MachineProfile::Standard => &[],
@@ -3859,6 +3893,8 @@ impl LoadedVmInner {
                     &kernel_config,
                     &self.gm,
                     enable_serial,
+                    self.machine_profile == MachineProfile::Microvm,
+                    &self.microvm_virtio_mmio_devices,
                     &self.processor_topology,
                     &self.pcie_host_bridges,
                     smmu_configs,
@@ -4479,11 +4515,12 @@ impl LoadedVm {
                             );
                             let effective_command_line = match &self.inner.load_mode {
                                 LoadMode::Pvh { cmdline, .. } => cmdline.clone(),
+                                LoadMode::Linux { cmdline, .. } => cmdline.clone(),
                                 _ => {
                                     return Err(
                                         openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
                                             RemoteError::new(anyhow::anyhow!(
-                                                "microVM snapshot has no effective PVH command line"
+                                                "microVM snapshot has no effective direct-boot command line"
                                             )),
                                         ),
                                     );
@@ -4498,13 +4535,7 @@ impl LoadedVm {
                                         RemoteError::new(error),
                                     )
                                 })?
-                                .ok_or_else(|| {
-                                    openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
-                                        RemoteError::new(anyhow::anyhow!(
-                                            "backend does not expose a guest TSC frequency"
-                                        )),
-                                    )
-                                })?;
+                                .unwrap_or(0);
                             let apic_frequency_hz = self
                                 .inner
                                 .partition
@@ -4514,13 +4545,7 @@ impl LoadedVm {
                                         RemoteError::new(error),
                                     )
                                 })?
-                                .ok_or_else(|| {
-                                    openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
-                                        RemoteError::new(anyhow::anyhow!(
-                                            "backend does not expose a local APIC frequency"
-                                        )),
-                                    )
-                                })?;
+                                .unwrap_or(0);
                             let capture_wall_clock = self
                                 .snapshot_capture_wall_clock
                                 .ok_or_else(|| {
@@ -4537,9 +4562,18 @@ impl LoadedVm {
                                 tsc_frequency_hz,
                                 apic_frequency_hz,
                                 capture_wall_clock,
-                                cpu_contract: mesh::payload::encode(
-                                    self.inner.partition.cpu_compatibility_contract(),
-                                ),
+                                cpu_contract: {
+                                    #[cfg(guest_arch = "x86_64")]
+                                    {
+                                        mesh::payload::encode(
+                                            self.inner.partition.cpu_compatibility_contract(),
+                                        )
+                                    }
+                                    #[cfg(guest_arch = "aarch64")]
+                                    {
+                                        Vec::new()
+                                    }
+                                },
                             })
                         })
                         .await;

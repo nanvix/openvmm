@@ -219,11 +219,28 @@ impl PetriVmConfigOpenVmm {
         }
 
         if is_microvm {
-            load_mode = match load_mode {
-                LoadMode::Linux { kernel, initrd, .. } => LoadMode::Pvh {
+            load_mode = match (arch, load_mode) {
+                (MachineArch::X86_64, LoadMode::Linux { kernel, initrd, .. }) => LoadMode::Pvh {
                     kernel,
                     initrd,
                     cmdline: build_microvm_command_line(&[], false)?,
+                },
+                (
+                    MachineArch::Aarch64,
+                    LoadMode::Linux {
+                        kernel,
+                        initrd,
+                        smbios,
+                        ..
+                    },
+                ) => LoadMode::Linux {
+                    kernel,
+                    initrd,
+                    cmdline: build_microvm_command_line(&[], false)?,
+                    enable_serial: true,
+                    isolation: openvmm_defs::config::LinuxIsolationConfig::None,
+                    boot_mode: openvmm_defs::config::LinuxDirectBootMode::DeviceTree,
+                    smbios,
                 },
                 _ => unreachable!("microVM firmware was validated as LinuxDirect"),
             };
@@ -255,10 +272,11 @@ impl PetriVmConfigOpenVmm {
             )
         };
         let mut emulated_serial_config = emulated_serial_config;
-        let microvm_portb = is_microvm.then(|| {
-            emulated_serial_config[0]
+        let microvm_portb = is_microvm.then(|| match arch {
+            MachineArch::Aarch64 => DisconnectedSerialBackendHandle.into_resource(),
+            MachineArch::X86_64 => emulated_serial_config[0]
                 .take()
-                .unwrap_or_else(|| DisconnectedSerialBackendHandle.into_resource())
+                .unwrap_or_else(|| DisconnectedSerialBackendHandle.into_resource()),
         });
 
         let (video_dev, framebuffer, framebuffer_view) = match setup.config_video()? {
@@ -391,7 +409,7 @@ impl PetriVmConfigOpenVmm {
 
         // Configure the serial ports now that they have been updated by the
         // OpenHCL configuration.
-        if properties.enable_serial && !is_microvm {
+        if properties.enable_serial && (!is_microvm || arch == MachineArch::Aarch64) {
             chipset = chipset.with_serial(emulated_serial_config);
             // Set so that we don't pull serial data until the guest is
             // ready. Otherwise, Linux will drop the input serial data

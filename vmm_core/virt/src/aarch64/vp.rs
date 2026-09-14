@@ -280,7 +280,29 @@ impl StateElement<Aarch64PartitionCapabilities, Aarch64VpInfo> for Registers {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Protobuf, Inspect)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Protobuf, Inspect)]
+#[mesh(package = "virt.aarch64")]
+pub struct OpaqueRegister {
+    #[inspect(hex)]
+    #[mesh(1)]
+    pub id: u64,
+    #[mesh(2)]
+    pub value: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Protobuf, Inspect)]
+#[mesh(package = "virt.aarch64")]
+pub struct OpaqueDeviceRegister {
+    #[mesh(1)]
+    pub group: u32,
+    #[inspect(hex)]
+    #[mesh(2)]
+    pub attr: u64,
+    #[mesh(3)]
+    pub value: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Protobuf, Inspect)]
 #[mesh(package = "virt.aarch64")]
 pub struct SystemRegisters {
     #[inspect(hex)]
@@ -310,6 +332,56 @@ pub struct SystemRegisters {
     #[inspect(hex)]
     #[mesh(9)]
     pub vbar_el1: u64,
+    #[inspect(hex)]
+    #[mesh(10)]
+    pub spsr_el1: u64,
+    #[inspect(hex)]
+    #[mesh(11)]
+    pub par_el1: u64,
+    #[inspect(hex)]
+    #[mesh(12)]
+    pub contextidr_el1: u64,
+    #[inspect(hex)]
+    #[mesh(13)]
+    pub tpidr_el0: u64,
+    #[inspect(hex)]
+    #[mesh(14)]
+    pub tpidrro_el0: u64,
+    #[inspect(hex)]
+    #[mesh(15)]
+    pub tpidr_el1: u64,
+    #[inspect(hex)]
+    #[mesh(16)]
+    pub cpacr_el1: u64,
+    #[inspect(hex)]
+    #[mesh(17)]
+    pub cntkctl_el1: u64,
+    #[inspect(hex)]
+    #[mesh(18)]
+    pub cntv_ctl_el0: u64,
+    #[inspect(hex)]
+    #[mesh(19)]
+    pub cntv_cval_el0: u64,
+    #[inspect(hex)]
+    #[mesh(20)]
+    pub cntp_ctl_el0: u64,
+    #[inspect(hex)]
+    #[mesh(21)]
+    pub cntp_cval_el0: u64,
+    #[mesh(22)]
+    pub mp_state: u32,
+    #[inspect(skip)]
+    #[mesh(23)]
+    pub opaque_registers: Vec<OpaqueRegister>,
+    #[inspect(skip)]
+    #[mesh(24)]
+    pub gic_registers: Vec<OpaqueDeviceRegister>,
+    #[inspect(hex)]
+    #[mesh(25)]
+    pub cntv_count_el0: u64,
+    #[inspect(hex)]
+    #[mesh(26)]
+    pub cntfrq_el0: u64,
 }
 
 impl HvRegisterState<HvArm64RegisterName, 9> for SystemRegisters {
@@ -328,7 +400,7 @@ impl HvRegisterState<HvArm64RegisterName, 9> for SystemRegisters {
     }
 
     fn get_values<'a>(&self, it: impl Iterator<Item = &'a mut HvRegisterValue>) {
-        let &Self {
+        let Self {
             sctlr_el1,
             ttbr0_el1,
             ttbr1_el1,
@@ -338,9 +410,11 @@ impl HvRegisterState<HvArm64RegisterName, 9> for SystemRegisters {
             mair_el1,
             elr_el1,
             vbar_el1,
+            ..
         } = self;
         for (dest, src) in it.zip([
-            sctlr_el1, ttbr0_el1, ttbr1_el1, tcr_el1, esr_el1, far_el1, mair_el1, elr_el1, vbar_el1,
+            *sctlr_el1, *ttbr0_el1, *ttbr1_el1, *tcr_el1, *esr_el1, *far_el1, *mair_el1, *elr_el1,
+            *vbar_el1,
         ]) {
             *dest = src.into();
         }
@@ -357,6 +431,7 @@ impl HvRegisterState<HvArm64RegisterName, 9> for SystemRegisters {
             mair_el1,
             elr_el1,
             vbar_el1,
+            ..
         } = self;
         for (src, dest) in it.zip([
             sctlr_el1, ttbr0_el1, ttbr1_el1, tcr_el1, esr_el1, far_el1, mair_el1, elr_el1, vbar_el1,
@@ -411,7 +486,12 @@ impl StateElement<Aarch64PartitionCapabilities, Aarch64VpInfo> for SystemRegiste
             mair_el1: 0,
             elr_el1: 0,
             vbar_el1: 0,
+            ..Default::default()
         }
+    }
+
+    fn can_compare(_caps: &Aarch64PartitionCapabilities) -> bool {
+        false
     }
 }
 

@@ -440,7 +440,11 @@ impl PartitionStateBuilder {
 
     fn write_aarch64_vp_chunks(&self, out: &mut Vec<u8>, state: &Aarch64VpState) {
         let r = &state.registers;
-        let sys = state.system_registers.unwrap_or_default();
+        let default_system_registers = Default::default();
+        let sys = state
+            .system_registers
+            .as_ref()
+            .unwrap_or(&default_system_registers);
 
         out.extend_from_slice(
             VpArm64SaveChunkGpRegisters {
@@ -457,9 +461,9 @@ impl PartitionStateBuilder {
                 elr_el2: 0,
                 spsr_el2: 0,
                 esr_el1: sys.esr_el1,
-                spsr_el1: 0,
+                spsr_el1: sys.spsr_el1,
                 far_el1: sys.far_el1,
-                par_el1: 0,
+                par_el1: sys.par_el1,
                 elr_el1: sys.elr_el1,
                 sp_el0: r.sp_el0,
                 sp_el1: r.sp_el1,

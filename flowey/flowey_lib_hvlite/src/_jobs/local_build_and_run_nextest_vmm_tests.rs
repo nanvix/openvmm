@@ -706,6 +706,7 @@ impl SimpleFlowNode for Node {
                         CommonTriple::AARCH64_WINDOWS_MSVC => "windows-aarch64",
                         CommonTriple::X86_64_WINDOWS_MSVC => "windows-x64",
                         CommonTriple::X86_64_LINUX_GNU => "linux-x64",
+                        CommonTriple::AARCH64_LINUX_GNU => "linux-aarch64",
                         CommonTriple::AARCH64_LINUX_MUSL => "linux-aarch64-musl",
                         _ => unreachable!(),
                     };

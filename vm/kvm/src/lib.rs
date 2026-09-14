@@ -114,6 +114,8 @@ mod ioctl {
     ioctl_write_ptr!(kvm_get_reg, KVMIO, 0xab, kvm_one_reg);
     ioctl_write_ptr!(kvm_set_reg, KVMIO, 0xac, kvm_one_reg);
     #[cfg(target_arch = "aarch64")]
+    ioctl_readwrite!(kvm_get_reg_list, KVMIO, 0xb0, kvm_reg_list);
+    #[cfg(target_arch = "aarch64")]
     ioctl_write_ptr!(kvm_arm_vcpu_init, KVMIO, 0xae, kvm_vcpu_init);
     #[cfg(target_arch = "aarch64")]
     ioctl_read!(kvm_arm_preferred_target, KVMIO, 0xaf, kvm_vcpu_init);
@@ -131,7 +133,6 @@ mod ioctl {
     );
     ioctl_readwrite!(kvm_create_device, KVMIO, 0xe0, kvm_create_device);
     ioctl_write_ptr!(kvm_set_device_attr, KVMIO, 0xe1, kvm_device_attr);
-    #[cfg(target_arch = "x86_64")]
     ioctl_write_ptr!(kvm_get_device_attr, KVMIO, 0xe2, kvm_device_attr);
     ioctl_readwrite!(kvm_create_guest_memfd, KVMIO, 0xd4, kvm_create_guest_memfd);
     #[cfg(target_arch = "aarch64")]
@@ -287,6 +288,16 @@ pub enum Error {
     SetRegs(#[source] nix::Error),
     #[error("SetSRegs")]
     SetSRegs(#[source] nix::Error),
+    #[cfg(target_arch = "aarch64")]
+    #[error("invalid size encoding for KVM register {0:#x}")]
+    InvalidRegisterSize(u64),
+    #[cfg(target_arch = "aarch64")]
+    #[error("KVM register {id:#x} has {actual} bytes, but its ID requires {expected}")]
+    RegisterSizeMismatch {
+        id: u64,
+        expected: usize,
+        actual: usize,
+    },
     #[cfg(target_arch = "x86_64")]
     #[error("GetTscFrequency")]
     GetTscFrequency(#[source] nix::Error),
@@ -1264,6 +1275,41 @@ impl Device {
         }
         Ok(())
     }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn get_device_attr_bytes(&self, group: u32, attr: u64, size: usize) -> Result<Vec<u8>> {
+        let mut value = vec![0; size];
+        let request = kvm_device_attr {
+            group,
+            attr,
+            addr: value.as_mut_ptr() as u64,
+            flags: 0,
+        };
+        // SAFETY: request.addr points to a writable buffer of the caller-specified
+        // attribute size for the duration of the ioctl.
+        unsafe {
+            ioctl::kvm_get_device_attr(self.0.as_raw_fd(), &request)
+                .map_err(Error::GetDeviceAttr)?;
+        }
+        Ok(value)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_device_attr_bytes(&self, group: u32, attr: u64, value: &[u8]) -> Result<()> {
+        let request = kvm_device_attr {
+            group,
+            attr,
+            addr: value.as_ptr() as u64,
+            flags: 0,
+        };
+        // SAFETY: request.addr points to a readable buffer of the required
+        // attribute size for the duration of the ioctl.
+        unsafe {
+            ioctl::kvm_set_device_attr(self.0.as_raw_fd(), &request)
+                .map_err(Error::SetDeviceAttr)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -1423,6 +1469,76 @@ impl<'a> Processor<'a> {
         }
 
         Ok(value)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn register_size(reg_id: u64) -> Result<usize> {
+        let size_shift = ((reg_id >> 52) & 0xf) as u32;
+        if size_shift > 8 {
+            return Err(Error::InvalidRegisterSize(reg_id));
+        }
+        Ok(1usize << size_shift)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn get_register_ids(&self) -> Result<Vec<u64>> {
+        let mut capacity = 512usize;
+        loop {
+            let mut storage = vec![0u64; capacity + 1];
+            storage[0] = capacity as u64;
+            let list = storage.as_mut_ptr().cast::<kvm_reg_list>();
+            // SAFETY: storage contains the kvm_reg_list header followed by
+            // capacity u64 register IDs, and remains live for the ioctl.
+            let result =
+                unsafe { ioctl::kvm_get_reg_list(self.get().vcpu.as_raw_fd(), &mut *list) };
+            match result {
+                Ok(_) => {
+                    let count = usize::try_from(storage[0])
+                        .map_err(|_| Error::InvalidRegisterSize(storage[0]))?;
+                    return Ok(storage[1..=count].to_vec());
+                }
+                Err(nix::errno::Errno::E2BIG) => {
+                    capacity = usize::try_from(storage[0])
+                        .map_err(|_| Error::InvalidRegisterSize(storage[0]))?;
+                }
+                Err(error) => return Err(Error::GetRegs(error)),
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn get_reg_bytes(&self, reg_id: u64) -> Result<Vec<u8>> {
+        let mut value = vec![0; Self::register_size(reg_id)?];
+        let reg = kvm_one_reg {
+            id: reg_id,
+            addr: value.as_mut_ptr() as u64,
+        };
+        // SAFETY: value has the size encoded by reg_id and remains live for the ioctl.
+        unsafe {
+            ioctl::kvm_get_reg(self.get().vcpu.as_raw_fd(), &reg).map_err(Error::GetRegs)?;
+        }
+        Ok(value)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_reg_bytes(&self, reg_id: u64, value: &[u8]) -> Result<()> {
+        let expected = Self::register_size(reg_id)?;
+        if value.len() != expected {
+            return Err(Error::RegisterSizeMismatch {
+                id: reg_id,
+                expected,
+                actual: value.len(),
+            });
+        }
+        let reg = kvm_one_reg {
+            id: reg_id,
+            addr: value.as_ptr() as u64,
+        };
+        // SAFETY: value has the size encoded by reg_id and remains live for the ioctl.
+        unsafe {
+            ioctl::kvm_set_reg(self.get().vcpu.as_raw_fd(), &reg).map_err(Error::SetRegs)?;
+        }
+        Ok(())
     }
 
     #[cfg(not(target_arch = "aarch64"))]
