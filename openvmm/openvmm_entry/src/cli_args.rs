@@ -42,7 +42,7 @@ use openvmm_defs::config::append_microvm_virtio_discovery;
 #[cfg(test)]
 use openvmm_defs::config::build_microvm_command_line;
 #[cfg(test)]
-use openvmm_defs::config::build_microvm_v2_command_line;
+use openvmm_defs::config::build_microvm_control_command_line;
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -998,7 +998,7 @@ options:
     #[clap(long)]
     pub virtio_console: Option<SerialConfigCli>,
 
-    /// dedicated microVM ABI-v2 control console backed by a local serial endpoint
+    /// dedicated microVM control console backed by a local serial endpoint
     ///
     /// Accepts listen=\<path\> or none. The boot
     /// virtio-console is required and remains the only kernel console.
@@ -6395,7 +6395,7 @@ mod tests {
                 "{MICROVM_CONSOLE_COMMAND_LINE} virtio_mmio.device=0x1000@0xd0002000:7 virtio_mmio.device=0x1000@0xd0003000:4 virtio_mmio.device=0x1000@0xd0006000:11"
             )
         );
-        let mut with_control_console = build_microvm_v2_command_line(&[], true).unwrap();
+        let mut with_control_console = build_microvm_control_command_line(&[], true).unwrap();
         append_microvm_virtio_discovery(
             &mut with_control_console,
             None,
@@ -6500,11 +6500,11 @@ mod tests {
             "driver-async-probe=virtio_console",
             "virtio-mmio.device=0x1000@0xd0007000:3",
         ] {
-            assert!(build_microvm_v2_command_line(&[reserved.into()], false).is_err());
+            assert!(build_microvm_control_command_line(&[reserved.into()], false).is_err());
             assert!(build_microvm_command_line(&[reserved.into()], false).is_ok());
         }
         for delimiter in ["--", "\"driver-async-probe=virtio_console\""] {
-            assert!(build_microvm_v2_command_line(&[delimiter.into()], false).is_err());
+            assert!(build_microvm_control_command_line(&[delimiter.into()], false).is_err());
             assert!(build_microvm_command_line(&[delimiter.into()], false).is_ok());
         }
         assert!(build_microvm_command_line(&["foo=bar\0baz".into()], false).is_err());
