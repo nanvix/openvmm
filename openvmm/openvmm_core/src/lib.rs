@@ -10,6 +10,7 @@
 //! time.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(verus_keep_ghost, feature(proc_macro_hygiene))]
 
 mod emuplat;
 pub mod hypervisor_backend;

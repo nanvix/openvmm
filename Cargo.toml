@@ -63,7 +63,8 @@ members = [
 ]
 exclude = [
   "xsync",
-  "Guide/mdbook-openvmm-shim"
+  "Guide/mdbook-openvmm-shim",
+  "toolchain/verus-src",
 ]
 
 [workspace.package]
@@ -75,6 +76,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 xtask_fuzz = { path = "xtask/xtask_fuzz" }
+vstd = { path = "toolchain/verus-src/source/vstd", default-features = false, features = ["alloc"] }
 
 # opentmk
 opentmk_protocol = { path = "opentmk_protocol" }

@@ -3924,7 +3924,7 @@ where
 /// host (when appropriate).
 async fn halt_task(
     mut halt_notify_recv: mesh::Receiver<HaltReason>,
-    mut _fatal_error_recv: mesh::Receiver<Box<dyn std::error::Error + Send + Sync>>,
+    mut _fatal_error_recv: mesh::Receiver<vmm_core::vmotherboard_adapter::FatalError>,
     control_send: Arc<Mutex<Option<mesh::Sender<ControlRequest>>>>,
     get_client: GuestEmulationTransportClient,
     halt_on_guest_halt: bool,

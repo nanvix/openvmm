@@ -143,6 +143,11 @@ impl IoApicRoutingConnection {
         // translated on its next delivery rather than translating eagerly here.
         self.inner.mark_dirty(ALL_IRQS);
     }
+
+    pub fn connect_selection(&self, selection: &IoapicIommuSelection) -> u16 {
+        self.connect_remapper(selection.ioapic_rid, selection.remapper.clone());
+        selection.ioapic_rid
+    }
 }
 
 impl IoApicRoutingInner {

@@ -1,4 +1,11 @@
 /target
+.tools/verus/
+toolchain/verus-src/
+.verus_onboarding/
+.verus_limitation/
+.verus_agent/
+.argus/
+.argus-limitation-home/
 **/*.rs.bk
 
 .vscode/

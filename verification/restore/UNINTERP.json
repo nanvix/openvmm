@@ -1,0 +1,38 @@
+{
+  "schema": "openvmm/restore-uninterp-ledger-v1",
+  "completion_status": "proof_debt",
+  "entries": [
+    {
+      "symbol": "restore_proof::initialized_vm_representation",
+      "deferred_fact": "A total abstraction from every constructible production InitializedVm to its memory, compatibility class, VP-capacity and initial/default VP state, boot-online policy, abstract component set and state, virtual time, and external-resource View.",
+      "source_evidence": [
+        "openvmm/openvmm_core/src/worker/dispatch.rs"
+      ],
+      "consumer": "View for InitializedVm",
+      "removal": "Replace the representation bridge with component Views for processor topology, memory, component state, virtual time, compatibility, and external resource identity."
+    },
+    {
+      "symbol": "restore_proof::decoded_restore_request_view",
+      "deferred_fact": "A total abstraction from successfully decoded SavedState, restore_time, and restore_vp_count to SavedVmStateView plus restore policy. It must expose only SavedState-owned partition, stable-identity VP, inventory, mutable component, and virtual-time state, without inventing memory, resources, compatibility, provenance, or the expected LoadedVm result.",
+      "source_evidence": [
+        "openvmm/openvmm_defs/src/worker.rs",
+        "openvmm/openvmm_core/src/worker/dispatch.rs",
+        "vmm_core/src/partition_unit/vp_set.rs"
+      ],
+      "consumer": "InitializedVm::load TOP contract",
+      "removal": "Add production Views for SavedState units, VP selection policy, and restore-time inputs, then define this constructor from those Views. Keep the serialized-file decoding correspondence as the explicitly trusted boundary required by the human how-to specification."
+    },
+    {
+      "symbol": "restore_proof::loaded_vm_representation",
+      "deferred_fact": "A total abstraction from the returned production LoadedVm to memory, preserved destination VP capacity, partition and stable-identity VP state, complete component inventory, active and pending component state, virtual time, resources, active VP count, and execution phase.",
+      "source_evidence": [
+        "openvmm/openvmm_core/src/worker/dispatch.rs",
+        "vmm_core/src/partition_unit.rs",
+        "vm/devices/virtio/virtio/src/transport/core.rs",
+        "vm/devices/virtio/virtio/src/transport/task.rs"
+      ],
+      "consumer": "View for LoadedVm",
+      "removal": "Replace the representation bridge with component Views and connect them with closed representation invariants and lemmas."
+    }
+  ]
+}

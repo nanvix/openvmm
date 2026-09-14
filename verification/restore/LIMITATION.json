@@ -1,0 +1,98 @@
+{
+  "schema": "openvmm/restore-limitation-review-v1",
+  "probe_run": "20260914T093044620326Z",
+  "disposition": "tool_blocked",
+  "summary": "openvmm_core opts into cargo-verus and the exhaustive top-level result contract is attached directly to production InitializedVm::load. The focused verifier now passes all source-level frontend blockers found so far, including tracing, local declarations, formatting macros, trait-object coercions, constants, array patterns, and async generator closures. The current immediate blocker is a pinned-Verus pruning bug for the Cargo-built vstd async hook; a guarded diagnostic verifier then exposes the next real BOTTOM modeling frontier at HvlitePartition.",
+  "tool_blocker": {
+    "evidence": "target/verus/restore.log",
+    "reason": "The stock pinned verifier panics in `vir/src/prune.rs` because async-root pruning marks `vstd::future::exec_await` reachable while the Cargo-built vstd metadata has no function-map entry for that private hook. A same-commit diagnostic build identified the exact missing key as `Fun(Path(vstd, [\"future\" :: \"exec_await\"]))`. With a diagnostic-only missing-entry guard, translation continues and reports that production trait `HvlitePartition` is not declared to Verus; an attempted empty external-trait declaration correctly fails because its `Inspect`, `Send`, `Sync`, and `RequestYield` supertrait closure is not modeled.",
+    "safe_boundary": "Do not claim InitializedVm::load verification. Fix or patch the cargo-verus/vstd async metadata contract without skipping arbitrary reachable functions, then add an explicit HvlitePartition external trait specification with only restore-relevant method contracts and the required supertrait models. Do not cfg-remove control flow, reintroduce a copied executable, use a ghost-selected replacement, add broad external_body annotations, or assume the final restore relation."
+  },
+  "removed_frontiers": [
+    {
+      "class": "instrumentation macro expansion",
+      "sites": 13,
+      "rewrite": "Moved four tracing expansions to production helpers and excluded eight profile-span groups plus one profile-enabled branch from verifier instrumentation."
+    },
+    {
+      "class": "function-local declarations",
+      "sites": 6,
+      "rewrite": "Changed four immutable local constants to immutable locals and lifted two active Linux local structs to module scope."
+    },
+    {
+      "class": "anyhow formatted ensure",
+      "sites": 2,
+      "rewrite": "Preserved both conditions and exact error messages using explicit Err control flow and production error constructors; no assume_specification was added."
+    },
+    {
+      "class": "trait-object lowering",
+      "sites": 4,
+      "rewrite": "Removed one redundant dyn cast and moved three unsupported trait-object construction boundaries into real production helpers."
+    },
+    {
+      "class": "unsupported constant representation",
+      "sites": 2,
+      "rewrite": "Replaced two one-byte string conversions with equivalent one-byte vector literals."
+    },
+    {
+      "class": "async generator and array-pattern lowering",
+      "sites": 4,
+      "rewrite": "Moved the vmtime, input-distributor, PCIe construction, and VP-thread async closures behind real production helper APIs, and replaced the fixed two-element slice pattern with two ordered std::mem::take operations."
+    },
+    {
+      "class": "fatal-error channel trait object",
+      "sites": 2,
+      "rewrite": "Introduced the concrete vmm_core::vmotherboard_adapter::FatalError message wrapper so both OpenVMM and Underhill preserve the original boxed error and receiver lifetime without exposing a multi-trait object to the focused frontend."
+    }
+  ],
+  "required_models": [
+    {
+      "id": "restore-entry-bridge",
+      "finding": "Complete the executable-bound contract already attached to InitializedVm::load and prove its real async body through the pre-execution return boundary.",
+      "disposition": "blocked_by_frontend",
+      "evidence": ["openvmm/openvmm_core/src/worker/dispatch.rs", "openvmm/openvmm_core/src/worker/dispatch.spec.rs", "openvmm/openvmm_core/src/worker/dispatch.proof.rs", "target/verus/restore.log"]
+    },
+    {
+      "id": "ram-layout",
+      "finding": "The caller must establish that the prepared RAM supplied to InitializedVm::load matches the validated snapshot memory layout.",
+      "disposition": "external_boundary",
+      "evidence": ["openvmm/openvmm_helpers/src/snapshot.rs", "verification/restore/SPEC.md"]
+    },
+    {
+      "id": "processor-inventory",
+      "finding": "Require a full-capacity saved VP inventory and distinguish the MSHV-selected instantiated prefix, boot-online lower bound, and full-capacity KVM/WHP behavior.",
+      "disposition": "required_model",
+      "evidence": ["openvmm/openvmm_core/src/worker/dispatch.rs", "vmm_core/src/partition_unit.rs"]
+    },
+    {
+      "id": "clock-and-timer-adjustment",
+      "finding": "Model VmTime wrapping advance, backend clock behavior, TSC/LAPIC/RTC downtime adjustment, and checked KVM nanosecond conversion.",
+      "disposition": "required_model",
+      "evidence": ["vm/vmcore/src/vmtime.rs", "vmm_core/virt/src/x86/vp.rs", "vm/devices/chipset/src/cmos_rtc.rs"]
+    },
+    {
+      "id": "device-restore-phases",
+      "finding": "Separate immediate state-unit restore from deferred virtio private restore, with Pending(None), NotRestored, stateless devices, and queue enablement represented distinctly.",
+      "disposition": "required_model",
+      "evidence": ["vm/devices/virtio/virtio/src/transport/core.rs", "vm/devices/virtio/virtio/src/transport/task.rs"]
+    },
+    {
+      "id": "external-resource-identity",
+      "finding": "Preserve the identity and attachment constraints of resources supplied outside the serialized snapshot.",
+      "disposition": "external_boundary",
+      "evidence": ["verification/restore/SPEC.md", "verification/restore/COMPONENTS.md"]
+    },
+    {
+      "id": "failure-publication-gate",
+      "finding": "On restore failure, prove only that the VM is not published ready and no guest instruction executes; rollback and cleanup are caller responsibilities.",
+      "disposition": "required_model",
+      "evidence": ["openvmm/openvmm_core/src/worker/dispatch.rs", "verification/restore/SPEC.md"]
+    },
+    {
+      "id": "conditional-platform-features",
+      "finding": "VMBus and VTL2 restoration are conditional or out of the microVM v1/v2 core profile, not unconditional restore guarantees.",
+      "disposition": "external_boundary",
+      "evidence": ["verification/restore/COMPONENTS.md"]
+    }
+  ]
+}
