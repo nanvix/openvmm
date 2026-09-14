@@ -107,7 +107,7 @@ pub const MICROVM_VIRTIO_NET_MMIO_BASE: u64 = 0xd000_0000;
 pub const MICROVM_VIRTIO_FS_MMIO_BASE: u64 = 0xd000_1000;
 /// Reserved microVM virtio-console MMIO base.
 pub const MICROVM_VIRTIO_CONSOLE_MMIO_BASE: u64 = 0xd000_2000;
-/// Fixed ABI-v2 control virtio-console MMIO base.
+/// Fixed microVM control virtio-console MMIO base.
 pub const MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE: u64 = 0xd000_7000;
 /// Fixed microVM virtio transport window length.
 pub const MICROVM_VIRTIO_MMIO_LEN: u64 = 0x1000;
@@ -123,7 +123,7 @@ pub const MICROVM_VIRTIO_CUSTOM_BLK_IRQ: u32 = 9;
 pub const MICROVM_VIRTIO_SCRATCH_BLK_IRQ: u32 = 11;
 /// Fixed microVM virtio-console interrupt.
 pub const MICROVM_VIRTIO_CONSOLE_IRQ: u32 = 7;
-/// Fixed ABI-v2 control virtio-console interrupt.
+/// Fixed microVM control virtio-console interrupt.
 pub const MICROVM_VIRTIO_CONTROL_CONSOLE_IRQ: u32 = 3;
 /// Fixed microVM virtio-fs interrupt.
 pub const MICROVM_VIRTIO_FS_IRQ: u32 = 6;
@@ -138,9 +138,9 @@ pub const MICROVM_VIRTIO_NET_FEATURES: u64 = (1 << 5) | (1 << 32);
 pub const MICROVM_VIRTIO_FS_FEATURES: u64 = (1 << 28) | (1 << 29) | (1 << 32) | (1 << 33);
 /// MicroVM client console reconnect timeout.
 pub const MICROVM_CONSOLE_RECONNECT_TIMEOUT_MS: u64 = 5_000;
-/// Resource identity of the ABI-v2 control virtio-console device.
+/// Resource identity of the microVM control virtio-console device.
 pub const MICROVM_VIRTIO_CONTROL_CONSOLE_ID: &str = "virtio-control-console";
-/// Host-owned kernel command-line token identifying the ABI-v2 control tty.
+/// Host-owned kernel command-line token identifying the control tty.
 pub const MICROVM_CONTROL_TTY_COMMAND_LINE: &str = "nvx_control_tty=hvc2";
 /// MicroVM virtio MMIO reservations in stable device order.
 pub const MICROVM_VIRTIO_MMIO_BASES: [u64; 8] = [
@@ -726,7 +726,7 @@ fn validate_microvm_command_line(
     );
     anyhow::ensure!(
         !has_control_console || has_console,
-        "microVM ABI version 2 control console requires the boot console"
+        "microVM control console requires the boot console"
     );
     let base_tokens = if has_console {
         MICROVM_CONSOLE_COMMAND_LINE
@@ -865,8 +865,8 @@ pub fn build_microvm_command_line(
     build_microvm_command_line_inner(user_args, has_console, false)
 }
 
-/// Builds the ABI-v2 microVM command line and reserves control-console tokens.
-pub fn build_microvm_v2_command_line(
+/// Builds the microVM command line with control-console tokens reserved.
+pub fn build_microvm_control_command_line(
     user_args: &[String],
     has_console: bool,
 ) -> anyhow::Result<String> {
@@ -893,7 +893,7 @@ fn validate_microvm_control_console_command_line(
     }
     anyhow::ensure!(
         !tokens.iter().any(|token| token.contains('"')) && !tokens.contains(&"--"),
-        "microVM ABI version 2 control-console command line cannot contain quotes or the kernel argument delimiter"
+        "microVM control-console command line cannot contain quotes or the kernel argument delimiter"
     );
     anyhow::ensure!(
         !tokens
@@ -925,7 +925,7 @@ fn build_microvm_command_line_inner(
             && (arg.contains('"') || arg.split_ascii_whitespace().any(|token| token == "--"))
         {
             anyhow::bail!(
-                "microVM ABI version 2 command line cannot contain quotes or the kernel argument delimiter"
+                "microVM control-console command line cannot contain quotes or the kernel argument delimiter"
             );
         }
         if arg.split_ascii_whitespace().any(|token| {
@@ -1175,7 +1175,7 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
             MICROVM_VIRTIO_CONTROL_CONSOLE_ID => {
                 anyhow::ensure!(
                     !std::mem::replace(&mut has_control_console, true),
-                    "microVM ABI version 2 permits only one control console"
+                    "microVM permits only one control console"
                 );
             }
             "virtio-blk" => block_count += 1,
@@ -1184,7 +1184,7 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
     }
     anyhow::ensure!(
         !has_control_console || has_console,
-        "microVM ABI version 2 control console requires the boot console"
+        "microVM control console requires the boot console"
     );
     validate_microvm_sandbox_blocks(&config.microvm_sandbox_blocks)?;
     anyhow::ensure!(
@@ -1594,7 +1594,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn control_console_restrictions_do_not_change_legacy_abi_v2_command_lines() {
+    fn control_console_restrictions_preserve_existing_command_lines() {
         let user_args = [
             r#"note="left right""#.to_owned(),
             "--".to_owned(),
@@ -1609,7 +1609,7 @@ mod tests {
         let mut cmdline = cmdline;
         append_microvm_virtio_discovery(&mut cmdline, None, false, None, true, false, &[]).unwrap();
 
-        assert!(build_microvm_v2_command_line(&user_args, true).is_err());
+        assert!(build_microvm_control_command_line(&user_args, true).is_err());
     }
 
     #[test]
