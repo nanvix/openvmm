@@ -18,7 +18,9 @@ use inspect::InspectMut;
 use power_resources::PowerRequest;
 use power_resources::PowerRequestClient;
 use serial_core::SerialIo;
+use serial_core::disconnected::Disconnected;
 use std::collections::VecDeque;
+use std::io;
 use std::io::ErrorKind;
 use std::ops::RangeInclusive;
 use std::pin::Pin;
@@ -73,6 +75,10 @@ pub struct MicrovmPortb {
     rx_waker: Option<Waker>,
     #[inspect(skip)]
     tx_waker: Option<Waker>,
+    #[inspect(skip)]
+    output_drain_requests: Option<mesh::Receiver<mesh::rpc::FailableRpc<(), ()>>>,
+    #[inspect(skip)]
+    output_drain: Option<mesh::rpc::FailableRpc<(), ()>>,
 }
 
 impl MicrovmPortb {
@@ -108,7 +114,18 @@ impl MicrovmPortb {
             input_gated: false,
             rx_waker: None,
             tx_waker: None,
+            output_drain_requests: None,
+            output_drain: None,
         }
+    }
+
+    /// Installs the process-exit output drain channel.
+    pub fn with_output_drain(
+        mut self,
+        requests: Option<mesh::Receiver<mesh::rpc::FailableRpc<(), ()>>>,
+    ) -> Self {
+        self.output_drain_requests = requests;
+        self
     }
 
     fn poll_rx(&mut self, cx: &mut Context<'_>) {
@@ -135,15 +152,17 @@ impl MicrovmPortb {
         }
     }
 
-    fn poll_tx(&mut self, cx: &mut Context<'_>) {
+    fn poll_tx(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while !self.tx_buffer.is_empty() {
             let (buffer, _) = self.tx_buffer.as_slices();
             match Pin::new(&mut self.io).poll_write(cx, buffer) {
-                Poll::Ready(Ok(0)) => break,
+                Poll::Ready(Ok(0)) => return Poll::Ready(Err(ErrorKind::WriteZero.into())),
                 Poll::Ready(Ok(count)) => {
                     self.tx_buffer.drain(..count);
                 }
-                Poll::Ready(Err(error)) if error.kind() == ErrorKind::BrokenPipe => break,
+                Poll::Ready(Err(error)) if error.kind() == ErrorKind::BrokenPipe => {
+                    return Poll::Ready(Err(error));
+                }
                 Poll::Ready(Err(error)) => {
                     tracelimit::error_ratelimited!(
                         len = buffer.len(),
@@ -151,13 +170,14 @@ impl MicrovmPortb {
                         "microVM portb output failed; dropping buffered bytes"
                     );
                     self.tx_buffer.clear();
+                    self.tx_waker = Some(cx.waker().clone());
+                    return Poll::Ready(Err(error));
                 }
-                Poll::Pending => break,
+                Poll::Pending => return Poll::Pending,
             }
         }
-        if self.tx_buffer.is_empty() {
-            self.tx_waker = Some(cx.waker().clone());
-        }
+        self.tx_waker = Some(cx.waker().clone());
+        Poll::Ready(Ok(()))
     }
 
     fn wake_tx(&mut self) {
@@ -191,7 +211,7 @@ impl ChangeDeviceState for MicrovmPortb {
         // Drain every byte the endpoint accepts immediately. Any remaining
         // VMM-owned bytes are serialized and retried against the reconstructed
         // endpoint after restore.
-        self.poll_tx(&mut Context::from_waker(Waker::noop()));
+        let _ = self.poll_tx(&mut Context::from_waker(Waker::noop()));
     }
 
     async fn reset(&mut self) {
@@ -219,6 +239,21 @@ impl ChipsetDevice for MicrovmPortb {
 
 impl PollDevice for MicrovmPortb {
     fn poll_device(&mut self, cx: &mut Context<'_>) {
+        if self.output_drain.is_none()
+            && let Some(requests) = &mut self.output_drain_requests
+        {
+            match requests.poll_recv(cx) {
+                Poll::Ready(Ok(request)) => {
+                    tracing::debug!(
+                        buffered_bytes = self.tx_buffer.len(),
+                        "draining microVM portb output"
+                    );
+                    self.output_drain = Some(request);
+                }
+                Poll::Ready(Err(_)) => self.output_drain_requests = None,
+                Poll::Pending => {}
+            }
+        }
         if !self.io.is_connected() {
             match self.io.poll_connect(cx) {
                 Poll::Ready(Ok(())) => {}
@@ -235,7 +270,22 @@ impl PollDevice for MicrovmPortb {
         if !self.input_gated {
             self.poll_rx(cx);
         }
-        self.poll_tx(cx);
+        let output = self.poll_tx(cx);
+        if self.output_drain.is_some() {
+            let output = match output {
+                Poll::Ready(Ok(())) => Pin::new(&mut self.io).poll_flush(cx),
+                output => output,
+            };
+            if let Poll::Ready(result) = output {
+                // Closing the endpoint publishes EOF only after every accepted
+                // byte has reached it. The controller also waits for the relay.
+                self.io = Box::new(Disconnected);
+                self.output_drain_requests = None;
+                if let Some(request) = self.output_drain.take() {
+                    request.handle_failable_sync(|()| result);
+                }
+            }
+        }
     }
 }
 
@@ -340,7 +390,7 @@ impl SaveRestore for MicrovmPortb {
     fn restore(&mut self, state: Self::SavedState) -> Result<(), RestoreError> {
         if state.rx_buffer.len() > BUFFER_MAX || state.tx_buffer.len() > BUFFER_MAX {
             return Err(RestoreError::InvalidSavedState(
-                std::io::Error::new(
+                io::Error::new(
                     ErrorKind::InvalidData,
                     format!("microVM portb buffer exceeds {BUFFER_MAX} bytes"),
                 )
@@ -609,15 +659,167 @@ mod tests {
     use super::*;
     use futures::AsyncRead;
     use futures::AsyncWrite;
+    use futures::FutureExt;
+    use mesh::rpc::RpcSend;
     use parking_lot::Mutex;
     use serial_core::disconnected::Disconnected;
+    use serial_core::serial_io::Connected;
     use std::io;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::task::Context;
     use std::task::Poll;
+    use test_with_tracing::test;
 
     const TEST_GENERATION_ID: [u8; GENERATION_ID_SIZE] = [0x3c; GENERATION_ID_SIZE];
+
+    #[derive(Default)]
+    struct OutputState {
+        bytes: Vec<u8>,
+        writable: bool,
+        flushed: bool,
+        closed: bool,
+        error: Option<ErrorKind>,
+    }
+
+    struct BufferedOutput(Arc<Mutex<OutputState>>);
+
+    impl Drop for BufferedOutput {
+        fn drop(&mut self) {
+            self.0.lock().closed = true;
+        }
+    }
+
+    impl AsyncRead for BufferedOutput {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buffer: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for BufferedOutput {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let mut state = self.0.lock();
+            if let Some(error) = state.error {
+                return Poll::Ready(Err(error.into()));
+            }
+            if !state.writable {
+                return Poll::Pending;
+            }
+            let count = buffer.len().min(3);
+            state.bytes.extend_from_slice(&buffer[..count]);
+            Poll::Ready(Ok(count))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.0.lock().flushed {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }
+
+        fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    #[test]
+    fn portb_exit_drain_waits_for_pending_writes_and_flush_before_closing() {
+        let state = Arc::new(Mutex::new(OutputState::default()));
+        let (requests, receiver) = mesh::channel();
+        let mut portb = MicrovmPortb::new(
+            Box::new(Connected::new(BufferedOutput(state.clone()))),
+            TEST_GENERATION_ID,
+            Vec::new(),
+        )
+        .with_output_drain(Some(receiver));
+        let payload = b"OPENVMM-SNAPSHOT-RESTORE-OK\n\0\xff";
+        assert!(matches!(portb.io_write(DATA_PORT, payload), IoResult::Ok));
+        let mut result = Box::pin(requests.call_failable(std::convert::identity, ()));
+        let mut cx = Context::from_waker(Waker::noop());
+        portb.poll_device(&mut cx);
+        assert!(result.as_mut().now_or_never().is_none());
+        assert!(!state.lock().closed);
+        assert_eq!(portb.save().unwrap().tx_buffer, payload);
+
+        state.lock().writable = true;
+        portb.poll_device(&mut cx);
+        assert!(result.as_mut().now_or_never().is_none());
+        assert_eq!(state.lock().bytes, payload);
+        assert!(!state.lock().closed);
+
+        state.lock().flushed = true;
+        portb.poll_device(&mut cx);
+        result.now_or_never().unwrap().unwrap();
+        assert!(state.lock().closed);
+        assert!(portb.tx_buffer.is_empty());
+    }
+
+    #[test]
+    fn portb_exit_drain_reports_output_failure() {
+        let state = Arc::new(Mutex::new(OutputState {
+            error: Some(ErrorKind::BrokenPipe),
+            ..Default::default()
+        }));
+        let (requests, receiver) = mesh::channel();
+        let mut portb = MicrovmPortb::new(
+            Box::new(Connected::new(BufferedOutput(state.clone()))),
+            TEST_GENERATION_ID,
+            Vec::new(),
+        )
+        .with_output_drain(Some(receiver));
+        assert!(matches!(portb.io_write(DATA_PORT, b"marker"), IoResult::Ok));
+        let result = requests.call_failable(std::convert::identity, ());
+        portb.poll_device(&mut Context::from_waker(Waker::noop()));
+        assert!(result.now_or_never().unwrap().is_err());
+        assert!(state.lock().closed);
+    }
+
+    #[test]
+    fn portb_output_error_preserves_the_next_write_wakeup() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+        use std::task::Wake;
+
+        struct OutputWake(AtomicBool);
+        impl Wake for OutputWake {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let wake = Arc::new(OutputWake(AtomicBool::new(false)));
+        let waker = Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        let state = Arc::new(Mutex::new(OutputState {
+            error: Some(ErrorKind::Other),
+            ..Default::default()
+        }));
+        let mut portb = MicrovmPortb::new(
+            Box::new(Connected::new(BufferedOutput(state.clone()))),
+            TEST_GENERATION_ID,
+            Vec::new(),
+        );
+        assert!(matches!(portb.io_write(DATA_PORT, b"lost"), IoResult::Ok));
+        portb.poll_device(&mut cx);
+        state.lock().error = None;
+        state.lock().writable = true;
+        assert!(matches!(
+            portb.io_write(DATA_PORT, b"next write"),
+            IoResult::Ok
+        ));
+        assert!(wake.0.load(Ordering::Relaxed));
+        portb.poll_device(&mut cx);
+        assert_eq!(state.lock().bytes, b"next write");
+    }
 
     struct ConnectWithByte {
         connected: bool,
