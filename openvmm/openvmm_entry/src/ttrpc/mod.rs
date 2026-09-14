@@ -425,6 +425,7 @@ impl VmService {
             }
         });
 
+        let mut exit_error = None;
         let quit = loop {
             // Take the controller events receiver out of self so it can be
             // polled in the select without borrowing self.
@@ -502,11 +503,14 @@ impl VmService {
                     );
                     break false;
                 }
-                Action::ControllerEvent(Some(event)) => {
-                    if self.handle_controller_event(event) {
+                Action::ControllerEvent(Some(event)) => match self.handle_controller_event(event) {
+                    Ok(true) => break true,
+                    Ok(false) => {}
+                    Err(error) => {
+                        exit_error = Some(error);
                         break true;
                     }
-                }
+                },
                 Action::ControllerEvent(None) => {} // handled above
                 Action::WaitVmCancelled(reason) => {
                     tracing::debug!("WaitVm client cancelled");
@@ -538,7 +542,11 @@ impl VmService {
             let _ = Arc::try_unwrap(vm).ok().expect("no more VM references");
         }
         drop(cancel_send);
-        server_task.await
+        server_task.await?;
+        match exit_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn start_rpc<F, R>(
@@ -1416,6 +1424,7 @@ impl VmService {
             }
         };
 
+        let has_microvm_portb_output = ports[0].is_some();
         let microvm_portb = if machine_profile == OpenvmmMachineProfile::Microvm {
             if ports.iter().skip(1).any(Option::is_some) {
                 bail!("microVM accepts only serial port 0 as its portb endpoint");
@@ -1452,7 +1461,13 @@ impl VmService {
         let mut chipset = chipset_builder
             .build()
             .context("failed to build vm configuration")?;
+        let mut microvm_output_drain = None;
         if let Some(io) = microvm_portb {
+            let output_drain = has_microvm_portb_output.then(|| {
+                let (drain, requests) = crate::microvm_output::MicrovmOutputDrain::new(None);
+                microvm_output_drain = Some(drain);
+                requests
+            });
             let restore_memory_ranges = authoritative_restore
                 .as_ref()
                 .map(|restore| restore.restore_memory_ranges.as_slice())
@@ -1479,6 +1494,7 @@ impl VmService {
                         io,
                         generation_id,
                         restore_entropy,
+                        output_drain,
                     }
                     .into_resource(),
                 },
@@ -2221,6 +2237,7 @@ impl VmService {
             microvm_filesystem_root_path,
             microvm_filesystem_attachment,
             microvm_console_socket_cleanup,
+            microvm_output_drain,
             snapshot_memory_file,
             _private_scratch_dir: None,
             guest_power_actions,
@@ -2347,8 +2364,8 @@ impl VmService {
         Ok(())
     }
 
-    fn handle_controller_event(&mut self, event: VmControllerEvent) -> bool {
-        match event {
+    fn handle_controller_event(&mut self, event: VmControllerEvent) -> anyhow::Result<bool> {
+        Ok(match event {
             VmControllerEvent::GuestHalt(reason) => {
                 tracing::info!(%reason, "guest halted (via controller)");
                 self.lifecycle = VmLifecycle::Halted(reason);
@@ -2365,6 +2382,13 @@ impl VmService {
                     response.send(Ok(()));
                 }
                 true
+            }
+            VmControllerEvent::ExitFailed { error } => {
+                self.lifecycle = VmLifecycle::Halted(error.clone());
+                if let Some((_, response)) = self.wait_vm_response.take() {
+                    response.send(Err(grpc_error(anyhow!(error.clone()))));
+                }
+                return Err(anyhow!(error));
             }
             VmControllerEvent::WorkerStopped { error } => {
                 if let Some(err) = &error {
@@ -2393,7 +2417,7 @@ impl VmService {
                 }
                 false
             }
-        }
+        })
     }
 
     fn add_pcie_device(
@@ -3388,6 +3412,70 @@ fn build_vhost_user_device(
     _vhost_user: vmservice::VhostUser,
 ) -> anyhow::Result<Resource<VirtioDeviceHandle>> {
     anyhow::bail!("vhost-user is only supported on unix hosts")
+}
+
+#[cfg(test)]
+mod microvm_exit_tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn rpc_service_terminates_and_reports_guest_exit_failures() {
+        DefaultPool::run_with(async |driver| {
+            for failure in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let listener = UnixListener::bind(directory.path().join("rpc")).unwrap();
+                let (events, event_recv) = mesh::channel();
+                let (worker_send, worker_recv) = mesh::channel();
+                let (response, received) = mesh::oneshot();
+                let mut service = VmService {
+                    driver: driver.clone(),
+                    vm: None,
+                    vm_controller: None,
+                    vm_controller_events: Some(event_recv),
+                    controller_task: None,
+                    wait_vm_response: Some((mesh::CancelContext::new(), response)),
+                    lifecycle: VmLifecycle::Running,
+                    restore_ready_pending: false,
+                    rpc_tasks: Vec::new(),
+                    transport: ResolvedTransport::Auto,
+                    registry: FdRegistry::default(),
+                };
+                events.send(if failure {
+                    VmControllerEvent::ExitFailed {
+                        error: "console output drain timed out".to_owned(),
+                    }
+                } else {
+                    VmControllerEvent::ExitRequested { code: 0 }
+                });
+                let result = mesh::CancelContext::new()
+                    .with_timeout(Duration::from_secs(5))
+                    .until_cancelled(service.run(listener, worker_recv))
+                    .await
+                    .expect("guest exit must stop the RPC service");
+                drop(worker_send);
+                let response = received.await.unwrap();
+                if failure {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("console output drain timed out")
+                    );
+                    assert!(
+                        response
+                            .unwrap_err()
+                            .message
+                            .contains("console output drain timed out")
+                    );
+                } else {
+                    result.unwrap();
+                    response.unwrap();
+                }
+                assert!(matches!(service.lifecycle, VmLifecycle::Halted(_)));
+            }
+        });
+    }
 }
 
 #[cfg(test)]
