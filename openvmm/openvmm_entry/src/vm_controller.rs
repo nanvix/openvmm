@@ -109,6 +109,8 @@ pub enum VmControllerEvent {
     /// The controller requests that the process exit with this code, because the
     /// guest drove a power event the user opted into exiting on.
     ExitRequested { code: i32 },
+    /// A guest-requested process exit failed and must terminate the runner.
+    ExitFailed { error: String },
 }
 
 /// Owns exclusive VM resources and services RPCs from the REPL.
@@ -198,6 +200,24 @@ fn action_for(reason: &HaltReason, actions: &GuestPowerActions) -> GuestPowerAct
         // Any other halt reason keeps the stopped VM for inspection.
         _ => GuestPowerAction::Halt,
     }
+}
+
+async fn guest_exit_event(
+    code: i32,
+    drain: Option<crate::microvm_output::MicrovmOutputDrain>,
+) -> VmControllerEvent {
+    if let Some(drain) = drain
+        && let Err(error) = drain.drain().await
+    {
+        tracing::error!(
+            error = error.as_ref() as &dyn std::error::Error,
+            "failed to drain microVM console output before exit"
+        );
+        return VmControllerEvent::ExitFailed {
+            error: format!("failed to drain microVM console output: {error:#}"),
+        };
+    }
+    VmControllerEvent::ExitRequested { code }
 }
 
 impl VmController {
@@ -408,19 +428,7 @@ impl VmController {
     }
 
     async fn request_exit(&mut self, code: i32, events: &mesh::Sender<VmControllerEvent>) {
-        if let Some(drain) = self.microvm_output_drain.take()
-            && let Err(error) = drain.drain().await
-        {
-            tracing::error!(
-                error = error.as_ref() as &dyn std::error::Error,
-                "failed to drain microVM console output before exit"
-            );
-            events.send(VmControllerEvent::WorkerStopped {
-                error: Some(format!("failed to drain microVM console output: {error:#}")),
-            });
-            return;
-        }
-        events.send(VmControllerEvent::ExitRequested { code });
+        events.send(guest_exit_event(code, self.microvm_output_drain.take()).await);
     }
 
     async fn handle_rpc(&mut self, rpc: VmControllerRpc, quit: &mut bool) {
@@ -1141,5 +1149,41 @@ impl VmController {
         })
         .await?;
         Ok(removed_lun)
+    }
+}
+
+#[cfg(test)]
+mod microvm_exit_tests {
+    use super::*;
+    use crate::microvm_output::MicrovmOutputDrain;
+    use futures::executor::block_on;
+    use test_with_tracing::test;
+
+    #[test]
+    fn successful_drain_preserves_guest_exit_status() {
+        block_on(async {
+            for code in [0, 37] {
+                let (drain, mut requests) = MicrovmOutputDrain::new(None);
+                let (event, ()) = futures::join!(guest_exit_event(code, Some(drain)), async {
+                    requests.recv().await.unwrap().complete(Ok(()));
+                });
+                assert!(matches!(
+                    event,
+                    VmControllerEvent::ExitRequested { code: actual } if actual == code
+                ));
+            }
+        });
+    }
+
+    #[test]
+    fn failed_drain_requests_process_exit_not_worker_stopped() {
+        let (drain, requests) = MicrovmOutputDrain::new(None);
+        drop(requests);
+        let event = block_on(guest_exit_event(0, Some(drain)));
+        assert!(matches!(
+            event,
+            VmControllerEvent::ExitFailed { error }
+                if error.contains("failed to drain microVM console output")
+        ));
     }
 }
