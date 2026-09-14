@@ -109,6 +109,8 @@ pub enum VmControllerEvent {
     /// The controller requests that the process exit with this code, because the
     /// guest drove a power event the user opted into exiting on.
     ExitRequested { code: i32 },
+    /// A guest-requested process exit failed and must terminate the runner.
+    ExitFailed { error: String },
 }
 
 /// Owns exclusive VM resources and services RPCs from the REPL.
@@ -152,6 +154,7 @@ pub struct VmController {
     pub(crate) microvm_filesystem_attachment: Option<openvmm_helpers::snapshot::SnapshotAttachment>,
     pub(crate) microvm_console_socket_cleanup: Option<crate::MicrovmConsoleSocketCleanup>,
     pub(crate) microvm_control_console_socket_cleanup: Option<crate::MicrovmConsoleSocketCleanup>,
+    pub(crate) microvm_output_drain: Option<crate::microvm_output::MicrovmOutputDrain>,
     pub(crate) snapshot_memory_file: Option<tempfile::NamedTempFile>,
     pub(crate) _private_scratch_dir: Option<tempfile::TempDir>,
     pub(crate) guest_power_actions: GuestPowerActions,
@@ -200,6 +203,24 @@ fn action_for(reason: &HaltReason, actions: &GuestPowerActions) -> GuestPowerAct
         // Any other halt reason keeps the stopped VM for inspection.
         _ => GuestPowerAction::Halt,
     }
+}
+
+async fn guest_exit_event(
+    code: i32,
+    drain: Option<crate::microvm_output::MicrovmOutputDrain>,
+) -> VmControllerEvent {
+    if let Some(drain) = drain
+        && let Err(error) = drain.drain().await
+    {
+        tracing::error!(
+            error = error.as_ref() as &dyn std::error::Error,
+            "failed to drain microVM console output before exit"
+        );
+        return VmControllerEvent::ExitFailed {
+            error: format!("failed to drain microVM console output: {error:#}"),
+        };
+    }
+    VmControllerEvent::ExitRequested { code }
 }
 
 impl VmController {
@@ -318,9 +339,7 @@ impl VmController {
                 Event::Halt(reason) => {
                     tracing::info!(?reason, "guest halted");
                     if let HaltReason::PowerOffWithStatus { code } = reason {
-                        event_send.send(VmControllerEvent::ExitRequested {
-                            code: i32::from(code),
-                        });
+                        self.request_exit(i32::from(code), &event_send).await;
                         return;
                     }
                     // On a guest crash, write a `.vmrs` dump (if configured)
@@ -349,9 +368,7 @@ impl VmController {
                             // are parked, so don't stop it here; signal the runner to
                             // exit instead.
                             tracing::info!(exit_code = code, "requesting exit on guest halt");
-                            event_send.send(VmControllerEvent::ExitRequested {
-                                code: i32::from(code),
-                            });
+                            self.request_exit(i32::from(code), &event_send).await;
                             return;
                         }
                         GuestPowerAction::Reset => {
@@ -411,6 +428,10 @@ impl VmController {
         }
 
         self.mesh.shutdown().await;
+    }
+
+    async fn request_exit(&mut self, code: i32, events: &mesh::Sender<VmControllerEvent>) {
+        events.send(guest_exit_event(code, self.microvm_output_drain.take()).await);
     }
 
     async fn handle_rpc(&mut self, rpc: VmControllerRpc, quit: &mut bool) {
@@ -1149,5 +1170,41 @@ impl VmController {
         })
         .await?;
         Ok(removed_lun)
+    }
+}
+
+#[cfg(test)]
+mod microvm_exit_tests {
+    use super::*;
+    use crate::microvm_output::MicrovmOutputDrain;
+    use futures::executor::block_on;
+    use test_with_tracing::test;
+
+    #[test]
+    fn successful_drain_preserves_guest_exit_status() {
+        block_on(async {
+            for code in [0, 37] {
+                let (drain, mut requests) = MicrovmOutputDrain::new(None);
+                let (event, ()) = futures::join!(guest_exit_event(code, Some(drain)), async {
+                    requests.recv().await.unwrap().complete(Ok(()));
+                });
+                assert!(matches!(
+                    event,
+                    VmControllerEvent::ExitRequested { code: actual } if actual == code
+                ));
+            }
+        });
+    }
+
+    #[test]
+    fn failed_drain_requests_process_exit_not_worker_stopped() {
+        let (drain, requests) = MicrovmOutputDrain::new(None);
+        drop(requests);
+        let event = block_on(guest_exit_event(0, Some(drain)));
+        assert!(matches!(
+            event,
+            VmControllerEvent::ExitFailed { error }
+                if error.contains("failed to drain microVM console output")
+        ));
     }
 }
