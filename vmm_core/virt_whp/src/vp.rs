@@ -39,6 +39,8 @@ pub(crate) struct ExitStats {
     #[cfg(guest_arch = "x86_64")]
     cpuid: Counter,
     #[cfg(guest_arch = "x86_64")]
+    rdtsc: Counter,
+    #[cfg(guest_arch = "x86_64")]
     apic_eoi: Counter,
     cancel: Counter,
     halt: Counter,
@@ -502,6 +504,7 @@ impl<'a> WhpProcessor<'a> {
 mod x86 {
     use crate::Hv1State;
     use crate::WhpProcessor;
+    use crate::WhpResultExt;
     use crate::emu;
     use crate::emu::WhpVpRefEmulation;
     use crate::memory::x86::GpaBackingType;
@@ -569,12 +572,17 @@ mod x86 {
                     self.handle_cpuid(info, exit);
                     &mut self.state.exits.cpuid
                 }
+                ExitReason::Rdtsc(info) => {
+                    self.handle_rdtsc(info, exit)
+                        .map_err(|error| dev.fatal_error(error.into()))?;
+                    &mut self.state.exits.rdtsc
+                }
                 ExitReason::ApicEoi(info) => {
                     self.handle_apic_eoi(info, dev);
                     &mut self.state.exits.apic_eoi
                 }
                 ExitReason::MsrAccess(info) => {
-                    self.handle_msr(dev, info, exit);
+                    self.handle_msr(dev, info, exit)?;
                     &mut self.state.exits.msr
                 }
                 ExitReason::InterruptWindow(info) => {
@@ -1264,29 +1272,224 @@ mod x86 {
             self.vtl2_intercept(HvMessageType::HvMessageTypeMsrIntercept, message.as_bytes());
         }
 
+        fn inject_general_protection_fault(&self) -> Result<(), crate::Error> {
+            let event = hvdef::HvX64PendingExceptionEvent::new()
+                .with_event_pending(true)
+                .with_event_type(hvdef::HV_X64_PENDING_EVENT_EXCEPTION)
+                .with_deliver_error_code(true)
+                .with_vector(0xd);
+            self.current_whp()
+                .set_register(whp::Register128::PendingEvent, event.into())
+                .for_op("inject general protection fault")
+        }
+
+        fn read_restored_tsc(&self) -> Result<u64, crate::Error> {
+            let reference = self
+                .current_vtlp()
+                .whp
+                .reference_time()
+                .for_op("read guest TSC reference time")?;
+            let value = {
+                let clock = self.vp.partition.restored_tsc.lock();
+                clock
+                    .as_ref()
+                    .ok_or(crate::Error::UnexpectedTimestampExit)?
+                    .read(self.vp.index.index(), reference)
+            };
+            match value {
+                Some(value) => Ok(value),
+                None => self
+                    .current_whp()
+                    .get_register(whp::Register64::Tsc)
+                    .for_op("read guest-programmed TSC"),
+            }
+        }
+
+        fn complete_tsc_read(
+            &self,
+            value: u64,
+            rip: u64,
+            tsc_aux: Option<u64>,
+        ) -> Result<(), crate::Error> {
+            let rax = value & 0xffff_ffff;
+            let rdx = value >> 32;
+            match tsc_aux {
+                Some(aux) => {
+                    set_registers!(
+                        self.current_whp(),
+                        [
+                            (whp::Register64::Rax, rax),
+                            (whp::Register64::Rdx, rdx),
+                            (whp::Register64::Rip, rip),
+                            (whp::Register64::Rcx, aux & 0xffff_ffff),
+                        ],
+                    )
+                    .for_op("complete guest timestamp read")?;
+                }
+                None => {
+                    set_registers!(
+                        self.current_whp(),
+                        [
+                            (whp::Register64::Rax, rax),
+                            (whp::Register64::Rdx, rdx),
+                            (whp::Register64::Rip, rip),
+                        ],
+                    )
+                    .for_op("complete guest timestamp read")?;
+                }
+            }
+            Ok(())
+        }
+
+        fn handle_rdtsc(
+            &self,
+            info: &whp::abi::WHV_X64_RDTSC_CONTEXT,
+            exit: whp::Exit<'_>,
+        ) -> Result<(), crate::Error> {
+            if exit.vp_context.ExecutionState.Cpl() != 0 {
+                let cr4 = self
+                    .current_whp()
+                    .get_register(whp::Register64::Cr4)
+                    .for_op("check timestamp access permission")?;
+                if cr4 & x86defs::X64_CR4_TSD != 0 {
+                    return self.inject_general_protection_fault();
+                }
+            }
+            let value = self.read_restored_tsc()?;
+            if self.state.exits.rdtsc.get() < 4 {
+                tracing::debug!(
+                    vp = self.vp.index.index(),
+                    value,
+                    whp_tsc = info.Tsc,
+                    whp_reference_time = info.ReferenceTime,
+                    "restored timestamp read"
+                );
+            }
+            let rip = exit
+                .vp_context
+                .Rip
+                .wrapping_add(u64::from(exit.vp_context.InstructionLength()));
+            let tsc_aux = (info.RdtscInfo & 1 != 0).then_some(info.TscAux);
+            self.complete_tsc_read(value, rip, tsc_aux)
+        }
+
+        fn handle_restored_tsc_msr(
+            &self,
+            info: &whp::abi::WHV_X64_MSR_ACCESS_CONTEXT,
+            exit: whp::Exit<'_>,
+        ) -> Result<bool, crate::Error> {
+            if self.state.active_vtl != Vtl::Vtl0
+                || !matches!(
+                    info.MsrNumber,
+                    x86defs::X86X_MSR_TSC
+                        | crate::tsc::IA32_TSC_ADJUST
+                        | x86defs::X86X_MSR_TSC_DEADLINE
+                )
+            {
+                return Ok(false);
+            }
+            let tsc_adjust_supported = {
+                let clock = self.vp.partition.restored_tsc.lock();
+                let Some(clock) = clock.as_ref() else {
+                    return Ok(false);
+                };
+                clock.tsc_adjust_supported
+            };
+            if exit.vp_context.ExecutionState.Cpl() != 0 {
+                self.inject_general_protection_fault()?;
+                return Ok(true);
+            }
+            let rcx = self
+                .current_whp()
+                .get_register(whp::Register64::Rcx)
+                .for_op("read timestamp MSR selector")?;
+            let msr = crate::tsc::msr_index(info.MsrNumber, info.AccessInfo.IsWrite(), rcx);
+            if !matches!(
+                msr,
+                x86defs::X86X_MSR_TSC
+                    | crate::tsc::IA32_TSC_ADJUST
+                    | x86defs::X86X_MSR_TSC_DEADLINE
+            ) || (msr == crate::tsc::IA32_TSC_ADJUST && !tsc_adjust_supported)
+                || (msr == x86defs::X86X_MSR_TSC_DEADLINE && !self.vp.partition.caps.tsc_deadline)
+            {
+                self.inject_general_protection_fault()?;
+                return Ok(true);
+            }
+
+            let rip = exit.vp_context.Rip.wrapping_add(2);
+            if info.AccessInfo.IsWrite() {
+                let value = (info.Rax & 0xffff_ffff) | (info.Rdx << 32);
+                let changed = if msr == x86defs::X86X_MSR_TSC_DEADLINE {
+                    self.current_whp()
+                        .set_register(whp::Register64::TscDeadline, value)
+                        .for_op("write guest TSC deadline")?;
+                    false
+                } else if msr == crate::tsc::IA32_TSC_ADJUST {
+                    let previous = self
+                        .current_whp()
+                        .get_register(whp::Register64::TscAdjust)
+                        .for_op("read guest TSC adjustment")?;
+                    self.current_whp()
+                        .set_register(whp::Register64::TscAdjust, value)
+                        .for_op("write guest TSC adjustment")?;
+                    value != previous
+                } else {
+                    self.current_whp()
+                        .set_register(whp::Register64::Tsc, value)
+                        .for_op("write guest TSC")?;
+                    true
+                };
+                if changed {
+                    self.vp
+                        .partition
+                        .restored_tsc
+                        .lock()
+                        .as_mut()
+                        .ok_or(crate::Error::UnexpectedTimestampExit)?
+                        .guest_write(self.vp.index.index());
+                }
+                self.current_whp()
+                    .set_register(whp::Register64::Rip, rip)
+                    .for_op("complete guest TSC write")?;
+            } else {
+                let value = if msr == x86defs::X86X_MSR_TSC_DEADLINE {
+                    self.current_whp()
+                        .get_register(whp::Register64::TscDeadline)
+                        .for_op("read guest TSC deadline")?
+                } else if msr == crate::tsc::IA32_TSC_ADJUST {
+                    self.current_whp()
+                        .get_register(whp::Register64::TscAdjust)
+                        .for_op("read guest TSC adjustment")?
+                } else {
+                    self.read_restored_tsc()?
+                };
+                self.complete_tsc_read(value, rip, None)?;
+            }
+            Ok(true)
+        }
+
         fn handle_msr(
             &mut self,
             dev: &impl CpuIo,
             info: &whp::abi::WHV_X64_MSR_ACCESS_CONTEXT,
             exit: whp::Exit<'_>,
-        ) {
+        ) -> Result<(), VpHaltReason> {
+            if self
+                .handle_restored_tsc_msr(info, exit)
+                .map_err(|error| dev.fatal_error(error.into()))?
+            {
+                return Ok(());
+            }
             let handled = if info.AccessInfo.IsWrite() {
                 self.msr_write(dev, exit, info.MsrNumber, info.Rax, info.Rdx)
             } else {
                 self.msr_read(dev, exit, info.MsrNumber)
             };
             if !handled {
-                // inject a GPF
-                let event = hvdef::HvX64PendingExceptionEvent::new()
-                    .with_event_pending(true)
-                    .with_event_type(hvdef::HV_X64_PENDING_EVENT_EXCEPTION)
-                    .with_deliver_error_code(true)
-                    .with_vector(0xd);
-
-                self.current_whp()
-                    .set_register(whp::Register128::PendingEvent, event.into())
-                    .unwrap();
+                self.inject_general_protection_fault()
+                    .map_err(|error| dev.fatal_error(error.into()))?;
             }
+            Ok(())
         }
 
         fn msr_write(
