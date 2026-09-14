@@ -7,6 +7,7 @@
 
 mod regs;
 pub(crate) mod snp;
+mod tsc;
 mod vm_state;
 mod vp_state;
 
@@ -1938,6 +1939,11 @@ impl<'p> Processor for KvmProcessor<'p> {
     fn access_state(&mut self, vtl: Vtl) -> Self::StateAccess<'_> {
         assert_eq!(vtl, Vtl::Vtl0);
         KvmVpStateAccess::new(self)
+    }
+
+    fn advance_tsc(&mut self, cycles: u64) -> anyhow::Result<()> {
+        tsc::advance_tsc(&self.partition.kvm.vp(self.inner.vp_info.apic_id), cycles)?;
+        Ok(())
     }
 }
 

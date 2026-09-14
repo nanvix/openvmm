@@ -58,6 +58,19 @@ struct AdvancedTsc {
 }
 
 #[cfg(guest_arch = "x86_64")]
+impl AdvancedTsc {
+    fn validate(&self, observed_tsc: u64) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            observed_tsc >= self.value,
+            "restored TSC did not advance by the required downtime: requested {:#x}, observed {observed_tsc:#x}, adjustment {} cycles",
+            self.value,
+            self.cycles,
+        );
+        Ok(())
+    }
+}
+
+#[cfg(guest_arch = "x86_64")]
 fn advance_tsc_state(
     previous_tsc: u64,
     duration: std::time::Duration,
@@ -93,6 +106,24 @@ mod snapshot_tsc_tests {
     fn downtime_rejects_tsc_overflow() {
         assert!(advance_tsc_state(u64::MAX, Duration::from_nanos(1), 1_000_000_000).is_err());
         assert!(advance_tsc_state(0, Duration::MAX, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn downtime_rejects_discarded_or_partial_tsc_advancement() {
+        let advanced = advance_tsc_state(1_000, Duration::from_millis(250), 1_000_000_000).unwrap();
+
+        assert!(advanced.validate(1_000).is_err());
+        assert!(advanced.validate(advanced.value - 1).is_err());
+    }
+
+    #[test]
+    fn downtime_allows_tsc_progress_during_adjustment() {
+        for duration in [Duration::ZERO, Duration::from_millis(250)] {
+            let advanced = advance_tsc_state(1_000, duration, 1_000_000_000).unwrap();
+
+            advanced.validate(advanced.value).unwrap();
+            advanced.validate(advanced.value + 1_000).unwrap();
+        }
     }
 }
 
@@ -237,7 +268,7 @@ where
         apic_frequency_hz: Option<u64>,
     ) -> anyhow::Result<()> {
         let mut access = self.vp.access_state(Vtl::Vtl0);
-        let mut tsc = access.tsc().context("failed to read stopped vCPU TSC")?;
+        let tsc = access.tsc().context("failed to read stopped vCPU TSC")?;
         let mut tsc_deadline = access
             .caps()
             .tsc_deadline
@@ -255,14 +286,15 @@ where
             .transpose()?;
         let previous_tsc = tsc.value;
         let advanced = advance_tsc_state(previous_tsc, duration, frequency_hz)?;
-        tsc.value = advanced.value;
         if let (Some(apic), Some(tsc_deadline)) = (apic.as_mut(), tsc_deadline.as_mut()) {
             tsc_deadline.value =
                 apic.advance_tsc_deadline(previous_tsc, advanced.value, tsc_deadline.value);
         }
-        access
-            .set_tsc(&tsc)
+        drop(access);
+        self.vp
+            .advance_tsc(advanced.cycles)
             .context("failed to adjust stopped vCPU TSC")?;
+        let mut access = self.vp.access_state(Vtl::Vtl0);
         if let Some(apic) = apic.take() {
             access
                 .set_apic(&apic)
@@ -282,13 +314,14 @@ where
             .value;
         tracing::debug!(
             previous_tsc,
-            requested_tsc = tsc.value,
+            requested_tsc = advanced.value,
             observed_tsc,
             cycles = advanced.cycles,
             frequency_hz,
             ?duration,
             "adjusted restored vCPU TSC"
         );
+        advanced.validate(observed_tsc)?;
         Ok(())
     }
 

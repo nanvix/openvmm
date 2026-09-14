@@ -790,6 +790,25 @@ pub trait Processor: InspectMut {
     }
 
     fn access_state(&mut self, vtl: Vtl) -> Self::StateAccess<'_>;
+
+    /// Advances the stopped VTL0 TSC by the specified number of guest cycles.
+    ///
+    /// Backends may override this to adjust a running counter's offset directly.
+    #[cfg(guest_arch = "x86_64")]
+    fn advance_tsc(&mut self, cycles: u64) -> anyhow::Result<()> {
+        use crate::x86::vp::AccessVpState;
+        use anyhow::Context as _;
+
+        let mut access = self.access_state(Vtl::Vtl0);
+        let mut tsc = access.tsc()?;
+        tsc.value = tsc
+            .value
+            .checked_add(cycles)
+            .context("TSC downtime adjustment exceeds the counter range")?;
+        access.set_tsc(&tsc)?;
+        access.commit()?;
+        Ok(())
+    }
 }
 
 /// A source for [`StopVp`].
