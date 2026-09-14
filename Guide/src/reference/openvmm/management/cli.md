@@ -51,10 +51,10 @@ describes the source definitions.
   one optional `--virtio-console <BACKEND>` is exposed at MMIO `0xd0002000`,
   IRQ 7 as the boot/log console (`hvc1`); and `--microvm-sandbox-block`
   exposes fixed distro, runtime, custom, and scratch slots starting at MMIO
-  `0xd0003000`. ABI v2 also reserves MMIO `0xd0007000`, IRQ 3 for the
+  `0xd0003000`. The profile also reserves MMIO `0xd0007000`, IRQ 3 for the
   dedicated control console (`hvc2`), selected by the host-owned
-  `nvx_control_tty=hvc2` token. This stage defines the reserved ABI and
-  resource identity but does not expose a live control endpoint. Both consoles
+  `nvx_control_tty=hvc2` token. The reserved slot and resource identity do not
+  expose a live control endpoint. Both consoles
   remain virtio-console devices from the guest's perspective. Ordinary
   `--virtio-blk` is rejected. All use split rings. Firmware, ACPI, SMBIOS, PCI,
   VMBus, UARTs, graphics, isolation, nested virtualization, and other devices
