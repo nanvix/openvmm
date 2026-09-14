@@ -593,9 +593,13 @@ pub fn append_microvm_virtio_discovery(
 ) -> anyhow::Result<()> {
     validate_microvm_sandbox_blocks(blocks)?;
     anyhow::ensure!(
-        !cmdline
-            .split_ascii_whitespace()
-            .any(|token| kernel_parameter_name_matches(token, "virtio_mmio.device")),
+        !cmdline.split_ascii_whitespace().any(|token| {
+            if has_control_console {
+                kernel_parameter_name_matches(token, "virtio_mmio.device")
+            } else {
+                token.starts_with("virtio_mmio.device=")
+            }
+        }),
         "microVM command line already contains virtio-mmio discovery"
     );
     anyhow::ensure!(
@@ -1591,9 +1595,21 @@ mod tests {
 
     #[test]
     fn control_console_restrictions_do_not_change_legacy_abi_v2_command_lines() {
-        let cmdline = r#"earlycon=xe9 console=hvc1 reboot=t panic=-1 note="left right" -- driver_async_probe=virtio_mmio nvx_control_tty=hvc9"#;
+        let user_args = [
+            r#"note="left right""#.to_owned(),
+            "--".to_owned(),
+            "driver_async_probe=virtio_mmio".to_owned(),
+            "nvx_control_tty=hvc9".to_owned(),
+            "virtio-mmio.device=0x1000@0xc0000000:1".to_owned(),
+        ];
+        let cmdline = build_microvm_command_line(&user_args, true).unwrap();
         let tokens = cmdline.split_ascii_whitespace().collect::<Vec<_>>();
         validate_microvm_control_console_command_line(&tokens, false).unwrap();
+
+        let mut cmdline = cmdline;
+        append_microvm_virtio_discovery(&mut cmdline, None, false, None, true, false, &[]).unwrap();
+
+        assert!(build_microvm_v2_command_line(&user_args, true).is_err());
     }
 
     #[test]
@@ -1608,6 +1624,13 @@ mod tests {
             let tokens = cmdline.split_ascii_whitespace().collect::<Vec<_>>();
             assert!(validate_microvm_control_console_command_line(&tokens, true).is_err());
         }
+
+        let mut cmdline = MICROVM_CONSOLE_COMMAND_LINE.to_owned();
+        cmdline.push_str(" virtio-mmio.device=0x1000@0xc0000000:1");
+        assert!(
+            append_microvm_virtio_discovery(&mut cmdline, None, false, None, true, true, &[])
+                .is_err()
+        );
     }
 
     #[test]
