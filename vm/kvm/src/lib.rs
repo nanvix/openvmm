@@ -293,6 +293,12 @@ pub enum Error {
     #[cfg(target_arch = "x86_64")]
     #[error("SetTscFrequency")]
     SetTscFrequency(#[source] nix::Error),
+    #[cfg(target_arch = "x86_64")]
+    #[error("GetTscOffset")]
+    GetTscOffset(#[source] nix::Error),
+    #[cfg(target_arch = "x86_64")]
+    #[error("SetTscOffset")]
+    SetTscOffset(#[source] nix::Error),
     #[error("Run")]
     Run(#[source] nix::Error),
     #[error("RunMemoryFault(flags={flags:#x}, gpa={gpa:#x}, size={size:#x})")]
@@ -1306,6 +1312,35 @@ impl<'a> Processor<'a> {
         // SAFETY: Calling the documented vCPU ioctl with its integer value.
         unsafe { ioctl::kvm_set_tsc_khz(self.get().vcpu.as_raw_fd(), khz) }
             .map_err(Error::SetTscFrequency)?;
+        Ok(())
+    }
+
+    /// Gets the guest TSC offset, in guest TSC cycles.
+    #[cfg(target_arch = "x86_64")]
+    pub fn tsc_offset(&self) -> Result<u64> {
+        let mut offset = 0u64;
+        let attr = kvm_device_attr {
+            group: KVM_VCPU_TSC_CTRL,
+            attr: u64::from(KVM_VCPU_TSC_OFFSET),
+            addr: std::ptr::from_mut(&mut offset) as u64,
+            flags: 0,
+        };
+        // SAFETY: `attr.addr` points to `offset` for the duration of the ioctl.
+        unsafe {
+            ioctl::kvm_get_device_attr(self.get().vcpu.as_raw_fd(), &attr)
+                .map_err(Error::GetTscOffset)?;
+        }
+        Ok(offset)
+    }
+
+    /// Sets the guest TSC offset without KVM's TSC-write synchronization heuristic.
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_tsc_offset(&self, offset: u64) -> Result<()> {
+        // SAFETY: `offset` is the u64 input required by KVM_VCPU_TSC_OFFSET.
+        unsafe {
+            self.set_device_attr(KVM_VCPU_TSC_CTRL, KVM_VCPU_TSC_OFFSET, &offset, 0)
+                .map_err(Error::SetTscOffset)?;
+        }
         Ok(())
     }
 
