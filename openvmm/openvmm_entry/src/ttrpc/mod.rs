@@ -2615,7 +2615,7 @@ fn validate_restore_console_attachments(
             attachment.stable_id == crate::MICROVM_CONTROL_CONSOLE_STABLE_ID
                 || attachment.kind == crate::MICROVM_CONTROL_CONSOLE_ATTACHMENT_KIND
         }),
-        "OpenVMM management RPC cannot restore control-console snapshots; use --restore-snapshot and --microvm-control-console"
+        "OpenVMM management RPC cannot restore control-console snapshots before authenticated broker activation"
     );
     Ok(())
 }
@@ -3527,7 +3527,11 @@ mod machine_profile_tests {
                     .to_string()
                     .contains("management RPC cannot restore control-console snapshots")
             );
-            assert!(error.to_string().contains("--restore-snapshot"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("before authenticated broker activation")
+            );
         }
     }
 
