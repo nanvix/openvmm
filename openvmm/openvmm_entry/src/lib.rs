@@ -890,9 +890,6 @@ fn random_nonzero_bytes<const N: usize>(description: &'static str) -> anyhow::Re
     }
 }
 
-// UNSAFETY: The launcher transfers exclusive ownership of the inherited
-// capability descriptor to OpenVMM.
-#[cfg_attr(unix, expect(unsafe_code))]
 fn microvm_control_broker_config(
     opt: &Options,
     endpoint: &SerialConfigCli,
@@ -900,24 +897,17 @@ fn microvm_control_broker_config(
     let capability = if matches!(endpoint, SerialConfigCli::None) {
         random_nonzero_bytes("disconnected control-console capability")?
     } else {
-        let inherited = opt
-            .microvm_control_auth_handle
-            .context("live microVM control console requires an inherited authentication handle")?;
-        #[cfg(unix)]
+        anyhow::ensure!(
+            opt.microvm_control_auth_stdin,
+            "live microVM control console requires --microvm-control-auth-stdin"
+        );
+        #[cfg(target_os = "linux")]
         {
-            // SAFETY: the CLI handle follows the launcher's exclusive-transfer
-            // contract and is consumed exactly once here.
-            let capability = unsafe { serial_io::read_control_capability(inherited) }
-                .context("failed to read control-console authentication capability")?;
-            anyhow::ensure!(
-                capability != [0; 32],
-                "control-console authentication capability is invalid"
-            );
-            capability
+            serial_io::read_control_capability_from_stdin()
+                .context("failed to read control-console authentication capability from stdin")?
         }
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         {
-            let _ = inherited;
             anyhow::bail!("secure live microVM control consoles are unavailable on this platform")
         }
     };
@@ -1715,31 +1705,6 @@ mod microvm_console_attachment_tests {
         assert_ne!(second.capability, [0; 32]);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn control_capability_handle_requires_exact_closed_pipe_payload() {
-        use std::io::Write as _;
-        use std::os::fd::IntoRawFd as _;
-
-        // UNSAFETY: into_raw_fd transfers exclusive ownership to the reader.
-        #[expect(unsafe_code)]
-        fn read_payload(payload: &[u8], keep_writer_open: bool) -> io::Result<[u8; 32]> {
-            let (read, mut write) = pal::pipe_pair()?;
-            write.write_all(payload)?;
-            if !keep_writer_open {
-                drop(write);
-            }
-            let raw = read.into_raw_fd();
-            // SAFETY: `read` relinquished exclusive ownership above.
-            unsafe { serial_io::read_control_capability(raw as u64) }
-        }
-
-        assert_eq!(read_payload(&[0x5a; 32], false).unwrap(), [0x5a; 32]);
-        assert!(read_payload(&[0x5a; 31], false).is_err());
-        assert!(read_payload(&[0x5a; 33], false).is_err());
-        assert!(read_payload(&[0x5a; 32], true).is_err());
-    }
-
     #[test]
     fn snapshot_downtime_accepts_supported_elapsed_time() {
         let capture = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1);
@@ -2422,6 +2387,7 @@ async fn vm_config_from_command_line(
     } else {
         None
     };
+    opt.validate_control_stdin_console(microvm_console.as_ref().map(|(config, _, _)| config))?;
     let microvm_control_broker_config = microvm_control_console
         .as_ref()
         .map(|(endpoint, _, _)| microvm_control_broker_config(opt, endpoint))
@@ -2457,9 +2423,10 @@ async fn vm_config_from_command_line(
     }
 
     let microvm_portb_cfg = if is_microvm {
-        let backend = if microvm_console
-            .as_ref()
-            .is_some_and(|(config, _, _)| matches!(config, SerialConfigCli::Console))
+        let backend = if opt.microvm_control_auth_stdin
+            || microvm_console
+                .as_ref()
+                .is_some_and(|(config, _, _)| matches!(config, SerialConfigCli::Console))
         {
             SerialConfigCli::Stderr
         } else {
@@ -6196,6 +6163,7 @@ async fn run_control_inner(
             shutdown_ic: resources.shutdown_ic,
             kvp_ic: resources.kvp_ic,
             console_in: resources.console_in,
+            stdin_enabled: !opt.microvm_control_auth_stdin,
             has_vtl2,
         },
     )

@@ -601,10 +601,15 @@ Serial devices can be configured to appear as different devices inside the guest
   OpenVMM verifies `SO_PEERCRED` before accepting the protocol attachment.
 
   A live endpoint also requires the hidden launcher option
-  `--microvm-control-auth-handle=<FD>`. FD is an inherited, readable, one-way
-  pipe containing exactly 32 random capability bytes. The launcher must close
-  its writer before starting OpenVMM. OpenVMM duplicates the descriptor,
-  performs one bounded nonblocking read through EOF, and closes it. Capability
+  `--microvm-control-auth-stdin`. The launcher must attach a prepared readable
+  one-way pipe to standard input, containing exactly 32 random capability
+  bytes, and close every writer before starting OpenVMM. OpenVMM safely
+  duplicates stdin into an owned file, performs one bounded nonblocking read
+  through EOF, and closes the duplicate. An all-zero capability is rejected.
+  Standard input remains at EOF and is reserved for authentication: the stdin
+  REPL is disabled, the boot console must use a socket or `none`, and portb
+  recovery output goes to stderr. This option cannot be combined with the
+  management RPC server, console relay, or `--paused`. Capability
   bytes must never appear in arguments, environment variables, endpoint names,
   logs, snapshots, or attachment identities. The first host record must prove
   that capability. Peer identity is checked first. Authentication must complete
@@ -612,11 +617,16 @@ Serial devices can be configured to appear as different devices inside the guest
   A stalled or failed authentication attempt closes the connection without a
   protocol Error record and without changing the broker epoch.
 
-  `none` needs no authentication handle. OpenVMM generates an unreachable
+  `none` does not consume stdin and rejects `--microvm-control-auth-stdin`.
+  OpenVMM generates an unreachable
   random capability so disconnected process tests remain supported. Secure
   Windows named-pipe SID verification and restrictive DACL creation are not
   yet available in PAL, so live control-console endpoints are rejected on
   Windows rather than falling back to capability-only authentication.
+
+  The numeric `--microvm-control-auth-handle` interface is not supported.
+  Launchers must explicitly select the stdin contract; there is no fallback
+  to an unauthenticated endpoint.
 
   Boot and control endpoints must be distinct. Snapshot capture records only
   the separate `console:microvm-control0` endpoint and broker-authenticated

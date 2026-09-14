@@ -175,6 +175,15 @@ pub fn read_control_capability(mut file: File) -> io::Result<[u8; 32]> {
     Ok(capability)
 }
 
+/// Reads the prepared authentication pipe without taking ownership of descriptor 0.
+#[cfg(target_os = "linux")]
+pub fn read_control_capability_from_stdin() -> io::Result<[u8; 32]> {
+    use std::os::fd::AsFd;
+
+    let stdin = io::stdin();
+    read_control_capability(File::from(stdin.as_fd().try_clone_to_owned()?))
+}
+
 fn bind_serial_inner(
     path: &Path,
     cleanup_existing: bool,
@@ -350,6 +359,72 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn control_capability_stdin_child() {
+        let Some(expected) = std::env::var_os("OPENVMM_TEST_CONTROL_STDIN") else {
+            return;
+        };
+        let result = read_control_capability_from_stdin();
+        match expected.to_str().unwrap() {
+            "valid" => {
+                let mut capability = [0x5a; 32];
+                capability[0] = 0;
+                assert_eq!(result.unwrap(), capability);
+                assert_eq!(io::stdin().read(&mut [0]).unwrap(), 0);
+            }
+            "open-writer" => assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut),
+            "non-pipe" => assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput),
+            _ => panic!("unexpected child-test scenario"),
+        }
+    }
+
+    #[test]
+    fn control_capability_uses_prepared_child_stdin() {
+        use std::process::Command;
+        use std::process::Stdio;
+        use std::time::Duration;
+        use std::time::Instant;
+
+        for scenario in ["valid", "open-writer", "non-pipe"] {
+            let (read, mut write) = pal::pipe_pair().unwrap();
+            let mut capability = [0x5a; 32];
+            capability[0] = 0;
+            write.write_all(&capability).unwrap();
+            let _writer = (scenario == "open-writer").then_some(write);
+            let input = if scenario == "non-pipe" {
+                tempfile::tempfile().unwrap()
+            } else {
+                read
+            };
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "serial_io::tests::control_capability_stdin_child",
+                    "--nocapture",
+                ])
+                .env("OPENVMM_TEST_CONTROL_STDIN", scenario)
+                .stdin(Stdio::from(input))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    panic!("stdin capability scenario {scenario} timed out: {output:?}");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "stdin scenario {scenario}: {output:?}"
+            );
+        }
     }
 
     #[test]
