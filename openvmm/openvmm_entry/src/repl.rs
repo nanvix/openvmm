@@ -440,6 +440,24 @@ pub(crate) struct ReplResources {
     pub has_vtl2: bool,
 }
 
+fn controller_exit(event: VmControllerEvent) -> anyhow::Result<Option<i32>> {
+    match event {
+        VmControllerEvent::WorkerStopped { error } => {
+            if let Some(err) = &error {
+                tracing::error!(error = err.as_str(), "vm worker stopped");
+            }
+            Ok(Some(i32::from(error.is_some())))
+        }
+        VmControllerEvent::VncWorkerStopped { .. } => Ok(None),
+        VmControllerEvent::GuestHalt(reason) => {
+            tracing::info!(reason = reason.as_str(), "guest halted");
+            Ok(None)
+        }
+        VmControllerEvent::ExitRequested { code } => Ok(Some(code)),
+        VmControllerEvent::ExitFailed { error } => Err(anyhow::anyhow!(error)),
+    }
+}
+
 /// Run the interactive REPL.
 pub(crate) async fn run_repl(
     driver: &DefaultDriver,
@@ -794,21 +812,8 @@ pub(crate) async fn run_repl(
                 continue;
             }
             Event::Controller(event) => {
-                match event {
-                    VmControllerEvent::WorkerStopped { error } => {
-                        if let Some(err) = &error {
-                            tracing::error!(error = err.as_str(), "vm worker stopped");
-                        }
-                        // Non-zero exit when the worker stopped with an error.
-                        break i32::from(error.is_some());
-                    }
-                    VmControllerEvent::VncWorkerStopped { .. } => {
-                        // VNC stopped but VM is still running, continue.
-                    }
-                    VmControllerEvent::GuestHalt(reason) => {
-                        tracing::info!(reason = reason.as_str(), "guest halted");
-                    }
-                    VmControllerEvent::ExitRequested { code } => break code,
+                if let Some(code) = controller_exit(event)? {
+                    break code;
                 }
                 continue;
             }
@@ -1734,6 +1739,27 @@ impl clap_dyn_complete::CustomCompleter for OpenvmmComplete {
                 completions
             }
             _ => Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod microvm_exit_tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn repl_propagates_exit_failures_and_preserves_requested_statuses() {
+        let error = controller_exit(VmControllerEvent::ExitFailed {
+            error: "console output drain timed out".to_owned(),
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("console output drain timed out"));
+        for code in [0, 37] {
+            assert_eq!(
+                controller_exit(VmControllerEvent::ExitRequested { code }).unwrap(),
+                Some(code)
+            );
         }
     }
 }

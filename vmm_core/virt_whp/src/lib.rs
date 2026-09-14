@@ -16,6 +16,8 @@ mod hypercalls;
 mod memory;
 mod regs;
 mod synic;
+#[cfg(guest_arch = "x86_64")]
+mod tsc;
 mod vm_state;
 mod vp;
 mod vp_state;
@@ -128,6 +130,9 @@ struct WhpPartitionInner {
     smt_enabled: bool,
     #[cfg(guest_arch = "x86_64")]
     tsc_frequency_hz: u64,
+    #[cfg(guest_arch = "x86_64")]
+    #[inspect(skip)]
+    restored_tsc: Mutex<Option<tsc::RestoredTsc>>,
     vtl0_alias_map_offset: Option<u64>,
     monitor_page: MonitorPage,
     hvstate: Hv1State,
@@ -535,6 +540,14 @@ impl virt::ResetPartition for WhpPartition {
     type Error = Error;
 
     fn reset(&self) -> Result<(), Error> {
+        #[cfg(guest_arch = "x86_64")]
+        {
+            let mut restored_tsc = self.inner.restored_tsc.lock();
+            if let Some(clock) = &*restored_tsc {
+                clock.disable(&self.inner.vtl0.whp)?;
+            }
+            *restored_tsc = None;
+        }
         self.inner.vtl0.reset()?;
         self.validate_is_reset(Vtl::Vtl0);
 
@@ -635,6 +648,39 @@ impl virt::Partition for WhpPartition {
     }
 
     #[cfg(guest_arch = "x86_64")]
+    fn advance_snapshot_time(&self, _duration: std::time::Duration) -> Result<(), Self::Error> {
+        if self.inner.vps.len() <= 1 {
+            return Ok(());
+        }
+
+        let partition = &self.inner.vtl0.whp;
+        partition
+            .suspend_time()
+            .for_op("suspend restored partition time")?;
+        let tsc = synchronize_restored_tscs(partition, self.inner.vps.len())?;
+        if self.inner.caps.nested_virt {
+            return Ok(());
+        }
+        let leaf = x86defs::cpuid::CpuidFunction::ExtendedFeatures.0;
+        let features = self
+            .inner
+            .cpuid
+            .result(leaf, 0, &self.inner.vtl0.cpuid(leaf, 0));
+        let tsc_adjust_supported =
+            x86defs::cpuid::ExtendedFeatureSubleaf0Ebx::from(features[1]).tsc_adjust();
+        let mut clock = self.inner.restored_tsc.lock();
+        *clock = Some(tsc::RestoredTsc::enable(
+            partition,
+            tsc,
+            self.inner.tsc_frequency_hz,
+            self.inner.vps.len(),
+            tsc_adjust_supported,
+            clock.as_ref(),
+        )?);
+        Ok(())
+    }
+
+    #[cfg(guest_arch = "x86_64")]
     fn apic_frequency_hz(&self) -> Result<Option<u64>, Self::Error> {
         let frequency = match &self.inner.vtl0.lapic {
             LocalApicKind::Emulated(_) => virt_support_apic::TIMER_FREQUENCY,
@@ -731,6 +777,21 @@ impl virt::Partition for WhpPartition {
             }
         }
     }
+}
+
+#[cfg(guest_arch = "x86_64")]
+fn synchronize_restored_tscs(partition: &whp::Partition, vp_count: usize) -> Result<u64, Error> {
+    let tsc = partition
+        .vp(0)
+        .get_register(whp::Register64::Tsc)
+        .for_op("read restored BSP TSC")?;
+    for vp_index in 1..vp_count as u32 {
+        partition
+            .vp(vp_index)
+            .set_register(whp::Register64::Tsc, tsc)
+            .for_op("synchronize restored VP TSC")?;
+    }
+    Ok(tsc)
 }
 
 #[cfg(guest_arch = "x86_64")]
@@ -883,6 +944,9 @@ pub enum Error {
     IsolationNotSupported(IsolationType),
     #[error("saved TSC frequency {saved} Hz does not match destination frequency {destination} Hz")]
     TscFrequencyMismatch { saved: u64, destination: u64 },
+    #[cfg(guest_arch = "x86_64")]
+    #[error("timestamp intercept arrived without a restored TSC clock")]
+    UnexpectedTimestampExit,
 }
 
 trait WhpResultExt<T> {
@@ -1382,6 +1446,8 @@ impl WhpPartitionInner {
             smt_enabled: proto_config.processor_topology.smt_enabled(),
             #[cfg(guest_arch = "x86_64")]
             tsc_frequency_hz,
+            #[cfg(guest_arch = "x86_64")]
+            restored_tsc: Mutex::new(None),
             vtl0_alias_map_offset,
             monitor_page: MonitorPage::new(),
             hvstate,
@@ -2223,6 +2289,49 @@ mod aarch64 {
                     error = &err as &dyn std::error::Error,
                     "failed to set interrupt state"
                 );
+            }
+        }
+    }
+}
+
+#[cfg(all(test, guest_arch = "x86_64"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires WHP"]
+    fn restored_tscs_are_identical_while_partition_time_is_suspended() {
+        for vp_count in [1, 2, 4, 8] {
+            let mut config = whp::PartitionConfig::new().unwrap();
+            config
+                .set_property(whp::PartitionProperty::ProcessorCount(vp_count))
+                .unwrap();
+            let partition = config.create().unwrap();
+            for vp_index in 0..vp_count {
+                partition.create_vp(vp_index).create().unwrap();
+            }
+
+            partition.suspend_time().unwrap();
+            let expected_tsc = 1_000_000_u64;
+            for vp_index in 0..vp_count {
+                partition
+                    .vp(vp_index)
+                    .set_register(
+                        whp::Register64::Tsc,
+                        expected_tsc + u64::from(vp_index) * 100_000,
+                    )
+                    .unwrap();
+            }
+
+            synchronize_restored_tscs(&partition, vp_count as usize).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+
+            for vp_index in 0..vp_count {
+                let actual_tsc = partition
+                    .vp(vp_index)
+                    .get_register(whp::Register64::Tsc)
+                    .unwrap();
+                assert_eq!(actual_tsc, expected_tsc, "VP {vp_index} TSC differs");
             }
         }
     }
