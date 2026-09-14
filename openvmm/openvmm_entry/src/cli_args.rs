@@ -42,7 +42,7 @@ use openvmm_defs::config::append_microvm_virtio_discovery;
 #[cfg(test)]
 use openvmm_defs::config::build_microvm_command_line;
 #[cfg(test)]
-use openvmm_defs::config::build_microvm_v2_command_line;
+use openvmm_defs::config::build_microvm_control_command_line;
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -6318,7 +6318,7 @@ mod tests {
                 "{MICROVM_CONSOLE_COMMAND_LINE} virtio_mmio.device=0x1000@0xd0002000:7 virtio_mmio.device=0x1000@0xd0003000:4 virtio_mmio.device=0x1000@0xd0006000:11"
             )
         );
-        let mut with_control_console = build_microvm_v2_command_line(&[], true).unwrap();
+        let mut with_control_console = build_microvm_control_command_line(&[], true).unwrap();
         append_microvm_virtio_discovery(
             &mut with_control_console,
             None,
