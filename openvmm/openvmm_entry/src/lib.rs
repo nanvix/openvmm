@@ -5,7 +5,7 @@
 //! for the worker process.
 
 #![expect(missing_docs)]
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 mod cli_args;
 mod crash_dump;
@@ -97,7 +97,7 @@ use openvmm_defs::config::Vtl2BaseAddressType;
 use openvmm_defs::config::Vtl2Config;
 #[cfg(test)]
 use openvmm_defs::config::build_microvm_command_line;
-use openvmm_defs::config::build_microvm_v2_command_line;
+use openvmm_defs::config::build_microvm_control_command_line;
 use openvmm_defs::rpc::VmRpc;
 use openvmm_defs::worker::VM_WORKER;
 use openvmm_defs::worker::VmWorkerParameters;
@@ -3491,7 +3491,7 @@ async fn vm_config_from_command_line(
                 initrd.map(Into::into),
                 match opt.machine {
                     MachineProfileCli::Microvm => {
-                        build_microvm_v2_command_line(&opt.cmdline, microvm_console.is_some())?
+                        build_microvm_control_command_line(&opt.cmdline, microvm_console.is_some())?
                     }
                     MachineProfileCli::Standard => unreachable!(),
                 },
