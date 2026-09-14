@@ -96,7 +96,6 @@ use openvmm_defs::config::VpAssignment;
 use openvmm_defs::config::VpciDeviceConfig;
 use openvmm_defs::config::Vtl2BaseAddressType;
 use openvmm_defs::config::Vtl2Config;
-#[cfg(test)]
 use openvmm_defs::config::build_microvm_command_line;
 use openvmm_defs::config::build_microvm_control_command_line;
 use openvmm_defs::rpc::VmRpc;
@@ -842,6 +841,18 @@ fn reject_control_console_before_activation(
         );
     }
     Ok(())
+}
+
+fn build_effective_microvm_command_line(
+    user_args: &[String],
+    has_console: bool,
+    has_control_console: bool,
+) -> anyhow::Result<String> {
+    if has_control_console {
+        build_microvm_control_command_line(user_args, has_console)
+    } else {
+        build_microvm_command_line(user_args, has_console)
+    }
 }
 
 fn microvm_network_attachment() -> openvmm_helpers::snapshot::SnapshotAttachment {
@@ -1636,6 +1647,19 @@ mod microvm_console_attachment_tests {
         let mut control_device_restore = boot_only;
         control_device_restore.devices[0].stable_id = MICROVM_CONTROL_CONSOLE_STABLE_ID.to_owned();
         assert!(reject_control_console_before_activation(Some(&control_device_restore)).is_err());
+    }
+
+    #[test]
+    fn boot_only_command_line_preserves_control_free_arguments() {
+        let user_args = [
+            r#"note="left right""#.to_owned(),
+            "--".to_owned(),
+            "driver_async_probe=virtio_mmio".to_owned(),
+            "nvx_control_tty=hvc9".to_owned(),
+            "virtio-mmio.device=0x1000@0xc0000000:1".to_owned(),
+        ];
+        assert!(build_effective_microvm_command_line(&user_args, true, false).is_ok());
+        assert!(build_effective_microvm_command_line(&user_args, true, true).is_err());
     }
 
     #[test]
@@ -3487,12 +3511,11 @@ async fn vm_config_from_command_line(
             (
                 kernel.into(),
                 initrd.map(Into::into),
-                match opt.machine {
-                    MachineProfileCli::Microvm => {
-                        build_microvm_control_command_line(&opt.cmdline, microvm_console.is_some())?
-                    }
-                    MachineProfileCli::Standard => unreachable!(),
-                },
+                build_effective_microvm_command_line(
+                    &opt.cmdline,
+                    microvm_console.is_some(),
+                    microvm_control_console.is_some(),
+                )?,
             )
         };
 
