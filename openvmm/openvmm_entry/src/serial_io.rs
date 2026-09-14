@@ -123,25 +123,15 @@ pub fn bind_control_serial(_path: &Path) -> io::Result<Resource<SerialBackendHan
     ))
 }
 
-/// Consumes an inherited one-way pipe and reads its control capability.
-///
-/// # Safety
-///
-/// `raw_handle` must identify a valid descriptor exclusively owned by the
-/// caller. No other owner may close or use it after this call.
+/// Consumes a one-way pipe containing exactly one nonzero control capability.
 #[cfg(unix)]
-// UNSAFETY: Adopts the launcher-transferred descriptor under the caller's
-// exclusive-ownership contract.
-#[expect(unsafe_code)]
-pub unsafe fn read_control_capability(raw_handle: u64) -> io::Result<[u8; 32]> {
+pub fn read_control_capability(mut file: File) -> io::Result<[u8; 32]> {
     use std::os::unix::fs::FileTypeExt;
 
-    // SAFETY: inherited descriptor ownership is the caller's contract.
-    let mut file = unsafe { pal::take_inherited_file(raw_handle)? };
     if !file.metadata()?.file_type().is_fifo() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "control authentication handle is not a one-way pipe",
+            "control authentication input is not a one-way pipe",
         ));
     }
     pal::unix::pipe::set_nonblocking(&file, true)?;
@@ -170,12 +160,19 @@ pub unsafe fn read_control_capability(raw_handle: u64) -> io::Result<[u8; 32]> {
             Err(error) => return Err(error),
         }
     }
-    bytes[..count].try_into().map_err(|_| {
+    let capability = bytes[..count].try_into().map_err(|_| {
         io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "control authentication payload has an invalid length",
         )
-    })
+    })?;
+    if capability == [0; 32] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "control authentication capability must not be zero",
+        ));
+    }
+    Ok(capability)
 }
 
 fn bind_serial_inner(
@@ -292,10 +289,68 @@ pub fn connect_tcp_serial(
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use std::io::Write as _;
     use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::fs::MetadataExt;
     use test_with_tracing::test;
+
+    fn read_capability_payload(payload: &[u8], keep_writer_open: bool) -> io::Result<[u8; 32]> {
+        let (read, mut write) = pal::pipe_pair()?;
+        write.write_all(payload)?;
+        if !keep_writer_open {
+            drop(write);
+        }
+        read_control_capability(read)
+    }
+
+    #[test]
+    fn control_capability_requires_exact_closed_pipe_payload() {
+        let mut capability = [0x5a; 32];
+        capability[0] = 0;
+        assert_eq!(
+            read_capability_payload(&capability, false).unwrap(),
+            capability
+        );
+        for length in [0, 1, 31] {
+            assert_eq!(
+                read_capability_payload(&vec![0x5a; length], false)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        }
+        for length in [33, 64] {
+            assert_eq!(
+                read_capability_payload(&vec![0x5a; length], false)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        for length in [0, 31, 32] {
+            assert_eq!(
+                read_capability_payload(&vec![0x5a; length], true)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::TimedOut
+            );
+        }
+        assert_eq!(
+            read_capability_payload(&[0; 32], false).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn control_capability_rejects_non_pipe_input() {
+        assert_eq!(
+            read_control_capability(tempfile::tempfile().unwrap())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
 
     #[test]
     fn control_listener_has_private_permissions_and_exclusive_path() {
