@@ -4181,6 +4181,14 @@ where
 mod tests {
     use super::*;
 
+    const TEST_FREQUENCY_HZ: u64 = 1_000_000_000;
+    const TEST_DISTRO_IDENTITY_BYTE: u8 = 0x11;
+    const TEST_SCRATCH_IDENTITY_BYTE: u8 = 0x22;
+
+    fn virtio_state_unit_name(kind: &str, mmio_base: u64) -> String {
+        format!("{kind}-{mmio_base}")
+    }
+
     /// Helper: build a test manifest with sensible defaults.
     fn test_manifest() -> SnapshotManifest {
         SnapshotManifest {
@@ -4297,7 +4305,7 @@ mod tests {
                 read_only: true,
                 length: 512,
                 identity_kind: "sha256".to_owned(),
-                identity: vec![0x11; SHA256_SIZE],
+                identity: vec![TEST_DISTRO_IDENTITY_BYTE; SHA256_SIZE],
                 artifact: String::new(),
                 logical_block_size: 512,
                 physical_block_size: 4096,
@@ -4770,15 +4778,31 @@ mod tests {
     fn generated_control_console_contract_with_attachment(
         control_console_attachment: SnapshotAttachment,
     ) -> SnapshotMachineContract {
+        let command_line = format!(
+            "{} \
+             virtio_mmio.device={:#x}@{:#x}:{} \
+             virtio_mmio.device={:#x}@{:#x}:{} \
+             virtio_mmio.device={:#x}@{:#x}:{} \
+             virtio_mmio.device={:#x}@{:#x}:{} \
+             {}",
+            openvmm_defs::config::MICROVM_CONSOLE_COMMAND_LINE,
+            openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+            openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_MMIO_BASE,
+            openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_IRQ,
+            openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+            openvmm_defs::config::MICROVM_VIRTIO_BLK_MMIO_BASE,
+            openvmm_defs::config::MICROVM_VIRTIO_BLK_IRQ,
+            openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+            openvmm_defs::config::MICROVM_VIRTIO_SANDBOX_BLOCK_MMIO_BASES[3],
+            openvmm_defs::config::MICROVM_VIRTIO_SCRATCH_BLK_IRQ,
+            openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN,
+            openvmm_defs::config::MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE,
+            openvmm_defs::config::MICROVM_VIRTIO_CONTROL_CONSOLE_IRQ,
+            openvmm_defs::config::MICROVM_CONTROL_TTY_COMMAND_LINE,
+        );
         microvm_machine_contract(
             "whp",
-            "earlycon=xe9 console=hvc1 reboot=t panic=-1 \
-             virtio_mmio.device=0x1000@0xd0002000:7 \
-             virtio_mmio.device=0x1000@0xd0003000:4 \
-             virtio_mmio.device=0x1000@0xd0006000:11 \
-             virtio_mmio.device=0x1000@0xd0007000:3 \
-             nvx_control_tty=hvc2"
-                .to_owned(),
+            command_line,
             None,
             false,
             None,
@@ -4800,7 +4824,7 @@ mod tests {
                     read_only: false,
                     length: 512,
                     identity_kind: "sha256".to_owned(),
-                    identity: vec![0x22; SHA256_SIZE],
+                    identity: vec![TEST_SCRATCH_IDENTITY_BYTE; SHA256_SIZE],
                     artifact: SCRATCH_FILE_NAME.to_owned(),
                     logical_block_size: 512,
                     physical_block_size: 4096,
@@ -4809,26 +4833,36 @@ mod tests {
             1,
             1024,
             None,
-            [
-                "partition",
-                "vmtime",
-                "pic",
-                "ioapic",
-                "pit",
-                "rtc",
-                "microvm-portb",
-                "microvm-shutdown",
-                "microvm-snapshot-request",
-                "virtio-console-3489669120",
-                "virtio-blk-3489673216",
-                "virtio-blk-3489685504",
-                "virtio-control-console-3489689600",
-            ]
-            .map(str::to_owned)
-            .to_vec(),
+            vec![
+                "partition".to_owned(),
+                "vmtime".to_owned(),
+                "pic".to_owned(),
+                "ioapic".to_owned(),
+                "pit".to_owned(),
+                "rtc".to_owned(),
+                "microvm-portb".to_owned(),
+                "microvm-shutdown".to_owned(),
+                "microvm-snapshot-request".to_owned(),
+                virtio_state_unit_name(
+                    "virtio-console",
+                    openvmm_defs::config::MICROVM_VIRTIO_CONSOLE_MMIO_BASE,
+                ),
+                virtio_state_unit_name(
+                    "virtio-blk",
+                    openvmm_defs::config::MICROVM_VIRTIO_BLK_MMIO_BASE,
+                ),
+                virtio_state_unit_name(
+                    "virtio-blk",
+                    openvmm_defs::config::MICROVM_VIRTIO_SANDBOX_BLOCK_MMIO_BASES[3],
+                ),
+                virtio_state_unit_name(
+                    "virtio-control-console",
+                    openvmm_defs::config::MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE,
+                ),
+            ],
             std::time::SystemTime::now().into(),
-            1_000_000_000,
-            Some(1_000_000_000),
+            TEST_FREQUENCY_HZ,
+            Some(TEST_FREQUENCY_HZ),
             vec![1, 2, 3],
         )
         .unwrap()
