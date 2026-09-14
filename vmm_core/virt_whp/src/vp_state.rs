@@ -196,11 +196,42 @@ mod x86 {
         }
 
         fn tsc(&mut self) -> Result<vp::Tsc, Self::Error> {
+            if self.vtl == hvdef::Vtl::Vtl0 {
+                let clock = self.run.vp.partition.restored_tsc.lock();
+                if let Some(clock) = &*clock {
+                    let reference = self
+                        .run
+                        .vp
+                        .partition
+                        .vtl0
+                        .whp
+                        .reference_time()
+                        .for_op("read restored TSC reference time")?;
+                    if let Some(value) = clock.read(self.run.vp.index.index(), reference) {
+                        return Ok(vp::Tsc { value });
+                    }
+                }
+            }
             self.run.vp.get_register_state(self.vtl)
         }
 
         fn set_tsc(&mut self, value: &vp::Tsc) -> Result<(), Self::Error> {
-            self.run.vp.set_register_state(self.vtl, value)
+            self.run.vp.set_register_state(self.vtl, value)?;
+            if self.vtl == hvdef::Vtl::Vtl0 {
+                let mut clock = self.run.vp.partition.restored_tsc.lock();
+                if let Some(clock) = &mut *clock {
+                    let reference = self
+                        .run
+                        .vp
+                        .partition
+                        .vtl0
+                        .whp
+                        .reference_time()
+                        .for_op("restore TSC reference time")?;
+                    clock.restore(self.run.vp.index.index(), value.value, reference);
+                }
+            }
+            Ok(())
         }
 
         fn tsc_deadline(&mut self) -> Result<vp::TscDeadline, Self::Error> {
