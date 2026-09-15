@@ -49,9 +49,14 @@ describes the source definitions.
   One virtio-fs slot is exposed at MMIO `0xd0001000`, IRQ 6 and remains
   dormant when `--mount` is omitted; an optional `--mount` binds HostFs to it;
   one optional `--virtio-console <BACKEND>` is exposed at MMIO `0xd0002000`,
-  IRQ 7; and `--microvm-sandbox-block` exposes fixed distro, runtime, custom,
-  and scratch slots starting at MMIO `0xd0003000`. Ordinary `--virtio-blk`
-  is rejected. All use split rings. Firmware, ACPI, SMBIOS, PCI,
+  IRQ 7 as the boot/log console (`hvc1`); and `--microvm-sandbox-block`
+  exposes fixed distro, runtime, custom, and scratch slots starting at MMIO
+  `0xd0003000`. The profile also reserves MMIO `0xd0007000`, IRQ 3 for the
+  dedicated control console (`hvc2`), selected by the host-owned
+  `nvx_control_tty=hvc2` token. The reserved slot and resource identity do not
+  expose a live control endpoint. Both consoles
+  remain virtio-console devices from the guest's perspective. Ordinary
+  `--virtio-blk` is rejected. All use split rings. Firmware, ACPI, SMBIOS, PCI,
   VMBus, UARTs, graphics, isolation, nested virtualization, and other devices
   are rejected. Host-driven save/restore, pulse-save/restore, and worker
   restart remain unavailable.
