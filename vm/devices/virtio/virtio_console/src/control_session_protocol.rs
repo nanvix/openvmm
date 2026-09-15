@@ -3,6 +3,7 @@
 
 //! Frozen outer protocol for the control-session broker.
 
+use core::fmt;
 use thiserror::Error;
 
 pub const HEADER_LEN: usize = 44;
@@ -42,14 +43,45 @@ impl TryFrom<u8> for RecordType {
     }
 }
 
+/// A protocol-v1 Error record code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ErrorCode {
+    /// The host failed capability authentication.
+    Authentication = 1,
+}
+
+impl TryFrom<u32> for ErrorCode {
+    type Error = ProtocolError;
+
+    fn try_from(value: u32) -> Result<Self, ProtocolError> {
+        match value {
+            1 => Ok(Self::Authentication),
+            _ => Err(ProtocolError::InvalidErrorCode(value)),
+        }
+    }
+}
+
 /// A validated protocol-v1 record.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct Record {
     pub record_type: RecordType,
     pub instance_id: [u8; 16],
     pub epoch: u64,
     pub sequence: u64,
     pub payload: Vec<u8>,
+}
+
+impl fmt::Debug for Record {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Record")
+            .field("record_type", &self.record_type)
+            .field("instance_id", &self.instance_id)
+            .field("epoch", &self.epoch)
+            .field("sequence", &self.sequence)
+            .field("payload_len", &self.payload.len())
+            .finish()
+    }
 }
 
 impl Record {
@@ -110,12 +142,22 @@ pub enum ProtocolError {
 }
 
 /// Serializable-neutral state for an incremental parser.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ParserSnapshot {
     pub header_bytes: Vec<u8>,
     pub header_count: usize,
     pub body_bytes: Vec<u8>,
     pub declared_body_len: Option<u32>,
+}
+
+impl fmt::Debug for ParserSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ParserSnapshot")
+            .field("header_count", &self.header_count)
+            .field("body_len", &self.body_bytes.len())
+            .field("declared_body_len", &self.declared_body_len)
+            .finish()
+    }
 }
 
 /// The result of accepting bytes into a parser.
@@ -135,12 +177,22 @@ struct ParsedHeader {
 }
 
 /// An aligned, bounded incremental protocol parser.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Parser {
     header: [u8; HEADER_LEN],
     header_count: usize,
     body: Vec<u8>,
     declared_body_len: Option<usize>,
+}
+
+impl fmt::Debug for Parser {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Parser")
+            .field("header_count", &self.header_count)
+            .field("body_len", &self.body.len())
+            .field("declared_body_len", &self.declared_body_len)
+            .finish()
+    }
 }
 
 impl Default for Parser {
@@ -406,10 +458,7 @@ fn validate_record(record: &Record) -> Result<(), ProtocolError> {
                 length: payload_len,
             }
         })?;
-        let code = u32::from_le_bytes(code_bytes);
-        if !(1..=5).contains(&code) {
-            return Err(ProtocolError::InvalidErrorCode(code));
-        }
+        ErrorCode::try_from(u32::from_le_bytes(code_bytes))?;
     }
     Ok(())
 }
@@ -509,6 +558,10 @@ mod tests {
             if expected_type == RecordType::Data {
                 assert_eq!(record.payload, b"NVXSNVXS");
             }
+            if expected_type == RecordType::Error {
+                let code = u32::from_le_bytes(record.payload.as_slice().try_into()?);
+                assert_eq!(ErrorCode::try_from(code)?, ErrorCode::Authentication);
+            }
             assert_eq!(encode(&record)?, bytes, "{name}");
             count += 1;
         }
@@ -519,13 +572,46 @@ mod tests {
 
     #[test]
     fn language_neutral_boundary_and_invalid_cases() -> Result<(), Box<dyn std::error::Error>> {
+        const EXPECTED_CASE_NAMES: [&str; 29] = [
+            "VALID_MIN",
+            "VALID_MAX",
+            "INVALID_EMPTY",
+            "INVALID_OVERSIZE",
+            "INVALID_MAGIC",
+            "INVALID_VERSION",
+            "INVALID_TYPE",
+            "INVALID_FLAGS",
+            "INVALID_DATA_LENGTH",
+            "AUTHENTICATION",
+            "INVALID_GUEST_ATTACH_PAYLOAD",
+            "INVALID_HOST_ATTACH_SHORT",
+            "INVALID_HOST_ATTACH_LONG",
+            "INVALID_RESET_PAYLOAD",
+            "INVALID_ACK_PAYLOAD",
+            "INVALID_WAIT_PAYLOAD",
+            "INVALID_READY_PAYLOAD",
+            "INVALID_ERROR_SHORT",
+            "INVALID_ERROR_LONG",
+            "INVALID_GUEST_ATTACH_INSTANCE",
+            "INVALID_HOST_ATTACH_EPOCH",
+            "INVALID_HOST_ATTACH_SEQUENCE",
+            "INVALID_ERROR_CODE_0",
+            "INVALID_ERROR_CODE_2",
+            "INVALID_ERROR_CODE_3",
+            "INVALID_ERROR_CODE_4",
+            "INVALID_ERROR_CODE_5",
+            "INVALID_ERROR_CODE_6",
+            "INVALID_ERROR_CODE_MAX",
+        ];
+
         let cases = include_str!("../test_data/control_session_protocol_v1_cases.txt");
         let instance_id = core::array::from_fn(|index| index as u8);
-        let mut count = 0;
+        let mut names = Vec::new();
         for line in cases.lines().filter(|line| !line.is_empty()) {
             let fields = line.split('|').collect::<Vec<_>>();
             match fields.as_slice() {
                 ["DATA_LENGTH", name, length] => {
+                    names.push(*name);
                     let length = length.parse::<usize>()?;
                     let result = encode(&Record::session(
                         RecordType::Data,
@@ -534,19 +620,71 @@ mod tests {
                         9,
                         vec![0x5a; length],
                     ));
-                    assert_eq!(result.is_ok(), name.starts_with("VALID_"), "{name}");
+                    match *name {
+                        "VALID_MIN" | "VALID_MAX" => assert!(result.is_ok(), "{name}"),
+                        "INVALID_EMPTY" => assert!(matches!(
+                            result,
+                            Err(ProtocolError::InvalidPayloadLength { length: 0, .. })
+                        )),
+                        "INVALID_OVERSIZE" => assert!(matches!(
+                            result,
+                            Err(ProtocolError::InvalidPayloadLength { length: 65_537, .. })
+                        )),
+                        _ => return Err(format!("unknown data-length case: {name}").into()),
+                    }
                 }
                 ["INVALID_HEADER", name, hex] => {
+                    names.push(*name);
                     let bytes = decode_hex(hex)?;
                     assert_eq!(bytes.len(), HEADER_LEN, "{name}");
                     let mut parser = Parser::new();
-                    assert!(parser.accept(&bytes).is_err(), "{name}");
+                    let error = parser.accept(&bytes).expect_err(name);
+                    let intended = matches!(
+                        (*name, &error),
+                        ("INVALID_MAGIC", ProtocolError::InvalidMagic)
+                            | ("INVALID_VERSION", ProtocolError::InvalidVersion(2))
+                            | ("INVALID_TYPE", ProtocolError::InvalidType(99))
+                            | ("INVALID_FLAGS", ProtocolError::InvalidFlags(1))
+                            | (
+                                "INVALID_DATA_LENGTH",
+                                ProtocolError::InvalidPayloadLength {
+                                    record_type: RecordType::Data,
+                                    length: 65_537,
+                                },
+                            )
+                    );
+                    assert!(intended, "{name}: unexpected error {error:?}");
+                }
+                ["ERROR_CODE", name, value] => {
+                    names.push(*name);
+                    let value = value.parse::<u32>()?;
+                    match *name {
+                        "AUTHENTICATION" => {
+                            assert_eq!(ErrorCode::try_from(value)?, ErrorCode::Authentication);
+                        }
+                        _ => return Err(format!("unknown error-code mapping: {name}").into()),
+                    }
+                }
+                ["INVALID_RECORD", name, expected_error, hex] => {
+                    names.push(*name);
+                    let bytes = decode_hex(hex)?;
+                    let error = decode_exact(&bytes).expect_err(name);
+                    let intended = matches!(
+                        (*expected_error, &error),
+                        (
+                            "INVALID_PAYLOAD_LENGTH",
+                            ProtocolError::InvalidPayloadLength { .. },
+                        ) | (
+                            "INVALID_BOOTSTRAP_IDENTITY",
+                            ProtocolError::InvalidBootstrapIdentity,
+                        ) | ("INVALID_ERROR_CODE", ProtocolError::InvalidErrorCode(_))
+                    );
+                    assert!(intended, "{name}: unexpected error {error:?}");
                 }
                 _ => return Err(format!("invalid language-neutral case: {line}").into()),
             }
-            count += 1;
         }
-        assert_eq!(count, 9);
+        assert_eq!(names, EXPECTED_CASE_NAMES);
         Ok(())
     }
 
@@ -637,8 +775,73 @@ mod tests {
         assert!(encode(&sample(RecordType::Ack, vec![1])).is_err());
         assert!(encode(&sample(RecordType::Wait, vec![1])).is_err());
         assert!(encode(&sample(RecordType::Ready, vec![1])).is_err());
-        assert!(encode(&sample(RecordType::Error, 0u32.to_le_bytes().to_vec())).is_err());
-        assert!(encode(&sample(RecordType::Error, 6u32.to_le_bytes().to_vec())).is_err());
+        assert_eq!(
+            ErrorCode::try_from(1),
+            Ok(ErrorCode::Authentication),
+            "the frozen authentication code must remain stable"
+        );
+        for code in [0, 2, 3, 4, 5, 6, u32::MAX] {
+            assert_eq!(
+                ErrorCode::try_from(code),
+                Err(ProtocolError::InvalidErrorCode(code))
+            );
+            assert!(encode(&sample(RecordType::Error, code.to_le_bytes().to_vec())).is_err());
+        }
+    }
+
+    fn assert_capability_redacted(label: &str, debug: &str, capability: &[u8; 32]) {
+        assert!(
+            !debug.contains(&format!("{capability:?}")),
+            "{label} contains the complete capability: {debug}"
+        );
+        for window in capability.windows(8) {
+            let recognizable_sequence = window
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            assert!(
+                !debug.contains(&recognizable_sequence),
+                "{label} contains capability bytes: {debug}"
+            );
+        }
+        let marker = core::str::from_utf8(capability).unwrap();
+        assert!(
+            !debug.contains(marker),
+            "{label} contains the capability marker: {debug}"
+        );
+    }
+
+    #[test]
+    fn debug_output_redacts_capability_storage_transitively() -> Result<(), ProtocolError> {
+        let capability = *b"NVX-CAPABILITY-SECRET-0123456789";
+        let record = Record::bootstrap(RecordType::HostAttach, capability.to_vec());
+        let encoded = encode(&record)?;
+
+        let mut parser = Parser::new();
+        let partial = parser.accept(&encoded[..HEADER_LEN + 16])?;
+        assert_eq!(partial.record, None);
+        let snapshot = parser.snapshot();
+
+        let mut complete_parser = Parser::new();
+        let progress = complete_parser.accept(&encoded)?;
+        assert_eq!(progress.record, Some(record.clone()));
+
+        let debug_outputs = [
+            ("record", format!("{record:?}")),
+            ("partial parser", format!("{parser:?}")),
+            ("parser snapshot", format!("{snapshot:?}")),
+            ("parse progress", format!("{progress:?}")),
+        ];
+        for (label, debug) in &debug_outputs {
+            assert_capability_redacted(label, debug, &capability);
+        }
+
+        assert!(debug_outputs[0].1.contains("payload_len: 32"));
+        assert!(debug_outputs[1].1.contains("body_len: 16"));
+        assert!(debug_outputs[2].1.contains("body_len: 16"));
+        assert!(debug_outputs[3].1.contains("payload_len: 32"));
+        Ok(())
     }
 
     #[test]
