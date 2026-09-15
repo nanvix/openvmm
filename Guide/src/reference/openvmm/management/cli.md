@@ -617,6 +617,10 @@ Serial devices can be configured to appear as different devices inside the guest
   A stalled or failed authentication attempt closes the connection without a
   protocol Error record and without changing the broker epoch.
 
+  The outer protocol uses byte-counted guest receive credits so host DATA is
+  backpressured before the guest's bounded ingress storage is exhausted. See
+  [Control-session Protocol](./control_session_protocol.md).
+
   `none` does not consume stdin and rejects `--microvm-control-auth-stdin`.
   OpenVMM generates an unreachable
   random capability so disconnected process tests remain supported. Secure

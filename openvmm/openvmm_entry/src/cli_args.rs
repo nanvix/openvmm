@@ -6549,6 +6549,16 @@ mod tests {
         ])
         .unwrap();
         valid_control_console.validate_microvm_options().unwrap();
+        assert!(
+            Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--microvm-control-protocol-version",
+                "1",
+            ])
+            .is_err()
+        );
         let valid_restore_control_console = Options::try_parse_from([
             "openvmm",
             "--machine",

@@ -531,6 +531,8 @@ impl InspectTaskMut<ConsoleWorkerState> for ConsoleWorker {
                         "guest_parser_bytes",
                         mode.broker.guest_parser_buffered_bytes(),
                     )
+                    .field("guest_receive_window", mode.broker.guest_receive_window())
+                    .field("guest_receive_credit", mode.broker.guest_receive_credit())
                     .field("host_input_bytes", mode.host_input.len())
                     .field("protocol_errors", counters.protocol_errors)
                     .field("authentication_errors", counters.authentication_errors)
@@ -1119,9 +1121,10 @@ fn validate_saved_record(saved: &saved_state::SavedRecord) -> Result<(), Restore
         .ok_or_else(|| invalid_saved_state("invalid pending broker record type"))?;
     let payload_len = saved.payload.len();
     let payload_is_valid = match record_type {
+        control_session_protocol::RecordType::Ack
+        | control_session_protocol::RecordType::Credit => payload_len == 4,
         control_session_protocol::RecordType::GuestAttach
         | control_session_protocol::RecordType::Reset
-        | control_session_protocol::RecordType::Ack
         | control_session_protocol::RecordType::Wait
         | control_session_protocol::RecordType::Ready => payload_len == 0,
         control_session_protocol::RecordType::HostAttach => payload_len == 32,
