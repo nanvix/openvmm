@@ -897,6 +897,7 @@ impl VmService {
                 "snapshot machine profile is not microvm"
             );
             openvmm_helpers::snapshot::validate_supported_microvm_contract(machine_contract)?;
+            validate_restore_console_attachments(&machine_contract.attachments)?;
             anyhow::ensure!(
                 machine_contract.microvm_sandbox_blocks.is_empty(),
                 "TTRPC restore does not support microVM sandbox-block snapshots"
@@ -1133,6 +1134,7 @@ impl VmService {
                         .attachments
                         .iter()
                         .find(|attachment| attachment.stable_id == "console:microvm-virtio0"),
+                    None,
                     restore.machine_contract.microvm_sandbox_blocks.clone(),
                 )),
             )?;
@@ -2221,6 +2223,7 @@ impl VmService {
             effective_command_line,
             microvm_sandbox_block_sources: Vec::new(),
             microvm_console_attachment,
+            microvm_control_console_attachment: None,
             microvm_network: None,
             microvm_network_attachment: None,
             microvm_egress_policy: None,
@@ -2229,6 +2232,7 @@ impl VmService {
             microvm_filesystem_root_path,
             microvm_filesystem_attachment,
             microvm_console_socket_cleanup,
+            microvm_control_console_socket_cleanup: None,
             microvm_output_drain,
             snapshot_memory_file,
             _private_scratch_dir: None,
@@ -2593,6 +2597,19 @@ impl VmService {
             }
         }
     }
+}
+
+fn validate_restore_console_attachments(
+    attachments: &[openvmm_helpers::snapshot::SnapshotAttachment],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !attachments.iter().any(|attachment| {
+            attachment.stable_id == crate::MICROVM_CONTROL_CONSOLE_STABLE_ID
+                || attachment.kind == crate::MICROVM_CONTROL_CONSOLE_ATTACHMENT_KIND
+        }),
+        "OpenVMM management RPC cannot restore control-console snapshots before authenticated broker activation"
+    );
+    Ok(())
 }
 
 /// Returns the appropriate serial backend open function and a human-readable
@@ -3492,6 +3509,42 @@ mod microvm_exit_tests {
 #[cfg(test)]
 mod machine_profile_tests {
     use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn management_restore_rejects_control_console_attachments_explicitly() {
+        let boot = openvmm_helpers::snapshot::SnapshotAttachment {
+            stable_id: crate::MICROVM_CONSOLE_STABLE_ID.to_owned(),
+            kind: crate::MICROVM_CONSOLE_ATTACHMENT_KIND.to_owned(),
+            required: false,
+            reconnect_policy: "discard-while-disconnected".to_owned(),
+            identity_kind: "disconnected".to_owned(),
+            identity: b"discard".to_vec(),
+            length: 0,
+            reconnect_timeout_ms: 0,
+        };
+        validate_restore_console_attachments(&[]).unwrap();
+        validate_restore_console_attachments(std::slice::from_ref(&boot)).unwrap();
+
+        let mut control = boot.clone();
+        control.stable_id = crate::MICROVM_CONTROL_CONSOLE_STABLE_ID.to_owned();
+        control.kind = crate::MICROVM_CONTROL_CONSOLE_ATTACHMENT_KIND.to_owned();
+        for policy in ["discard-while-disconnected", "recreate-listener"] {
+            control.reconnect_policy = policy.to_owned();
+            let error =
+                validate_restore_console_attachments(&[boot.clone(), control.clone()]).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("management RPC cannot restore control-console snapshots")
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("before authenticated broker activation")
+            );
+        }
+    }
 
     #[test]
     fn ttrpc_microvm_profile_preserves_wire_identity_and_processor_policy() {
