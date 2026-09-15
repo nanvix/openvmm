@@ -437,6 +437,7 @@ pub(crate) struct ReplResources {
     pub shutdown_ic: Option<mesh::Sender<hyperv_ic_resources::shutdown::ShutdownRpc>>,
     pub kvp_ic: Option<mesh::Sender<hyperv_ic_resources::kvp::KvpConnectRpc>>,
     pub console_in: Option<Box<dyn AsyncWrite + Send + Unpin>>,
+    pub stdin_enabled: bool,
     pub has_vtl2: bool,
 }
 
@@ -474,153 +475,163 @@ pub(crate) async fn run_repl(
         shutdown_ic,
         kvp_ic,
         console_in,
+        stdin_enabled,
         has_vtl2,
     } = resources;
 
     let (console_command_send, console_command_recv) = mesh::channel();
     let (inspect_completion_engine_send, inspect_completion_engine_recv) = mesh::channel();
 
-    let mut console_in = console_in;
-    thread::Builder::new()
-        .name("stdio-thread".to_string())
-        .spawn(move || {
-            // install panic hook to restore cooked terminal (linux)
-            #[cfg(unix)]
-            if io::stderr().is_terminal() {
-                term::revert_terminal_on_panic()
-            }
+    let _headless_input_channels = if stdin_enabled {
+        let mut console_in = console_in;
+        thread::Builder::new()
+            .name("stdio-thread".to_string())
+            .spawn(move || {
+                // install panic hook to restore cooked terminal (linux)
+                #[cfg(unix)]
+                if io::stderr().is_terminal() {
+                    term::revert_terminal_on_panic()
+                }
 
-            let mut rl = rustyline::Editor::<
-                OpenvmmRustylineEditor,
-                rustyline::history::FileHistory,
-            >::with_config(
-                rustyline::Config::builder()
-                    .completion_type(rustyline::CompletionType::List)
-                    .build(),
-            )
-            .unwrap();
+                let mut rl = rustyline::Editor::<
+                    OpenvmmRustylineEditor,
+                    rustyline::history::FileHistory,
+                >::with_config(
+                    rustyline::Config::builder()
+                        .completion_type(rustyline::CompletionType::List)
+                        .build(),
+                )
+                .unwrap();
 
-            rl.set_helper(Some(OpenvmmRustylineEditor {
-                openvmm_inspect_req: Arc::new(inspect_completion_engine_send),
-            }));
+                rl.set_helper(Some(OpenvmmRustylineEditor {
+                    openvmm_inspect_req: Arc::new(inspect_completion_engine_send),
+                }));
 
-            let history_file = {
-                const HISTORY_FILE: &str = ".openvmm_history";
+                let history_file = {
+                    const HISTORY_FILE: &str = ".openvmm_history";
 
-                let history_folder = None
-                    .or_else(dirs::state_dir)
-                    .or_else(dirs::data_local_dir)
-                    .map(|path| path.join("openvmm"));
+                    let history_folder = None
+                        .or_else(dirs::state_dir)
+                        .or_else(dirs::data_local_dir)
+                        .map(|path| path.join("openvmm"));
 
-                if let Some(history_folder) = history_folder {
-                    if let Err(err) = std::fs::create_dir_all(&history_folder) {
-                        tracing::warn!(
-                            error = &err as &dyn std::error::Error,
-                            "could not create directory: {}",
-                            history_folder.display()
-                        )
+                    if let Some(history_folder) = history_folder {
+                        if let Err(err) = std::fs::create_dir_all(&history_folder) {
+                            tracing::warn!(
+                                error = &err as &dyn std::error::Error,
+                                "could not create directory: {}",
+                                history_folder.display()
+                            )
+                        }
+
+                        Some(history_folder.join(HISTORY_FILE))
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(history_file) = &history_file {
+                    tracing::info!("restoring history from {}", history_file.display());
+                    if rl.load_history(history_file).is_err() {
+                        tracing::info!("could not find existing {}", history_file.display());
+                    }
+                }
+
+                // Enable Ctrl-Backspace to delete the current word.
+                rl.bind_sequence(
+                    rustyline::KeyEvent::new('\x08', rustyline::Modifiers::CTRL),
+                    rustyline::Cmd::Kill(rustyline::Movement::BackwardWord(
+                        1,
+                        rustyline::Word::Emacs,
+                    )),
+                );
+
+                let mut parser = CommandParser::new();
+
+                let mut stdin = io::stdin();
+                loop {
+                    // Raw console text until Ctrl-Q.
+                    let terminal = stdin.is_terminal();
+                    if terminal {
+                        crossterm::terminal::enable_raw_mode()
+                            .expect("failed to enable raw console mode");
                     }
 
-                    Some(history_folder.join(HISTORY_FILE))
-                } else {
-                    None
-                }
-            };
+                    if let Some(input) = console_in.as_mut() {
+                        let mut buf = [0; 32];
+                        loop {
+                            let n = stdin.read(&mut buf).unwrap();
+                            let mut b = &buf[..n];
+                            let stop = if let Some(ctrlq) = b.iter().position(|x| *x == 0x11) {
+                                b = &b[..ctrlq];
+                                true
+                            } else {
+                                false
+                            };
+                            block_on(input.as_mut().write_all(b)).expect("BUGBUG");
+                            if stop {
+                                break;
+                            }
+                        }
+                    }
 
-            if let Some(history_file) = &history_file {
-                tracing::info!("restoring history from {}", history_file.display());
-                if rl.load_history(history_file).is_err() {
-                    tracing::info!("could not find existing {}", history_file.display());
-                }
-            }
+                    if terminal {
+                        crossterm::terminal::disable_raw_mode()
+                            .expect("failed to disable raw console mode");
+                    }
 
-            // Enable Ctrl-Backspace to delete the current word.
-            rl.bind_sequence(
-                rustyline::KeyEvent::new('\x08', rustyline::Modifiers::CTRL),
-                rustyline::Cmd::Kill(rustyline::Movement::BackwardWord(1, rustyline::Word::Emacs)),
-            );
-
-            let mut parser = CommandParser::new();
-
-            let mut stdin = io::stdin();
-            loop {
-                // Raw console text until Ctrl-Q.
-                let terminal = stdin.is_terminal();
-                if terminal {
-                    crossterm::terminal::enable_raw_mode()
-                        .expect("failed to enable raw console mode");
-                }
-
-                if let Some(input) = console_in.as_mut() {
-                    let mut buf = [0; 32];
                     loop {
-                        let n = stdin.read(&mut buf).unwrap();
-                        let mut b = &buf[..n];
-                        let stop = if let Some(ctrlq) = b.iter().position(|x| *x == 0x11) {
-                            b = &b[..ctrlq];
-                            true
-                        } else {
-                            false
-                        };
-                        block_on(input.as_mut().write_all(b)).expect("BUGBUG");
-                        if stop {
+                        let line = rl.readline("openvmm> ");
+                        if line.is_err() {
                             break;
                         }
-                    }
-                }
+                        let line = line.unwrap();
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if let Err(err) = rl.add_history_entry(&line) {
+                            tracing::warn!(
+                                err = &err as &dyn std::error::Error,
+                                "error adding to .openvmm_history"
+                            )
+                        }
 
-                if terminal {
-                    crossterm::terminal::disable_raw_mode()
-                        .expect("failed to disable raw console mode");
-                }
-
-                loop {
-                    let line = rl.readline("openvmm> ");
-                    if line.is_err() {
-                        break;
-                    }
-                    let line = line.unwrap();
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    if let Err(err) = rl.add_history_entry(&line) {
-                        tracing::warn!(
-                            err = &err as &dyn std::error::Error,
-                            "error adding to .openvmm_history"
-                        )
-                    }
-
-                    match parser.parse(trimmed) {
-                        Ok(cmd) => match cmd {
-                            InteractiveCommand::Input { data } => {
-                                let mut data = data.join(" ");
-                                data.push('\n');
-                                if let Some(input) = console_in.as_mut() {
-                                    block_on(input.write_all(data.as_bytes())).expect("BUGBUG");
+                        match parser.parse(trimmed) {
+                            Ok(cmd) => match cmd {
+                                InteractiveCommand::Input { data } => {
+                                    let mut data = data.join(" ");
+                                    data.push('\n');
+                                    if let Some(input) = console_in.as_mut() {
+                                        block_on(input.write_all(data.as_bytes())).expect("BUGBUG");
+                                    }
                                 }
+                                InteractiveCommand::InputMode => break,
+                                cmd => {
+                                    // Send the command to the main thread for processing.
+                                    let (processing_done_send, processing_done_recv) =
+                                        mesh::oneshot::<()>();
+                                    console_command_send.send((cmd, processing_done_send));
+                                    let _ = block_on(processing_done_recv);
+                                }
+                            },
+                            Err(err) => {
+                                err.print().unwrap();
                             }
-                            InteractiveCommand::InputMode => break,
-                            cmd => {
-                                // Send the command to the main thread for processing.
-                                let (processing_done_send, processing_done_recv) =
-                                    mesh::oneshot::<()>();
-                                console_command_send.send((cmd, processing_done_send));
-                                let _ = block_on(processing_done_recv);
-                            }
-                        },
-                        Err(err) => {
-                            err.print().unwrap();
+                        }
+
+                        if let Some(history_file) = &history_file {
+                            rl.append_history(history_file).unwrap();
                         }
                     }
-
-                    if let Some(history_file) = &history_file {
-                        rl.append_history(history_file).unwrap();
-                    }
                 }
-            }
-        })
-        .unwrap();
+            })
+            .unwrap();
+        None
+    } else {
+        // Keep the event loop alive for guest/controller events without a stdin reader.
+        Some((console_command_send, inspect_completion_engine_send))
+    };
 
     let mut state_change_task = None::<Task<Result<StateChange, RpcError>>>;
     let mut pulse_save_restore_interval: Option<Duration> = None;
@@ -1744,9 +1755,35 @@ impl clap_dyn_complete::CustomCompleter for OpenvmmComplete {
 }
 
 #[cfg(test)]
-mod microvm_exit_tests {
+mod tests {
     use super::*;
+    use pal_async::async_test;
     use test_with_tracing::test;
+
+    #[async_test]
+    async fn headless_repl_waits_for_controller_without_stdin(driver: DefaultDriver) {
+        let (vm_rpc, _vm_requests) = mesh::channel();
+        let (vm_controller, _controller_requests) = mesh::channel();
+        let (events, vm_controller_events) = mesh::channel();
+        let resources = ReplResources {
+            vm_rpc,
+            vm_controller,
+            vm_controller_events,
+            restore_ready_pending: false,
+            scsi_rpc: None,
+            nvme_vtl2_rpc: None,
+            consomme_rpc: None,
+            shutdown_ic: None,
+            kvp_ic: None,
+            console_in: None,
+            stdin_enabled: false,
+            has_vtl2: false,
+        };
+        let mut repl = pin!(run_repl(&driver, resources));
+        assert!(futures::poll!(repl.as_mut()).is_pending());
+        events.send(VmControllerEvent::ExitRequested { code: 23 });
+        assert_eq!(repl.await.unwrap(), 23);
+    }
 
     #[test]
     fn repl_propagates_exit_failures_and_preserves_requested_statuses() {
