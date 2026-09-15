@@ -1,9 +1,8 @@
 # Control-session protocol
 
 The microVM control console uses an aligned record stream between the guest,
-OpenVMM's broker, and the authenticated host endpoint. A broker is configured
-for exactly one protocol version. It does not negotiate or downgrade based on
-peer input.
+OpenVMM's broker, and the authenticated host endpoint. The protocol is frozen
+at version 1.
 
 ## Header
 
@@ -24,13 +23,8 @@ Every record has a 44-byte little-endian header:
 epoch, and sequence fields. Post-bootstrap records use the current instance
 and epoch. DATA payloads contain between 1 and 65,536 bytes.
 
-Version 1 is the compatibility default. Its record types and payload rules are
-frozen, including its zero-length ACK.
-
-## Version 2 receive credit
-
-Version 2 retains the header and existing record type numbers. It adds record
-type 9, `CREDIT`, and changes only the ACK payload:
+The record types include type 9, `CREDIT`. ACK and CREDIT carry receive-credit
+values:
 
 * ACK contains one four-byte little-endian initial receive window.
 * CREDIT contains one four-byte little-endian increment.
@@ -58,8 +52,8 @@ On an active host disconnect, the broker advances the epoch, clears usable
 credit, drops pending and unstarted DATA, finishes any physically started
 record, and then emits RESET. The replacement epoch receives fresh credit only
 from its ACK. Device reset and snapshot restore follow the same no-credit-reuse
-rule. Broker saved-state schema 2 remains the version-1 format; version 2 uses
-schema 3 and persists only the selected protocol version, not usable credit.
+rule. Broker saved-state schema 2 contains no usable receive credit; a restored
+instance obtains a fresh window from its new ACK.
 
 Malformed lengths or credit values, wrong-state records, wrong instance or
 epoch values, and duplicate or out-of-order sequences fail closed. Existing

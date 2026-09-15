@@ -70,7 +70,6 @@ use virtio::queue::restored_queue_front_readable_length;
 use virtio::spec::VirtioDeviceFeatures;
 use virtio_resources::console::VirtioConsoleDisconnectPolicy;
 use virtio_resources::console::VirtioControlConsoleBrokerConfig;
-use virtio_resources::console::VirtioControlConsoleProtocolVersion;
 use vmcore::save_restore::RestoreError;
 use vmcore::save_restore::SaveError;
 use vmcore::save_restore::SavedStateBlob;
@@ -147,8 +146,7 @@ impl VirtioConsoleDevice {
         } else {
             HostTransportState::WaitingForDisconnect
         };
-        let broker = control_session_broker::ControlSessionBroker::new_with_version(
-            protocol_version(config.protocol_version),
+        let broker = control_session_broker::ControlSessionBroker::new(
             config.instance_id,
             config.capability,
         );
@@ -345,11 +343,7 @@ impl VirtioDevice for VirtioConsoleDevice {
                     )));
                 }
                 let broker = saved_state::SavedBrokerSnapshot::from(mode.broker.snapshot());
-                let schema_version = match mode.config.protocol_version {
-                    VirtioControlConsoleProtocolVersion::V1 => BROKER_V1_SAVED_STATE_VERSION,
-                    VirtioControlConsoleProtocolVersion::V2 => BROKER_V2_SAVED_STATE_VERSION,
-                };
-                (schema_version, Vec::new(), 0, Some(broker))
+                (BROKER_SAVED_STATE_VERSION, Vec::new(), 0, Some(broker))
             }
         };
         Ok(Some(SavedStateBlob::new(saved_state::SavedState {
@@ -391,8 +385,7 @@ impl VirtioDevice for VirtioConsoleDevice {
                     .take()
                     .ok_or_else(|| invalid_saved_state("missing control-console broker state"))?;
                 let snapshot = saved_broker.try_into().map_err(invalid_saved_state)?;
-                let broker = control_session_broker::ControlSessionBroker::restore_with_version(
-                    protocol_version(mode.config.protocol_version),
+                let broker = control_session_broker::ControlSessionBroker::restore(
                     snapshot,
                     mode.config.instance_id,
                     mode.config.capability,
@@ -469,10 +462,7 @@ enum HostTransportState {
 #[derive(Clone, Copy)]
 enum SavedStateMode {
     Direct(VirtioConsoleDisconnectPolicy),
-    Broker {
-        current_instance_id: [u8; 16],
-        protocol_version: control_session_protocol::ProtocolVersion,
-    },
+    Broker { current_instance_id: [u8; 16] },
 }
 
 impl ConsoleWorkerMode {
@@ -483,7 +473,6 @@ impl ConsoleWorkerMode {
             } => SavedStateMode::Direct(*disconnect_policy),
             Self::Broker(mode) => SavedStateMode::Broker {
                 current_instance_id: mode.config.instance_id,
-                protocol_version: protocol_version(mode.config.protocol_version),
             },
         }
     }
@@ -515,7 +504,6 @@ impl InspectTaskMut<ConsoleWorkerState> for ConsoleWorker {
                 response
                     .field("mode", "broker")
                     .field("broker_state", format!("{:?}", mode.broker.state()))
-                    .field("protocol_version", mode.broker.protocol_version() as u16)
                     .field("epoch", mode.broker.epoch())
                     .field("host_transport", format!("{:?}", mode.transport_state))
                     .field("host_authenticated", mode.broker.host_is_authenticated())
@@ -581,21 +569,9 @@ const BUF_SIZE: usize = 4096;
 const MAX_STAGED_RX_BYTES: usize = BUF_SIZE;
 const MAX_SAVED_STATE_BYTES: usize = 512 * 1024;
 const DIRECT_SAVED_STATE_VERSION: u32 = 1;
-const BROKER_V1_SAVED_STATE_VERSION: u32 = 2;
-const BROKER_V2_SAVED_STATE_VERSION: u32 = 3;
-#[cfg(test)]
-const BROKER_SAVED_STATE_VERSION: u32 = BROKER_V1_SAVED_STATE_VERSION;
+const BROKER_SAVED_STATE_VERSION: u32 = 2;
 #[cfg(test)]
 const SAVED_STATE_VERSION: u32 = DIRECT_SAVED_STATE_VERSION;
-
-fn protocol_version(
-    version: VirtioControlConsoleProtocolVersion,
-) -> control_session_protocol::ProtocolVersion {
-    match version {
-        VirtioControlConsoleProtocolVersion::V1 => control_session_protocol::ProtocolVersion::V1,
-        VirtioControlConsoleProtocolVersion::V2 => control_session_protocol::ProtocolVersion::V2,
-    }
-}
 
 fn disconnect_policy_id(policy: VirtioConsoleDisconnectPolicy) -> u32 {
     match policy {
@@ -640,15 +616,10 @@ fn validate_saved_state(
         }
         SavedStateMode::Broker {
             current_instance_id,
-            protocol_version,
         } => {
-            let required_schema = match protocol_version {
-                control_session_protocol::ProtocolVersion::V1 => BROKER_V1_SAVED_STATE_VERSION,
-                control_session_protocol::ProtocolVersion::V2 => BROKER_V2_SAVED_STATE_VERSION,
-            };
-            if saved.schema_version != required_schema {
+            if saved.schema_version != BROKER_SAVED_STATE_VERSION {
                 return Err(invalid_saved_state(format!(
-                    "control console requires schema version {required_schema}, got {}",
+                    "control console requires schema version {BROKER_SAVED_STATE_VERSION}, got {}",
                     saved.schema_version
                 )));
             }
@@ -661,11 +632,10 @@ fn validate_saved_state(
                 .broker
                 .as_ref()
                 .ok_or_else(|| invalid_saved_state("missing control-console broker state"))?;
-            let snapshot = validate_saved_broker(broker, protocol_version)?;
-            control_session_broker::ControlSessionBroker::validate_restore_with_version(
+            let snapshot = validate_saved_broker(broker)?;
+            control_session_broker::ControlSessionBroker::validate_restore(
                 &snapshot,
                 current_instance_id,
-                protocol_version,
             )
             .map_err(|error| invalid_saved_state(error.to_string()))?;
         }
@@ -726,7 +696,6 @@ mod saved_state {
     use crate::control_session_broker::BrokerSnapshot;
     use crate::control_session_broker::EncodedRecordSnapshot;
     use crate::control_session_broker::OutputSnapshot;
-    use crate::control_session_protocol;
     use crate::control_session_protocol::ParserSnapshot;
     use crate::control_session_protocol::Record;
     use crate::control_session_protocol::RecordType;
@@ -783,8 +752,6 @@ mod saved_state {
         pub pending_host_record: Option<SavedRecord>,
         #[mesh(14)]
         pub counters: SavedBrokerCounters,
-        #[mesh(15)]
-        pub protocol_version: u32,
     }
 
     #[derive(Protobuf)]
@@ -855,13 +822,6 @@ mod saved_state {
     impl From<BrokerSnapshot> for SavedBrokerSnapshot {
         fn from(snapshot: BrokerSnapshot) -> Self {
             Self {
-                protocol_version: if snapshot.protocol_version
-                    == control_session_protocol::ProtocolVersion::V1 as u16
-                {
-                    0
-                } else {
-                    snapshot.protocol_version.into()
-                },
                 state: snapshot.state.into(),
                 instance_id: snapshot.instance_id.to_vec(),
                 drain_foreign_instance_records: snapshot.drain_foreign_instance_records,
@@ -888,12 +848,6 @@ mod saved_state {
                 .map_err(|_| "broker state is out of range".to_string())?;
             let instance_id = fixed_bytes(snapshot.instance_id, "broker instance ID")?;
             let broker = Self {
-                protocol_version: if snapshot.protocol_version == 0 {
-                    control_session_protocol::ProtocolVersion::V1 as u16
-                } else {
-                    u16::try_from(snapshot.protocol_version)
-                        .map_err(|_| "broker protocol version is out of range".to_string())?
-                },
                 state,
                 instance_id,
                 drain_foreign_instance_records: snapshot.drain_foreign_instance_records,
@@ -1052,7 +1006,6 @@ mod saved_state {
 
 fn validate_saved_broker(
     saved: &saved_state::SavedBrokerSnapshot,
-    expected_protocol_version: control_session_protocol::ProtocolVersion,
 ) -> Result<control_session_broker::BrokerSnapshot, RestoreError> {
     use control_session_protocol::HEADER_LEN;
     use control_session_protocol::MAX_DATA_LEN;
@@ -1066,19 +1019,6 @@ fn validate_saved_broker(
     if saved.epoch == 0 {
         return Err(invalid_saved_state("saved broker epoch is zero"));
     }
-    let saved_protocol_version = if saved.protocol_version == 0 {
-        control_session_protocol::ProtocolVersion::V1
-    } else {
-        u16::try_from(saved.protocol_version)
-            .ok()
-            .and_then(|version| control_session_protocol::ProtocolVersion::try_from(version).ok())
-            .ok_or_else(|| invalid_saved_state("invalid broker protocol version"))?
-    };
-    if saved_protocol_version != expected_protocol_version {
-        return Err(invalid_saved_state(
-            "saved broker protocol version does not match the configured broker",
-        ));
-    }
     if saved.guest_parser.header_bytes.len() != HEADER_LEN
         || saved.guest_parser.header_count as usize > HEADER_LEN
         || saved.guest_parser.body_bytes.len() > MAX_DATA_LEN
@@ -1089,17 +1029,16 @@ fn validate_saved_broker(
     {
         return Err(invalid_saved_state("invalid broker parser bounds"));
     }
-    validate_saved_output(saved_protocol_version, &saved.guest_output)?;
-    validate_saved_output(saved_protocol_version, &saved.host_output)?;
+    validate_saved_output(&saved.guest_output)?;
+    validate_saved_output(&saved.host_output)?;
     if let Some(record) = &saved.pending_guest_record {
-        validate_saved_record(saved_protocol_version, record)?;
+        validate_saved_record(record)?;
     }
     if let Some(record) = &saved.pending_host_record {
-        validate_saved_record(saved_protocol_version, record)?;
+        validate_saved_record(record)?;
     }
 
     let snapshot = saved_state::SavedBrokerSnapshot {
-        protocol_version: saved_protocol_version as u32,
         state: saved.state,
         instance_id: saved.instance_id.clone(),
         drain_foreign_instance_records: saved.drain_foreign_instance_records,
@@ -1131,10 +1070,7 @@ fn validate_saved_broker(
     snapshot.try_into().map_err(invalid_saved_state)
 }
 
-fn validate_saved_output(
-    protocol_version: control_session_protocol::ProtocolVersion,
-    saved: &saved_state::SavedOutputSnapshot,
-) -> Result<(), RestoreError> {
+fn validate_saved_output(saved: &saved_state::SavedOutputSnapshot) -> Result<(), RestoreError> {
     use control_session_broker::MAX_QUEUED_BYTES_PER_LEG;
     use control_session_broker::MAX_QUEUED_RECORDS_PER_LEG;
     use control_session_protocol::HEADER_LEN;
@@ -1148,7 +1084,7 @@ fn validate_saved_output(
         if !(HEADER_LEN..=HEADER_LEN + MAX_DATA_LEN).contains(&bytes.len()) {
             return Err(invalid_saved_state("invalid broker output record length"));
         }
-        control_session_protocol::decode_exact_for(protocol_version, bytes)
+        control_session_protocol::decode_exact(bytes)
             .map_err(|error| invalid_saved_state(error.to_string()))?;
         queued_bytes = queued_bytes
             .checked_add(bytes.len())
@@ -1165,7 +1101,7 @@ fn validate_saved_output(
                 "invalid current broker output record length",
             ));
         }
-        control_session_protocol::decode_exact_for(protocol_version, &current.bytes)
+        control_session_protocol::decode_exact(&current.bytes)
             .map_err(|error| invalid_saved_state(error.to_string()))?;
         let offset = usize::try_from(current.offset)
             .map_err(|_| invalid_saved_state("broker output offset is out of range"))?;
@@ -1178,35 +1114,24 @@ fn validate_saved_output(
     Ok(())
 }
 
-fn validate_saved_record(
-    protocol_version: control_session_protocol::ProtocolVersion,
-    saved: &saved_state::SavedRecord,
-) -> Result<(), RestoreError> {
+fn validate_saved_record(saved: &saved_state::SavedRecord) -> Result<(), RestoreError> {
     let record_type = u8::try_from(saved.record_type)
         .ok()
         .and_then(|record_type| control_session_protocol::RecordType::try_from(record_type).ok())
         .ok_or_else(|| invalid_saved_state("invalid pending broker record type"))?;
     let payload_len = saved.payload.len();
-    let payload_is_valid = match (protocol_version, record_type) {
-        (
-            control_session_protocol::ProtocolVersion::V2,
-            control_session_protocol::RecordType::Ack
-            | control_session_protocol::RecordType::Credit,
-        ) => payload_len == 4,
-        (_, control_session_protocol::RecordType::Credit) => false,
-        (_, control_session_protocol::RecordType::Ack) => payload_len == 0,
-        (
-            _,
-            control_session_protocol::RecordType::GuestAttach
-            | control_session_protocol::RecordType::Reset
-            | control_session_protocol::RecordType::Wait
-            | control_session_protocol::RecordType::Ready,
-        ) => payload_len == 0,
-        (_, control_session_protocol::RecordType::HostAttach) => payload_len == 32,
-        (_, control_session_protocol::RecordType::Data) => {
+    let payload_is_valid = match record_type {
+        control_session_protocol::RecordType::Ack
+        | control_session_protocol::RecordType::Credit => payload_len == 4,
+        control_session_protocol::RecordType::GuestAttach
+        | control_session_protocol::RecordType::Reset
+        | control_session_protocol::RecordType::Wait
+        | control_session_protocol::RecordType::Ready => payload_len == 0,
+        control_session_protocol::RecordType::HostAttach => payload_len == 32,
+        control_session_protocol::RecordType::Data => {
             (1..=control_session_protocol::MAX_DATA_LEN).contains(&payload_len)
         }
-        (_, control_session_protocol::RecordType::Error) => payload_len == 4,
+        control_session_protocol::RecordType::Error => payload_len == 4,
     };
     if saved.instance_id.len() != 16 || !payload_is_valid {
         return Err(invalid_saved_state("invalid pending broker record"));

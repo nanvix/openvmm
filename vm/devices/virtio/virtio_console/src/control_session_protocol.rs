@@ -10,25 +10,7 @@ pub const MAX_DATA_LEN: usize = 65_536;
 pub const MIN_RECEIVE_CREDIT: u32 = MAX_DATA_LEN as u32;
 pub const MAX_RECEIVE_CREDIT: u32 = 4 * 1024 * 1024 + 10;
 const MAGIC: [u8; 4] = *b"NVXS";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u16)]
-pub enum ProtocolVersion {
-    V1 = 1,
-    V2 = 2,
-}
-
-impl TryFrom<u16> for ProtocolVersion {
-    type Error = ProtocolError;
-
-    fn try_from(value: u16) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(Self::V1),
-            2 => Ok(Self::V2),
-            _ => Err(ProtocolError::InvalidVersion(value)),
-        }
-    }
-}
+const VERSION: u16 = 1;
 
 /// A control-session record type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,7 +143,6 @@ struct ParsedHeader {
 /// An aligned, bounded incremental protocol parser.
 #[derive(Clone, Debug)]
 pub struct Parser {
-    version: ProtocolVersion,
     header: [u8; HEADER_LEN],
     header_count: usize,
     body: Vec<u8>,
@@ -176,12 +157,7 @@ impl Default for Parser {
 
 impl Parser {
     pub fn new() -> Self {
-        Self::new_for(ProtocolVersion::V1)
-    }
-
-    pub fn new_for(version: ProtocolVersion) -> Self {
         Self {
-            version,
             header: [0; HEADER_LEN],
             header_count: 0,
             body: Vec::new(),
@@ -207,10 +183,10 @@ impl Parser {
                 });
             }
 
-            let header = parse_header(self.version, &self.header)?;
+            let header = parse_header(&self.header)?;
             self.declared_body_len = Some(header.payload_len);
             if header.payload_len == 0 {
-                let record = record_from_parts(self.version, header, Vec::new())?;
+                let record = record_from_parts(header, Vec::new())?;
                 self.reset();
                 return Ok(ParseProgress {
                     consumed,
@@ -242,9 +218,9 @@ impl Parser {
             });
         }
 
-        let header = parse_header(self.version, &self.header)?;
+        let header = parse_header(&self.header)?;
         let body = core::mem::take(&mut self.body);
-        let record = record_from_parts(self.version, header, body)?;
+        let record = record_from_parts(header, body)?;
         self.reset();
         Ok(ParseProgress {
             consumed,
@@ -261,10 +237,7 @@ impl Parser {
         }
     }
 
-    pub fn validate_snapshot_for(
-        version: ProtocolVersion,
-        snapshot: &ParserSnapshot,
-    ) -> Result<(), ProtocolError> {
+    pub fn validate_snapshot(snapshot: &ParserSnapshot) -> Result<(), ProtocolError> {
         if snapshot.header_bytes.len() != HEADER_LEN {
             return Err(ProtocolError::InvalidSnapshot(
                 "header storage must be exactly 44 bytes",
@@ -284,7 +257,7 @@ impl Parser {
         } else {
             let mut header = [0; HEADER_LEN];
             header.copy_from_slice(&snapshot.header_bytes);
-            let parsed = parse_header(version, &header)?;
+            let parsed = parse_header(&header)?;
             let declared = snapshot
                 .declared_body_len
                 .ok_or(ProtocolError::InvalidSnapshot(
@@ -305,16 +278,8 @@ impl Parser {
     }
 
     /// Restores parser state after validating all bounds before allocation.
-    #[cfg_attr(not(test), expect(dead_code, reason = "v1 compatibility helper"))]
     pub fn restore(snapshot: ParserSnapshot) -> Result<Self, ProtocolError> {
-        Self::restore_for(ProtocolVersion::V1, snapshot)
-    }
-
-    pub fn restore_for(
-        version: ProtocolVersion,
-        snapshot: ParserSnapshot,
-    ) -> Result<Self, ProtocolError> {
-        Self::validate_snapshot_for(version, &snapshot)?;
+        Self::validate_snapshot(&snapshot)?;
 
         let mut header = [0; HEADER_LEN];
         header.copy_from_slice(&snapshot.header_bytes);
@@ -322,7 +287,6 @@ impl Parser {
         let mut body = Vec::with_capacity(body_capacity);
         body.extend_from_slice(&snapshot.body_bytes);
         Ok(Self {
-            version,
             header,
             header_count: snapshot.header_count,
             body,
@@ -343,13 +307,8 @@ impl Parser {
 }
 
 /// Encodes a validated record using the frozen 44-byte header.
-#[cfg_attr(not(test), expect(dead_code, reason = "v1 compatibility helper"))]
 pub fn encode(record: &Record) -> Result<Vec<u8>, ProtocolError> {
-    encode_for(ProtocolVersion::V1, record)
-}
-
-pub fn encode_for(version: ProtocolVersion, record: &Record) -> Result<Vec<u8>, ProtocolError> {
-    validate_record(version, record)?;
+    validate_record(record)?;
     let payload_len =
         u32::try_from(record.payload.len()).map_err(|_| ProtocolError::LengthOverflow)?;
     let total_len = HEADER_LEN
@@ -357,7 +316,7 @@ pub fn encode_for(version: ProtocolVersion, record: &Record) -> Result<Vec<u8>, 
         .ok_or(ProtocolError::LengthOverflow)?;
     let mut bytes = Vec::with_capacity(total_len);
     bytes.extend_from_slice(&MAGIC);
-    bytes.extend_from_slice(&(version as u16).to_le_bytes());
+    bytes.extend_from_slice(&VERSION.to_le_bytes());
     bytes.push(record.record_type as u8);
     bytes.push(0);
     bytes.extend_from_slice(&record.instance_id);
@@ -369,13 +328,8 @@ pub fn encode_for(version: ProtocolVersion, record: &Record) -> Result<Vec<u8>, 
 }
 
 /// Decodes exactly one complete record.
-#[cfg_attr(not(test), expect(dead_code, reason = "v1 compatibility helper"))]
 pub fn decode_exact(bytes: &[u8]) -> Result<Record, ProtocolError> {
-    decode_exact_for(ProtocolVersion::V1, bytes)
-}
-
-pub fn decode_exact_for(version: ProtocolVersion, bytes: &[u8]) -> Result<Record, ProtocolError> {
-    let mut parser = Parser::new_for(version);
+    let mut parser = Parser::new();
     let progress = parser.accept(bytes)?;
     if progress.consumed != bytes.len() || !parser.is_aligned() {
         return Err(ProtocolError::InvalidSnapshot(
@@ -387,21 +341,15 @@ pub fn decode_exact_for(version: ProtocolVersion, bytes: &[u8]) -> Result<Record
     ))
 }
 
-fn parse_header(
-    expected_version: ProtocolVersion,
-    bytes: &[u8; HEADER_LEN],
-) -> Result<ParsedHeader, ProtocolError> {
+fn parse_header(bytes: &[u8; HEADER_LEN]) -> Result<ParsedHeader, ProtocolError> {
     if bytes[..4] != MAGIC {
         return Err(ProtocolError::InvalidMagic);
     }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-    if version != expected_version as u16 {
+    if version != VERSION {
         return Err(ProtocolError::InvalidVersion(version));
     }
     let record_type = RecordType::try_from(bytes[6])?;
-    if expected_version == ProtocolVersion::V1 && record_type == RecordType::Credit {
-        return Err(ProtocolError::InvalidType(bytes[6]));
-    }
     if bytes[7] != 0 {
         return Err(ProtocolError::InvalidFlags(bytes[7]));
     }
@@ -416,7 +364,7 @@ fn parse_header(
     let payload_len = u32::from_le_bytes(bytes[40..44].try_into().map_err(|_| {
         ProtocolError::InvalidSnapshot("payload field has an invalid encoded length")
     })?);
-    validate_payload_length(expected_version, record_type, payload_len)?;
+    validate_payload_length(record_type, payload_len)?;
     if matches!(
         record_type,
         RecordType::GuestAttach | RecordType::HostAttach
@@ -433,11 +381,7 @@ fn parse_header(
     })
 }
 
-fn record_from_parts(
-    version: ProtocolVersion,
-    header: ParsedHeader,
-    payload: Vec<u8>,
-) -> Result<Record, ProtocolError> {
+fn record_from_parts(header: ParsedHeader, payload: Vec<u8>) -> Result<Record, ProtocolError> {
     let record = Record {
         record_type: header.record_type,
         instance_id: header.instance_id,
@@ -445,14 +389,14 @@ fn record_from_parts(
         sequence: header.sequence,
         payload,
     };
-    validate_record(version, &record)?;
+    validate_record(&record)?;
     Ok(record)
 }
 
-fn validate_record(version: ProtocolVersion, record: &Record) -> Result<(), ProtocolError> {
+fn validate_record(record: &Record) -> Result<(), ProtocolError> {
     let payload_len =
         u32::try_from(record.payload.len()).map_err(|_| ProtocolError::LengthOverflow)?;
-    validate_payload_length(version, record.record_type, payload_len)?;
+    validate_payload_length(record.record_type, payload_len)?;
     if matches!(
         record.record_type,
         RecordType::GuestAttach | RecordType::HostAttach
@@ -472,14 +416,14 @@ fn validate_record(version: ProtocolVersion, record: &Record) -> Result<(), Prot
             return Err(ProtocolError::InvalidErrorCode(code));
         }
     }
-    match (version, record.record_type) {
-        (ProtocolVersion::V2, RecordType::Ack) => {
+    match record.record_type {
+        RecordType::Ack => {
             let credit = decode_credit_payload(&record.payload)?;
             if !(MIN_RECEIVE_CREDIT..=MAX_RECEIVE_CREDIT).contains(&credit) {
                 return Err(ProtocolError::InvalidReceiveCredit(credit));
             }
         }
-        (ProtocolVersion::V2, RecordType::Credit) => {
+        RecordType::Credit => {
             let credit = decode_credit_payload(&record.payload)?;
             if !(1..=MAX_RECEIVE_CREDIT).contains(&credit) {
                 return Err(ProtocolError::InvalidReceiveCredit(credit));
@@ -490,22 +434,15 @@ fn validate_record(version: ProtocolVersion, record: &Record) -> Result<(), Prot
     Ok(())
 }
 
-fn validate_payload_length(
-    version: ProtocolVersion,
-    record_type: RecordType,
-    payload_len: u32,
-) -> Result<(), ProtocolError> {
-    let valid = match (version, record_type) {
-        (ProtocolVersion::V1, RecordType::Credit) => false,
-        (ProtocolVersion::V2, RecordType::Ack | RecordType::Credit) => payload_len == 4,
-        (_, RecordType::Ack) => payload_len == 0,
-        (_, RecordType::GuestAttach)
-        | (_, RecordType::Reset)
-        | (_, RecordType::Wait)
-        | (_, RecordType::Ready) => payload_len == 0,
-        (_, RecordType::HostAttach) => payload_len == 32,
-        (_, RecordType::Data) => (1..=MAX_DATA_LEN as u32).contains(&payload_len),
-        (_, RecordType::Error) => payload_len == 4,
+fn validate_payload_length(record_type: RecordType, payload_len: u32) -> Result<(), ProtocolError> {
+    let valid = match record_type {
+        RecordType::Ack | RecordType::Credit => payload_len == 4,
+        RecordType::GuestAttach | RecordType::Reset | RecordType::Wait | RecordType::Ready => {
+            payload_len == 0
+        }
+        RecordType::HostAttach => payload_len == 32,
+        RecordType::Data => (1..=MAX_DATA_LEN as u32).contains(&payload_len),
+        RecordType::Error => payload_len == 4,
     };
     if valid {
         Ok(())
@@ -566,7 +503,7 @@ mod tests {
 
     #[test]
     fn golden_vectors_round_trip() -> Result<(), Box<dyn std::error::Error>> {
-        let vectors = include_str!("../test_data/control_session_protocol_v1_vectors.txt");
+        let vectors = include_str!("../test_data/control_session_protocol_vectors.txt");
         let mut count = 0;
         for line in vectors.lines().filter(|line| !line.is_empty()) {
             let (name, hex) = line
@@ -578,7 +515,8 @@ mod tests {
                 "GUEST_ATTACH" => RecordType::GuestAttach,
                 "HOST_ATTACH" => RecordType::HostAttach,
                 "RESET" => RecordType::Reset,
-                "ACK" => RecordType::Ack,
+                "ACK_INITIAL_CREDIT" => RecordType::Ack,
+                "CREDIT" => RecordType::Credit,
                 "DATA_EMBEDDED_MAGIC" => RecordType::Data,
                 "WAIT" => RecordType::Wait,
                 "READY" => RecordType::Ready,
@@ -609,47 +547,23 @@ mod tests {
             if expected_type == RecordType::Data {
                 assert_eq!(record.payload, b"NVXSNVXS");
             }
+            if expected_type == RecordType::Ack {
+                assert_eq!(decode_credit_payload(&record.payload)?, MAX_RECEIVE_CREDIT);
+            }
+            if expected_type == RecordType::Credit {
+                assert_eq!(decode_credit_payload(&record.payload)?, MIN_RECEIVE_CREDIT);
+            }
             assert_eq!(encode(&record)?, bytes, "{name}");
             count += 1;
         }
-        assert_eq!(count, 8);
+        assert_eq!(count, 9);
         assert!(vectors.contains("4e5658534e565853"));
         Ok(())
     }
 
     #[test]
-    fn v2_golden_vectors_round_trip() -> Result<(), Box<dyn std::error::Error>> {
-        let vectors = include_str!("../test_data/control_session_protocol_v2_vectors.txt");
-        let mut count = 0;
-        for line in vectors.lines().filter(|line| !line.is_empty()) {
-            let (name, hex) = line
-                .split_once('|')
-                .ok_or_else(|| format!("invalid vector line: {line}"))?;
-            let bytes = decode_hex(hex)?;
-            let record = decode_exact_for(ProtocolVersion::V2, &bytes)?;
-            let expected_type = match name {
-                "GUEST_ATTACH" => RecordType::GuestAttach,
-                "HOST_ATTACH" => RecordType::HostAttach,
-                "RESET" => RecordType::Reset,
-                "ACK_INITIAL_CREDIT" => RecordType::Ack,
-                "CREDIT" => RecordType::Credit,
-                "DATA_EMBEDDED_MAGIC" => RecordType::Data,
-                "WAIT" => RecordType::Wait,
-                "READY" => RecordType::Ready,
-                "ERROR_AUTHENTICATION" => RecordType::Error,
-                _ => return Err(format!("unknown vector name: {name}").into()),
-            };
-            assert_eq!(record.record_type, expected_type, "{name}");
-            assert_eq!(encode_for(ProtocolVersion::V2, &record)?, bytes, "{name}");
-            count += 1;
-        }
-        assert_eq!(count, 9);
-        Ok(())
-    }
-
-    #[test]
     fn language_neutral_boundary_and_invalid_cases() -> Result<(), Box<dyn std::error::Error>> {
-        let cases = include_str!("../test_data/control_session_protocol_v1_cases.txt");
+        let cases = include_str!("../test_data/control_session_protocol_cases.txt");
         let instance_id = core::array::from_fn(|index| index as u8);
         let mut count = 0;
         for line in cases.lines().filter(|line| !line.is_empty()) {
@@ -672,56 +586,43 @@ mod tests {
                     let mut parser = Parser::new();
                     assert!(parser.accept(&bytes).is_err(), "{name}");
                 }
-                _ => return Err(format!("invalid language-neutral case: {line}").into()),
-            }
-            count += 1;
-        }
-        assert_eq!(count, 9);
-        Ok(())
-    }
-
-    #[test]
-    fn v2_language_neutral_credit_cases() -> Result<(), Box<dyn std::error::Error>> {
-        let cases = include_str!("../test_data/control_session_protocol_v2_cases.txt");
-        let instance_id = core::array::from_fn(|index| index as u8);
-        let mut count = 0;
-        for line in cases.lines().filter(|line| !line.is_empty()) {
-            let fields = line.split('|').collect::<Vec<_>>();
-            match fields.as_slice() {
                 ["ACK_CREDIT", name, value] => {
                     let value = value.parse::<u32>()?;
-                    let result = encode_for(
-                        ProtocolVersion::V2,
-                        &Record::session(RecordType::Ack, instance_id, 7, 9, credit_payload(value)),
-                    );
+                    let result = encode(&Record::session(
+                        RecordType::Ack,
+                        instance_id,
+                        7,
+                        9,
+                        credit_payload(value),
+                    ));
                     assert_eq!(result.is_ok(), name.starts_with("VALID_"), "{name}");
                 }
                 ["CREDIT_INCREMENT", name, value] => {
                     let value = value.parse::<u32>()?;
-                    let result = encode_for(
-                        ProtocolVersion::V2,
-                        &Record::session(
-                            RecordType::Credit,
-                            instance_id,
-                            7,
-                            9,
-                            credit_payload(value),
-                        ),
-                    );
+                    let result = encode(&Record::session(
+                        RecordType::Credit,
+                        instance_id,
+                        7,
+                        9,
+                        credit_payload(value),
+                    ));
                     assert_eq!(result.is_ok(), name.starts_with("VALID_"), "{name}");
                 }
                 _ => return Err(format!("invalid language-neutral case: {line}").into()),
             }
             count += 1;
         }
-        assert_eq!(count, 8);
+        assert_eq!(count, 17);
         Ok(())
     }
 
     #[test]
     fn every_byte_fragmentation_preserves_state() -> Result<(), ProtocolError> {
-        for payload in [vec![0x55], vec![0x33; 257]] {
-            let record = sample(RecordType::Data, payload);
+        for record in [
+            sample(RecordType::Ack, credit_payload(MIN_RECEIVE_CREDIT)),
+            sample(RecordType::Credit, credit_payload(17)),
+            sample(RecordType::Data, vec![0x33; 257]),
+        ] {
             let encoded = encode(&record)?;
             for split in 0..encoded.len() {
                 let mut parser = Parser::new();
@@ -738,59 +639,16 @@ mod tests {
 
     #[test]
     fn coalesced_records_stop_at_exact_boundary() -> Result<(), ProtocolError> {
-        let first = sample(RecordType::Ready, Vec::new());
+        let first = sample(RecordType::Credit, credit_payload(17));
         let second = sample(RecordType::Data, b"xNVXSy".to_vec());
         let mut bytes = encode(&first)?;
         bytes.extend_from_slice(&encode(&second)?);
         let mut parser = Parser::new();
         let progress = parser.accept(&bytes)?;
         assert_eq!(progress.record, Some(first));
-        assert_eq!(progress.consumed, HEADER_LEN);
+        assert_eq!(progress.consumed, HEADER_LEN + 4);
         let progress = parser.accept(&bytes[progress.consumed..])?;
         assert_eq!(progress.record, Some(second));
-        Ok(())
-    }
-
-    #[test]
-    fn v2_fragmentation_and_coalescing_preserve_boundaries() -> Result<(), ProtocolError> {
-        let records = [
-            sample(RecordType::Ack, credit_payload(MIN_RECEIVE_CREDIT)),
-            sample(RecordType::Credit, credit_payload(17)),
-            sample(RecordType::Data, vec![0x33; 257]),
-        ];
-        for record in &records {
-            let encoded = encode_for(ProtocolVersion::V2, record)?;
-            for split in 0..encoded.len() {
-                let mut parser = Parser::new_for(ProtocolVersion::V2);
-                let first = parser.accept(&encoded[..split])?;
-                assert!(first.record.is_none());
-                parser = Parser::restore_for(ProtocolVersion::V2, parser.snapshot())?;
-                let second = parser.accept(&encoded[split..])?;
-                assert_eq!(second.record, Some(record.clone()));
-            }
-        }
-
-        let mut bytes = encode_for(ProtocolVersion::V2, &records[1])?;
-        let first_len = bytes.len();
-        bytes.extend_from_slice(&encode_for(ProtocolVersion::V2, &records[2])?);
-        let mut parser = Parser::new_for(ProtocolVersion::V2);
-        let first = parser.accept(&bytes)?;
-        assert_eq!(first.record, Some(records[1].clone()));
-        assert_eq!(first.consumed, first_len);
-        assert_eq!(
-            parser.accept(&bytes[first.consumed..])?.record,
-            Some(records[2].clone())
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn protocol_versions_are_not_interchangeable() -> Result<(), ProtocolError> {
-        let v1 = encode(&sample(RecordType::Data, vec![1]))?;
-        let v2 = encode_for(ProtocolVersion::V2, &sample(RecordType::Data, vec![1]))?;
-        assert!(decode_exact_for(ProtocolVersion::V2, &v1).is_err());
-        assert!(decode_exact(&v2).is_err());
-        assert!(encode(&sample(RecordType::Credit, credit_payload(1))).is_err());
         Ok(())
     }
 
@@ -845,12 +703,14 @@ mod tests {
         assert!(encode(&sample(RecordType::GuestAttach, vec![1])).is_err());
         assert!(encode(&sample(RecordType::HostAttach, vec![0; 31])).is_err());
         assert!(encode(&sample(RecordType::Reset, vec![1])).is_err());
-        assert!(encode(&sample(RecordType::Ack, vec![1])).is_err());
+        assert!(encode(&sample(RecordType::Ack, Vec::new())).is_err());
+        assert!(encode(&sample(RecordType::Ack, credit_payload(MIN_RECEIVE_CREDIT))).is_ok());
         assert!(encode(&sample(RecordType::Wait, vec![1])).is_err());
         assert!(encode(&sample(RecordType::Ready, vec![1])).is_err());
         assert!(encode(&sample(RecordType::Error, 0u32.to_le_bytes().to_vec())).is_err());
         assert!(encode(&sample(RecordType::Error, 6u32.to_le_bytes().to_vec())).is_err());
-        assert!(encode(&sample(RecordType::Credit, credit_payload(1))).is_err());
+        assert!(encode(&sample(RecordType::Credit, credit_payload(1))).is_ok());
+        assert!(encode(&sample(RecordType::Credit, credit_payload(0))).is_err());
     }
 
     #[test]

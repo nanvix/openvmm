@@ -1023,16 +1023,6 @@ options:
     )]
     pub microvm_control_auth_timeout_ms: u64,
 
-    /// select the control-session wire protocol version
-    #[clap(
-        long = "microvm-control-protocol-version",
-        value_name = "VERSION",
-        default_value_t = 1,
-        value_parser = clap::value_parser!(u16).range(1..=2),
-        hide = true
-    )]
-    pub microvm_control_protocol_version: u16,
-
     /// attach the virtio-console device to the specified PCIe port
     #[clap(long, value_name = "PORT", requires("virtio_console"))]
     pub virtio_console_pcie_port: Option<String>,
@@ -6559,6 +6549,16 @@ mod tests {
         ])
         .unwrap();
         valid_control_console.validate_microvm_options().unwrap();
+        assert!(
+            Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--microvm-control-protocol-version",
+                "1",
+            ])
+            .is_err()
+        );
         let valid_restore_control_console = Options::try_parse_from([
             "openvmm",
             "--machine",
@@ -6581,19 +6581,6 @@ mod tests {
                     .is_err()
             );
         }
-        let valid_v2_disconnected_restore = Options::try_parse_from([
-            "openvmm",
-            "--machine",
-            "microvm",
-            "--restore-snapshot",
-            "snapshot",
-            "--microvm-control-protocol-version",
-            "2",
-        ])
-        .unwrap();
-        valid_v2_disconnected_restore
-            .validate_microvm_options()
-            .unwrap();
         let valid_network = Options::try_parse_from([
             "openvmm",
             "--machine",

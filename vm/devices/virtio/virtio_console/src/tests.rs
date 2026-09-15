@@ -47,7 +47,6 @@ use virtio::test_helpers::write_descriptor;
 use virtio::transport::VirtioMmioDevice;
 use virtio_resources::console::VirtioConsoleDisconnectPolicy;
 use virtio_resources::console::VirtioControlConsoleBrokerConfig;
-use virtio_resources::console::VirtioControlConsoleProtocolVersion;
 use vmcore::device_state::ChangeDeviceState;
 use vmcore::interrupt::Interrupt;
 use vmcore::line_interrupt::LineInterrupt;
@@ -397,37 +396,11 @@ impl TestHarness {
         Self::new_broker_with_timeout(driver, instance_id, capability, 5000)
     }
 
-    fn new_broker_v2(driver: &DefaultDriver, instance_id: [u8; 16], capability: [u8; 32]) -> Self {
-        Self::new_broker_with_version(
-            driver,
-            instance_id,
-            capability,
-            5000,
-            VirtioControlConsoleProtocolVersion::V2,
-        )
-    }
-
     fn new_broker_with_timeout(
         driver: &DefaultDriver,
         instance_id: [u8; 16],
         capability: [u8; 32],
         auth_timeout_ms: u64,
-    ) -> Self {
-        Self::new_broker_with_version(
-            driver,
-            instance_id,
-            capability,
-            auth_timeout_ms,
-            VirtioControlConsoleProtocolVersion::V1,
-        )
-    }
-
-    fn new_broker_with_version(
-        driver: &DefaultDriver,
-        instance_id: [u8; 16],
-        capability: [u8; 32],
-        auth_timeout_ms: u64,
-        protocol_version: VirtioControlConsoleProtocolVersion,
     ) -> Self {
         Self::new_with_device(driver, |driver_source, io| {
             VirtioConsoleDevice::new_broker(
@@ -438,7 +411,6 @@ impl TestHarness {
                     capability,
                     expected_peer_identity: LocalPeerIdentity::UnixUid(1000),
                     auth_timeout_ms,
-                    protocol_version,
                 },
             )
         })
@@ -548,19 +520,6 @@ impl TestHarness {
     }
 
     fn replace_with_broker(&mut self, instance_id: [u8; 16], capability: [u8; 32]) {
-        self.replace_with_broker_version(
-            instance_id,
-            capability,
-            VirtioControlConsoleProtocolVersion::V1,
-        );
-    }
-
-    fn replace_with_broker_version(
-        &mut self,
-        instance_id: [u8; 16],
-        capability: [u8; 32],
-        protocol_version: VirtioControlConsoleProtocolVersion,
-    ) {
         let (io, handle) = new_mock_serial();
         let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(self.driver.clone()));
         self.device = VirtioConsoleDevice::new_broker(
@@ -571,7 +530,6 @@ impl TestHarness {
                 capability,
                 expected_peer_identity: LocalPeerIdentity::UnixUid(1000),
                 auth_timeout_ms: 5000,
-                protocol_version,
             },
         );
         self.handle = handle;
@@ -748,16 +706,18 @@ fn encode(record: &Record) -> Vec<u8> {
     control_session_protocol::encode(record).unwrap()
 }
 
-fn encode_for(version: control_session_protocol::ProtocolVersion, record: &Record) -> Vec<u8> {
-    control_session_protocol::encode_for(version, record).unwrap()
-}
-
 fn decode(bytes: &[u8]) -> Record {
     control_session_protocol::decode_exact(bytes).unwrap()
 }
 
-fn decode_for(version: control_session_protocol::ProtocolVersion, bytes: &[u8]) -> Record {
-    control_session_protocol::decode_exact_for(version, bytes).unwrap()
+fn ack(instance_id: [u8; 16], epoch: u64) -> Record {
+    Record::session(
+        RecordType::Ack,
+        instance_id,
+        epoch,
+        0,
+        control_session_protocol::credit_payload(control_session_protocol::MIN_RECEIVE_CREDIT),
+    )
 }
 
 // --- Tests ---
@@ -1421,16 +1381,7 @@ async fn activate_broker(harness: &mut TestHarness) {
     assert_eq!(reset.instance_id, BROKER_INSTANCE);
 
     harness
-        .send_guest_bytes(
-            1,
-            &encode(&Record::session(
-                RecordType::Ack,
-                BROKER_INSTANCE,
-                1,
-                0,
-                Vec::new(),
-            )),
-        )
+        .send_guest_bytes(1, &encode(&ack(BROKER_INSTANCE, 1)))
         .await;
     harness.handle.inject_rx_data(&encode(&Record::bootstrap(
         RecordType::HostAttach,
@@ -1438,45 +1389,6 @@ async fn activate_broker(harness: &mut TestHarness) {
     )));
     yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
     let ready = decode(&harness.handle.take_tx_data());
-    assert_eq!(ready.record_type, RecordType::Ready);
-}
-
-async fn activate_broker_v2(harness: &mut TestHarness, receive_credit: u32) {
-    let version = control_session_protocol::ProtocolVersion::V2;
-    harness
-        .send_guest_bytes(
-            0,
-            &encode_for(
-                version,
-                &Record::bootstrap(RecordType::GuestAttach, Vec::new()),
-            ),
-        )
-        .await;
-    let reset = decode_for(version, &harness.receive_guest_bytes(0, 128).await);
-    assert_eq!(reset.record_type, RecordType::Reset);
-    assert_eq!(reset.instance_id, BROKER_INSTANCE);
-
-    harness
-        .send_guest_bytes(
-            1,
-            &encode_for(
-                version,
-                &Record::session(
-                    RecordType::Ack,
-                    BROKER_INSTANCE,
-                    1,
-                    0,
-                    control_session_protocol::credit_payload(receive_credit),
-                ),
-            ),
-        )
-        .await;
-    harness.handle.inject_rx_data(&encode_for(
-        version,
-        &Record::bootstrap(RecordType::HostAttach, BROKER_CAPABILITY.to_vec()),
-    ));
-    yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
-    let ready = decode_for(version, &harness.handle.take_tx_data());
     assert_eq!(ready.record_type, RecordType::Ready);
 }
 
@@ -1502,16 +1414,7 @@ async fn broker_cold_attach_ready_and_bidirectional_data(driver: DefaultDriver) 
     let reset = decode(&harness.receive_guest_bytes(0, 128).await);
     assert_eq!((reset.record_type, reset.epoch), (RecordType::Reset, 1));
     harness
-        .send_guest_bytes(
-            1,
-            &encode(&Record::session(
-                RecordType::Ack,
-                BROKER_INSTANCE,
-                1,
-                0,
-                Vec::new(),
-            )),
-        )
+        .send_guest_bytes(1, &encode(&ack(BROKER_INSTANCE, 1)))
         .await;
     yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
     assert_eq!(
@@ -1683,16 +1586,7 @@ async fn broker_host_lifecycle_error_does_not_stop_guest_worker(driver: DefaultD
     );
     assert_eq!((reset.record_type, reset.epoch), (RecordType::Reset, 2));
     harness
-        .send_guest_bytes(
-            4,
-            &encode(&Record::session(
-                RecordType::Ack,
-                BROKER_INSTANCE,
-                2,
-                0,
-                Vec::new(),
-            )),
-        )
+        .send_guest_bytes(4, &encode(&ack(BROKER_INSTANCE, 2)))
         .await;
     assert!(harness.device.stop_queue(0).await.is_some());
     assert!(harness.device.stop_queue(1).await.is_some());
@@ -1731,34 +1625,27 @@ async fn broker_disconnect_emits_reset_without_guest_eof(driver: DefaultDriver) 
 }
 
 #[async_test]
-async fn broker_v2_zero_credit_disconnects_and_reconnects_without_guest_release(
+async fn broker_zero_credit_disconnects_and_reconnects_without_guest_release(
     driver: DefaultDriver,
 ) {
-    let version = control_session_protocol::ProtocolVersion::V2;
-    let mut harness = TestHarness::new_broker_v2(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
     harness.enable().await;
-    activate_broker_v2(&mut harness, control_session_protocol::MIN_RECEIVE_CREDIT).await;
+    activate_broker(&mut harness).await;
 
-    let full_host_record = encode_for(
-        version,
-        &Record::session(
-            RecordType::Data,
-            BROKER_INSTANCE,
-            1,
-            0,
-            vec![0x5a; control_session_protocol::MAX_DATA_LEN],
-        ),
-    );
-    let full_guest_record = encode_for(
-        version,
-        &Record::session(
-            RecordType::Data,
-            BROKER_INSTANCE,
-            1,
-            1,
-            vec![0x5a; control_session_protocol::MAX_DATA_LEN],
-        ),
-    );
+    let full_host_record = encode(&Record::session(
+        RecordType::Data,
+        BROKER_INSTANCE,
+        1,
+        0,
+        vec![0x5a; control_session_protocol::MAX_DATA_LEN],
+    ));
+    let full_guest_record = encode(&Record::session(
+        RecordType::Data,
+        BROKER_INSTANCE,
+        1,
+        1,
+        vec![0x5a; control_session_protocol::MAX_DATA_LEN],
+    ));
     harness.handle.inject_rx_data(&full_host_record);
     assert_eq!(
         harness
@@ -1767,16 +1654,18 @@ async fn broker_v2_zero_credit_disconnects_and_reconnects_without_guest_release(
         full_guest_record
     );
 
-    let blocked = encode_for(
-        version,
-        &Record::session(RecordType::Data, BROKER_INSTANCE, 1, 1, vec![0x44]),
-    );
+    let blocked = encode(&Record::session(
+        RecordType::Data,
+        BROKER_INSTANCE,
+        1,
+        1,
+        vec![0x44],
+    ));
     harness.handle.inject_rx_data(&blocked);
     yield_until(|| harness.handle.pending_rx_len() == 0).await;
 
     harness.handle.disconnect();
-    let reset = decode_for(
-        version,
+    let reset = decode(
         &harness
             .receive_guest_exact(4, control_session_protocol::HEADER_LEN)
             .await,
@@ -1784,66 +1673,45 @@ async fn broker_v2_zero_credit_disconnects_and_reconnects_without_guest_release(
     assert_eq!((reset.record_type, reset.epoch), (RecordType::Reset, 2));
 
     harness.handle.reconnect();
-    harness.handle.inject_rx_data(&encode_for(
-        version,
-        &Record::bootstrap(RecordType::HostAttach, BROKER_CAPABILITY.to_vec()),
-    ));
+    harness.handle.inject_rx_data(&encode(&Record::bootstrap(
+        RecordType::HostAttach,
+        BROKER_CAPABILITY.to_vec(),
+    )));
     yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
     assert_eq!(
-        decode_for(version, &harness.handle.take_tx_data()).record_type,
+        decode(&harness.handle.take_tx_data()).record_type,
         RecordType::Wait
     );
     harness
-        .send_guest_bytes(
-            5,
-            &encode_for(
-                version,
-                &Record::session(
-                    RecordType::Ack,
-                    BROKER_INSTANCE,
-                    2,
-                    0,
-                    control_session_protocol::credit_payload(
-                        control_session_protocol::MIN_RECEIVE_CREDIT,
-                    ),
-                ),
-            ),
-        )
+        .send_guest_bytes(5, &encode(&ack(BROKER_INSTANCE, 2)))
         .await;
     yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
     assert_eq!(
-        decode_for(version, &harness.handle.take_tx_data()).record_type,
+        decode(&harness.handle.take_tx_data()).record_type,
         RecordType::Ready
     );
 }
 
 #[async_test]
-async fn broker_v2_disconnect_finishes_partial_data_before_reset(driver: DefaultDriver) {
-    let version = control_session_protocol::ProtocolVersion::V2;
-    let mut harness = TestHarness::new_broker_v2(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+async fn broker_disconnect_finishes_partial_data_before_reset(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
     harness.enable().await;
-    activate_broker_v2(&mut harness, control_session_protocol::MIN_RECEIVE_CREDIT).await;
+    activate_broker(&mut harness).await;
 
-    let host_data = encode_for(
-        version,
-        &Record::session(
-            RecordType::Data,
-            BROKER_INSTANCE,
-            1,
-            0,
-            b"partially-emitted-v2".to_vec(),
-        ),
-    );
-    let guest_data = encode_for(
-        version,
-        &Record::session(
-            RecordType::Data,
-            BROKER_INSTANCE,
-            1,
-            1,
-            b"partially-emitted-v2".to_vec(),
-        ),
-    );
+    let host_data = encode(&Record::session(
+        RecordType::Data,
+        BROKER_INSTANCE,
+        1,
+        0,
+        b"partially-emitted".to_vec(),
+    ));
+    let guest_data = encode(&Record::session(
+        RecordType::Data,
+        BROKER_INSTANCE,
+        1,
+        1,
+        b"partially-emitted".to_vec(),
+    ));
     harness.handle.inject_rx_data(&host_data);
     let first = harness.receive_guest_bytes(2, 13).await;
     assert_eq!(first, guest_data[..13]);
@@ -1854,8 +1722,7 @@ async fn broker_v2_disconnect_finishes_partial_data_before_reset(driver: Default
     completed.extend(remainder);
     assert_eq!(completed, guest_data);
     assert_eq!(
-        decode_for(
-            version,
+        decode(
             &harness
                 .receive_guest_exact(5, control_session_protocol::HEADER_LEN)
                 .await,
@@ -1916,16 +1783,7 @@ async fn broker_fragmentation_partial_host_writes_and_backpressure(driver: Defau
         RecordType::Reset
     );
     harness
-        .send_guest_bytes(
-            2,
-            &encode(&Record::session(
-                RecordType::Ack,
-                BROKER_INSTANCE,
-                1,
-                0,
-                Vec::new(),
-            )),
-        )
+        .send_guest_bytes(2, &encode(&ack(BROKER_INSTANCE, 1)))
         .await;
 
     harness.handle.set_max_write_size(3);
@@ -2012,6 +1870,19 @@ async fn broker_restore_finishes_old_output_then_uses_fresh_identity(driver: Def
     harness.replace_with_broker(NEW_INSTANCE, NEW_CAPABILITY);
     harness.device.restore_device(Some(saved)).unwrap();
     assert!(!harness.handle.is_connected());
+    {
+        let (worker, _) = harness.device.worker.get();
+        let crate::ConsoleWorkerMode::Broker(mode) = &worker.mode else {
+            panic!("expected broker worker");
+        };
+        assert_eq!(
+            (
+                mode.broker.guest_receive_window(),
+                mode.broker.guest_receive_credit()
+            ),
+            (0, 0)
+        );
+    }
     harness
         .enable_with_state(Some(receive_state), Some(transmit_state))
         .await;
@@ -2052,105 +1923,8 @@ async fn broker_restore_finishes_old_output_then_uses_fresh_identity(driver: Def
 
     harness.send_guest_bytes(3, &old_guest_data[19..]).await;
     harness
-        .send_guest_bytes(
-            4,
-            &encode(&Record::session(
-                RecordType::Ack,
-                NEW_INSTANCE,
-                1,
-                0,
-                Vec::new(),
-            )),
-        )
+        .send_guest_bytes(4, &encode(&ack(NEW_INSTANCE, 1)))
         .await;
-}
-
-#[async_test]
-async fn broker_v2_restore_preserves_partial_output_but_not_credit(driver: DefaultDriver) {
-    let version = control_session_protocol::ProtocolVersion::V2;
-    let mut harness = TestHarness::new_broker_v2(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
-    harness.enable().await;
-    activate_broker_v2(&mut harness, control_session_protocol::MIN_RECEIVE_CREDIT).await;
-
-    let old_host_data = encode_for(
-        version,
-        &Record::session(
-            RecordType::Data,
-            BROKER_INSTANCE,
-            1,
-            0,
-            b"partially-restored-v2".to_vec(),
-        ),
-    );
-    let old_guest_data = encode_for(
-        version,
-        &Record::session(
-            RecordType::Data,
-            BROKER_INSTANCE,
-            1,
-            1,
-            b"partially-restored-v2".to_vec(),
-        ),
-    );
-    harness.handle.inject_rx_data(&old_host_data);
-    let first = harness.receive_guest_bytes(2, 13).await;
-    assert_eq!(first, old_guest_data[..13]);
-
-    let receive_state = harness.device.stop_queue(0).await.unwrap();
-    let transmit_state = harness.device.stop_queue(1).await.unwrap();
-    let saved = harness.device.save_device().unwrap().unwrap();
-    let saved_state: crate::saved_state::SavedState = saved.parse().unwrap();
-    assert_eq!(
-        saved_state.schema_version,
-        super::BROKER_V2_SAVED_STATE_VERSION
-    );
-    assert_eq!(
-        saved_state.broker.as_ref().unwrap().protocol_version,
-        version as u32
-    );
-
-    const NEW_INSTANCE: [u8; 16] = [0x63; 16];
-    const NEW_CAPABILITY: [u8; 32] = [0xb9; 32];
-    harness.replace_with_broker_version(
-        NEW_INSTANCE,
-        NEW_CAPABILITY,
-        VirtioControlConsoleProtocolVersion::V2,
-    );
-    harness.device.restore_device(Some(saved)).unwrap();
-    assert!(!harness.handle.is_connected());
-    {
-        let (worker, _) = harness.device.worker.get();
-        let crate::ConsoleWorkerMode::Broker(mode) = &worker.mode else {
-            panic!("expected broker worker");
-        };
-        assert_eq!(
-            (
-                mode.broker.guest_receive_window(),
-                mode.broker.guest_receive_credit()
-            ),
-            (0, 0)
-        );
-    }
-    harness
-        .enable_with_state(Some(receive_state), Some(transmit_state))
-        .await;
-
-    let remainder = harness
-        .receive_guest_exact(3, old_guest_data.len() - 13)
-        .await;
-    let mut completed = first;
-    completed.extend(remainder);
-    assert_eq!(completed, old_guest_data);
-    let reset = decode_for(
-        version,
-        &harness
-            .receive_guest_exact(5, control_session_protocol::HEADER_LEN)
-            .await,
-    );
-    assert_eq!(
-        (reset.record_type, reset.instance_id, reset.epoch),
-        (RecordType::Reset, NEW_INSTANCE, 1)
-    );
 }
 
 #[async_test]
@@ -2179,40 +1953,12 @@ async fn direct_and_broker_saved_state_schemas_are_not_interchangeable(driver: D
         broker_state.schema_version,
         super::BROKER_SAVED_STATE_VERSION
     );
-    assert_eq!(
-        broker_state.broker.as_ref().unwrap().protocol_version,
-        0,
-        "v1 saved-state encoding must remain unchanged"
-    );
+    assert!(broker_state.broker.is_some());
 
     let (io, _) = new_mock_serial();
     let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
     let mut direct_device = VirtioConsoleDevice::new(&driver_source, Box::new(io));
     assert!(direct_device.restore_device(Some(broker_saved)).is_err());
-}
-
-#[async_test]
-async fn broker_v1_and_v2_saved_state_schemas_are_not_interchangeable(driver: DefaultDriver) {
-    let mut v1 = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
-    v1.enable().await;
-    v1.device.stop_queue(0).await;
-    v1.device.stop_queue(1).await;
-    let v1_saved = v1.device.save_device().unwrap().unwrap();
-
-    let mut v2 = TestHarness::new_broker_v2(&driver, [0x61; 16], [0xa8; 32]);
-    assert!(v2.device.restore_device(Some(v1_saved)).is_err());
-    v2.enable().await;
-    v2.device.stop_queue(0).await;
-    v2.device.stop_queue(1).await;
-    let v2_saved = v2.device.save_device().unwrap().unwrap();
-
-    let mut v1_destination = TestHarness::new_broker(&driver, [0x62; 16], [0xa9; 32]);
-    assert!(
-        v1_destination
-            .device
-            .restore_device(Some(v2_saved))
-            .is_err()
-    );
 }
 
 #[async_test]

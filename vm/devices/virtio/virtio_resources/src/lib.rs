@@ -230,20 +230,12 @@ pub mod console {
         const ID: &'static str = "virtio-console";
     }
 
-    #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, MeshPayload)]
-    pub enum VirtioControlConsoleProtocolVersion {
-        #[default]
-        V1,
-        V2,
-    }
-
     #[derive(Clone, MeshPayload)]
     pub struct VirtioControlConsoleBrokerConfig {
         pub instance_id: [u8; 16],
         pub capability: [u8; 32],
         pub expected_peer_identity: serial_core::LocalPeerIdentity,
         pub auth_timeout_ms: u64,
-        pub protocol_version: VirtioControlConsoleProtocolVersion,
     }
 
     #[derive(MeshPayload)]
