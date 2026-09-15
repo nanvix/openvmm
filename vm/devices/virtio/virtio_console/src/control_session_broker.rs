@@ -7,6 +7,7 @@ use crate::control_session_protocol;
 use crate::control_session_protocol::Parser;
 use crate::control_session_protocol::ParserSnapshot;
 use crate::control_session_protocol::ProtocolError;
+use crate::control_session_protocol::ProtocolVersion;
 use crate::control_session_protocol::Record;
 use crate::control_session_protocol::RecordType;
 use std::collections::VecDeque;
@@ -96,6 +97,14 @@ pub enum BrokerError {
     SequenceMismatch { expected: u64, actual: u64 },
     #[error("guest acknowledged a session before RESET was emitted")]
     AckBeforeReset,
+    #[error(
+        "receive credit increment {increment} exceeds charged bytes with {available} available of window {window}"
+    )]
+    InvalidCredit {
+        available: u32,
+        increment: u32,
+        window: u32,
+    },
     #[error("output leg {0:?} is backpressured")]
     Backpressure(OutputLegId),
     #[error("control-session epoch overflow")]
@@ -128,6 +137,7 @@ pub struct OutputSnapshot {
 /// or live host-attachment identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerSnapshot {
+    pub protocol_version: u16,
     pub state: u8,
     pub instance_id: [u8; 16],
     pub drain_foreign_instance_records: bool,
@@ -242,8 +252,8 @@ impl OutputLeg {
         }
     }
 
-    fn restore(snapshot: OutputSnapshot) -> Result<Self, BrokerError> {
-        Self::validate_snapshot(&snapshot)?;
+    fn restore(version: ProtocolVersion, snapshot: OutputSnapshot) -> Result<Self, BrokerError> {
+        Self::validate_snapshot(version, &snapshot)?;
         let current = if let Some(current) = snapshot.current {
             Some(EncodedRecord {
                 bytes: current.bytes,
@@ -276,9 +286,12 @@ impl OutputLeg {
         })
     }
 
-    fn validate_snapshot(snapshot: &OutputSnapshot) -> Result<(), BrokerError> {
+    fn validate_snapshot(
+        version: ProtocolVersion,
+        snapshot: &OutputSnapshot,
+    ) -> Result<(), BrokerError> {
         if let Some(current) = &snapshot.current {
-            validate_encoded_output(&current.bytes)?;
+            validate_encoded_output(version, &current.bytes)?;
             if current.offset >= current.bytes.len() {
                 return Err(BrokerError::InvalidSnapshot(
                     "current output offset is out of bounds",
@@ -292,7 +305,7 @@ impl OutputLeg {
         }
         let mut queued_bytes = 0usize;
         for bytes in &snapshot.queued_records {
-            validate_encoded_output(bytes)?;
+            validate_encoded_output(version, bytes)?;
             queued_bytes =
                 queued_bytes
                     .checked_add(bytes.len())
@@ -309,8 +322,8 @@ impl OutputLeg {
     }
 }
 
-fn validate_encoded_output(bytes: &[u8]) -> Result<(), BrokerError> {
-    let record = control_session_protocol::decode_exact(bytes)?;
+fn validate_encoded_output(version: ProtocolVersion, bytes: &[u8]) -> Result<(), BrokerError> {
+    let record = control_session_protocol::decode_exact_for(version, bytes)?;
     if matches!(
         record.record_type,
         RecordType::GuestAttach | RecordType::HostAttach
@@ -324,6 +337,7 @@ fn validate_encoded_output(bytes: &[u8]) -> Result<(), BrokerError> {
 
 /// Pure protocol and reconnect state machine.
 pub struct ControlSessionBroker {
+    protocol_version: ProtocolVersion,
     instance_id: [u8; 16],
     capability: [u8; 32],
     epoch: u64,
@@ -336,6 +350,8 @@ pub struct ControlSessionBroker {
     guest_send_sequence: u64,
     host_receive_sequence: u64,
     host_send_sequence: u64,
+    guest_receive_window: u32,
+    guest_receive_credit: u32,
     host_connected: bool,
     host_authenticated: bool,
     host_rejected: bool,
@@ -347,20 +363,32 @@ pub struct ControlSessionBroker {
 }
 
 impl ControlSessionBroker {
+    #[cfg_attr(not(test), expect(dead_code, reason = "v1 compatibility helper"))]
     pub fn new(instance_id: [u8; 16], capability: [u8; 32]) -> Self {
+        Self::new_with_version(ProtocolVersion::V1, instance_id, capability)
+    }
+
+    pub fn new_with_version(
+        protocol_version: ProtocolVersion,
+        instance_id: [u8; 16],
+        capability: [u8; 32],
+    ) -> Self {
         Self {
+            protocol_version,
             instance_id,
             capability,
             epoch: 1,
             state: BrokerState::AwaitGuestAttach,
-            guest_parser: Parser::new(),
-            host_parser: Parser::new(),
+            guest_parser: Parser::new_for(protocol_version),
+            host_parser: Parser::new_for(protocol_version),
             guest_output: OutputLeg::default(),
             host_output: OutputLeg::default(),
             guest_receive_sequence: 0,
             guest_send_sequence: 0,
             host_receive_sequence: 0,
             host_send_sequence: 0,
+            guest_receive_window: 0,
+            guest_receive_credit: 0,
             host_connected: false,
             host_authenticated: false,
             host_rejected: false,
@@ -376,6 +404,10 @@ impl ControlSessionBroker {
         self.state
     }
 
+    pub fn protocol_version(&self) -> ProtocolVersion {
+        self.protocol_version
+    }
+
     #[cfg_attr(not(test), expect(dead_code, reason = "used by protocol tests"))]
     pub fn instance_id(&self) -> [u8; 16] {
         self.instance_id
@@ -387,6 +419,14 @@ impl ControlSessionBroker {
 
     pub fn counters(&self) -> &BrokerCounters {
         &self.counters
+    }
+
+    pub fn guest_receive_window(&self) -> u32 {
+        self.guest_receive_window
+    }
+
+    pub fn guest_receive_credit(&self) -> u32 {
+        self.guest_receive_credit
     }
 
     pub fn host_is_authenticated(&self) -> bool {
@@ -428,7 +468,7 @@ impl ControlSessionBroker {
     /// credentials. A still-open host transport must be detached separately by
     /// the physical adapter before it can attach again.
     pub fn reset_for_device(&mut self) {
-        *self = Self::new(self.instance_id, self.capability);
+        *self = Self::new_with_version(self.protocol_version, self.instance_id, self.capability);
     }
 
     /// Reserves the single host slot after OS-level identity verification.
@@ -444,7 +484,7 @@ impl ControlSessionBroker {
         self.host_authenticated = false;
         self.host_rejected = false;
         self.host_bound_epoch = 0;
-        self.host_parser = Parser::new();
+        self.host_parser = Parser::new_for(self.protocol_version);
         self.host_output.clear();
         self.pending_host_record = None;
         self.host_receive_sequence = 0;
@@ -572,7 +612,7 @@ impl ControlSessionBroker {
         self.host_authenticated = false;
         self.host_rejected = false;
         self.host_bound_epoch = 0;
-        self.host_parser = Parser::new();
+        self.host_parser = Parser::new_for(self.protocol_version);
         self.host_output.clear();
         self.pending_host_record = None;
         self.host_receive_sequence = 0;
@@ -592,6 +632,8 @@ impl ControlSessionBroker {
         self.pending_guest_record = None;
         self.guest_receive_sequence = 0;
         self.guest_send_sequence = 0;
+        self.guest_receive_window = 0;
+        self.guest_receive_credit = 0;
         self.enqueue_guest_control(RecordType::Reset)?;
         Ok(())
     }
@@ -614,7 +656,12 @@ impl ControlSessionBroker {
                     .current
                     .as_ref()
                     .filter(|current| current.bytes.len() - current.offset == count)
-                    .map(|current| control_session_protocol::decode_exact(&current.bytes))
+                    .map(|current| {
+                        control_session_protocol::decode_exact_for(
+                            self.protocol_version,
+                            &current.bytes,
+                        )
+                    })
                     .transpose()?
                     .is_some_and(|record| {
                         record.record_type == RecordType::Reset
@@ -642,6 +689,7 @@ impl ControlSessionBroker {
             guest_output.current = None;
         }
         BrokerSnapshot {
+            protocol_version: self.protocol_version as u16,
             state: self.state as u8,
             instance_id: self.instance_id,
             drain_foreign_instance_records: self.drain_foreign_instance_records,
@@ -661,15 +709,30 @@ impl ControlSessionBroker {
 
     /// Restores only physical guest alignment state, then starts a fresh
     /// instance at epoch one and queues RESET.
+    #[cfg_attr(not(test), expect(dead_code, reason = "v1 compatibility helper"))]
     pub fn restore(
         snapshot: BrokerSnapshot,
         new_instance_id: [u8; 16],
         new_capability: [u8; 32],
     ) -> Result<Self, BrokerError> {
-        Self::validate_restore(&snapshot, new_instance_id)?;
-        let guest_parser = Parser::restore(snapshot.guest_parser)?;
-        let mut saved_guest_output = OutputLeg::restore(snapshot.guest_output)?;
-        let _saved_host_output = OutputLeg::restore(snapshot.host_output)?;
+        Self::restore_with_version(
+            ProtocolVersion::V1,
+            snapshot,
+            new_instance_id,
+            new_capability,
+        )
+    }
+
+    pub fn restore_with_version(
+        protocol_version: ProtocolVersion,
+        snapshot: BrokerSnapshot,
+        new_instance_id: [u8; 16],
+        new_capability: [u8; 32],
+    ) -> Result<Self, BrokerError> {
+        Self::validate_restore_with_version(&snapshot, new_instance_id, protocol_version)?;
+        let guest_parser = Parser::restore_for(protocol_version, snapshot.guest_parser)?;
+        let mut saved_guest_output = OutputLeg::restore(protocol_version, snapshot.guest_output)?;
+        let _saved_host_output = OutputLeg::restore(protocol_version, snapshot.host_output)?;
 
         saved_guest_output.queue.clear();
         saved_guest_output.queued_bytes = 0;
@@ -681,7 +744,7 @@ impl ControlSessionBroker {
             saved_guest_output.current = None;
         }
 
-        let mut broker = Self::new(new_instance_id, new_capability);
+        let mut broker = Self::new_with_version(protocol_version, new_instance_id, new_capability);
         broker.state = BrokerState::ResetPending;
         broker.guest_parser = guest_parser;
         broker.guest_output = saved_guest_output;
@@ -691,12 +754,17 @@ impl ControlSessionBroker {
         Ok(broker)
     }
 
-    /// Validates snapshot state against the fresh destination identity.
-    pub fn validate_restore(
+    pub fn validate_restore_with_version(
         snapshot: &BrokerSnapshot,
         new_instance_id: [u8; 16],
+        protocol_version: ProtocolVersion,
     ) -> Result<(), BrokerError> {
         Self::validate_snapshot(snapshot)?;
+        if snapshot.protocol_version != protocol_version as u16 {
+            return Err(BrokerError::InvalidSnapshot(
+                "saved protocol version does not match the configured broker",
+            ));
+        }
         if new_instance_id == [0; 16] {
             return Err(BrokerError::InvalidSnapshot("instance ID is zero"));
         }
@@ -708,7 +776,8 @@ impl ControlSessionBroker {
         if let Some(current) = &snapshot.guest_output.current
             && current.offset != 0
         {
-            let record = control_session_protocol::decode_exact(&current.bytes)?;
+            let record =
+                control_session_protocol::decode_exact_for(protocol_version, &current.bytes)?;
             if record.instance_id == [0; 16] || record.instance_id == new_instance_id {
                 return Err(BrokerError::InvalidSnapshot(
                     "partial guest output does not belong to an old instance",
@@ -721,6 +790,7 @@ impl ControlSessionBroker {
     /// Validates all snapshot bounds and encoded values without constructing a
     /// broker or allocating output queues.
     pub fn validate_snapshot(snapshot: &BrokerSnapshot) -> Result<(), BrokerError> {
+        let protocol_version = ProtocolVersion::try_from(snapshot.protocol_version)?;
         let _saved_state = BrokerState::from_snapshot(snapshot.state)?;
         if snapshot.epoch == 0 {
             return Err(BrokerError::InvalidSnapshot("saved epoch is zero"));
@@ -728,11 +798,11 @@ impl ControlSessionBroker {
         if snapshot.instance_id == [0; 16] {
             return Err(BrokerError::InvalidSnapshot("instance ID is zero"));
         }
-        validate_pending(snapshot.pending_guest_record.as_ref())?;
-        validate_pending(snapshot.pending_host_record.as_ref())?;
-        Parser::validate_snapshot(&snapshot.guest_parser)?;
-        OutputLeg::validate_snapshot(&snapshot.guest_output)?;
-        OutputLeg::validate_snapshot(&snapshot.host_output)?;
+        validate_pending(protocol_version, snapshot.pending_guest_record.as_ref())?;
+        validate_pending(protocol_version, snapshot.pending_host_record.as_ref())?;
+        Parser::validate_snapshot_for(protocol_version, &snapshot.guest_parser)?;
+        OutputLeg::validate_snapshot(protocol_version, &snapshot.guest_output)?;
+        OutputLeg::validate_snapshot(protocol_version, &snapshot.host_output)?;
         Ok(())
     }
 
@@ -769,6 +839,33 @@ impl ControlSessionBroker {
                     increment(&mut self.counters.ack_errors);
                     return self.illegal(record.record_type);
                 }
+                if record.record_type == RecordType::Credit {
+                    self.validate_current_guest_record(&record)?;
+                    let credit_increment =
+                        control_session_protocol::decode_credit_payload(&record.payload)?;
+                    let Some(available) = self.guest_receive_credit.checked_add(credit_increment)
+                    else {
+                        increment(&mut self.counters.protocol_errors);
+                        return Err(BrokerError::InvalidCredit {
+                            available: self.guest_receive_credit,
+                            increment: credit_increment,
+                            window: self.guest_receive_window,
+                        });
+                    };
+                    if available > self.guest_receive_window {
+                        increment(&mut self.counters.protocol_errors);
+                        return Err(BrokerError::InvalidCredit {
+                            available: self.guest_receive_credit,
+                            increment: credit_increment,
+                            window: self.guest_receive_window,
+                        });
+                    }
+                    let next_guest_receive =
+                        checked_next_sequence(self.guest_receive_sequence, &mut self.state)?;
+                    self.guest_receive_credit = available;
+                    self.guest_receive_sequence = next_guest_receive;
+                    return Ok(());
+                }
                 if record.record_type != RecordType::Data {
                     return self.illegal(record.record_type);
                 }
@@ -778,9 +875,13 @@ impl ControlSessionBroker {
                     increment(&mut self.counters.backpressure_errors);
                     return Err(BrokerError::Backpressure(OutputLegId::Host));
                 }
+                let next_guest_receive =
+                    checked_next_sequence(self.guest_receive_sequence, &mut self.state)?;
+                let next_host_send =
+                    checked_next_sequence(self.host_send_sequence, &mut self.state)?;
                 self.host_output.enqueue(encoded)?;
-                self.advance_guest_receive_sequence()?;
-                self.advance_host_send_sequence()?;
+                self.guest_receive_sequence = next_guest_receive;
+                self.host_send_sequence = next_host_send;
                 Ok(())
             }
             BrokerState::Failed => Err(BrokerError::Failed),
@@ -821,14 +922,24 @@ impl ControlSessionBroker {
                 actual: record.sequence,
             });
         }
-        self.advance_guest_receive_sequence()?;
-        self.drain_foreign_instance_records = false;
+        let initial_credit = match self.protocol_version {
+            ProtocolVersion::V1 => 0,
+            ProtocolVersion::V2 => {
+                control_session_protocol::decode_credit_payload(&record.payload)?
+            }
+        };
+        let next_guest_receive =
+            checked_next_sequence(self.guest_receive_sequence, &mut self.state)?;
         if self.host_authenticated {
             self.enqueue_host_control(RecordType::Ready, Vec::new())?;
             self.state = BrokerState::Active;
         } else {
             self.state = BrokerState::ReadyNoHost;
         }
+        self.guest_receive_sequence = next_guest_receive;
+        self.guest_receive_window = initial_credit;
+        self.guest_receive_credit = initial_credit;
+        self.drain_foreign_instance_records = false;
         Ok(())
     }
 
@@ -888,14 +999,25 @@ impl ControlSessionBroker {
                 actual: record.sequence,
             });
         }
+        let payload_len =
+            u32::try_from(record.payload.len()).map_err(|_| ProtocolError::LengthOverflow)?;
+        if self.protocol_version == ProtocolVersion::V2 && payload_len > self.guest_receive_credit {
+            increment(&mut self.counters.backpressure_errors);
+            return Err(BrokerError::Backpressure(OutputLegId::Guest));
+        }
         let encoded = self.make_guest_data(&record.payload)?;
         if !self.guest_output.can_enqueue(encoded.len()) {
             increment(&mut self.counters.backpressure_errors);
             return Err(BrokerError::Backpressure(OutputLegId::Guest));
         }
+        let next_host_receive = checked_next_sequence(self.host_receive_sequence, &mut self.state)?;
+        let next_guest_send = checked_next_sequence(self.guest_send_sequence, &mut self.state)?;
         self.guest_output.enqueue(encoded)?;
-        self.advance_host_receive_sequence()?;
-        self.advance_guest_send_sequence()?;
+        if self.protocol_version == ProtocolVersion::V2 {
+            self.guest_receive_credit -= payload_len;
+        }
+        self.host_receive_sequence = next_host_receive;
+        self.guest_send_sequence = next_guest_send;
         Ok(())
     }
 
@@ -929,13 +1051,15 @@ impl ControlSessionBroker {
             self.guest_send_sequence,
             Vec::new(),
         );
-        let encoded = control_session_protocol::encode(&record)?;
+        let encoded = control_session_protocol::encode_for(self.protocol_version, &record)?;
         if !self.guest_output.can_enqueue(encoded.len()) {
             increment(&mut self.counters.backpressure_errors);
             return Err(BrokerError::Backpressure(OutputLegId::Guest));
         }
+        let next_guest_send = checked_next_sequence(self.guest_send_sequence, &mut self.state)?;
         self.guest_output.enqueue(encoded)?;
-        self.advance_guest_send_sequence()
+        self.guest_send_sequence = next_guest_send;
+        Ok(())
     }
 
     fn enqueue_host_control(
@@ -950,49 +1074,41 @@ impl ControlSessionBroker {
             self.host_send_sequence,
             payload,
         );
-        let encoded = control_session_protocol::encode(&record)?;
+        let encoded = control_session_protocol::encode_for(self.protocol_version, &record)?;
         if !self.host_output.can_enqueue(encoded.len()) {
             increment(&mut self.counters.backpressure_errors);
             return Err(BrokerError::Backpressure(OutputLegId::Host));
         }
+        let next_host_send = checked_next_sequence(self.host_send_sequence, &mut self.state)?;
         self.host_output.enqueue(encoded)?;
-        self.advance_host_send_sequence()
+        self.host_send_sequence = next_host_send;
+        Ok(())
     }
 
     fn make_guest_data(&self, payload: &[u8]) -> Result<Vec<u8>, BrokerError> {
-        Ok(control_session_protocol::encode(&Record::session(
-            RecordType::Data,
-            self.instance_id,
-            self.epoch,
-            self.guest_send_sequence,
-            payload.to_vec(),
-        ))?)
+        Ok(control_session_protocol::encode_for(
+            self.protocol_version,
+            &Record::session(
+                RecordType::Data,
+                self.instance_id,
+                self.epoch,
+                self.guest_send_sequence,
+                payload.to_vec(),
+            ),
+        )?)
     }
 
     fn make_host_data(&self, payload: &[u8]) -> Result<Vec<u8>, BrokerError> {
-        Ok(control_session_protocol::encode(&Record::session(
-            RecordType::Data,
-            self.instance_id,
-            self.epoch,
-            self.host_send_sequence,
-            payload.to_vec(),
-        ))?)
-    }
-
-    fn advance_guest_receive_sequence(&mut self) -> Result<(), BrokerError> {
-        advance_sequence(&mut self.guest_receive_sequence, &mut self.state)
-    }
-
-    fn advance_guest_send_sequence(&mut self) -> Result<(), BrokerError> {
-        advance_sequence(&mut self.guest_send_sequence, &mut self.state)
-    }
-
-    fn advance_host_receive_sequence(&mut self) -> Result<(), BrokerError> {
-        advance_sequence(&mut self.host_receive_sequence, &mut self.state)
-    }
-
-    fn advance_host_send_sequence(&mut self) -> Result<(), BrokerError> {
-        advance_sequence(&mut self.host_send_sequence, &mut self.state)
+        Ok(control_session_protocol::encode_for(
+            self.protocol_version,
+            &Record::session(
+                RecordType::Data,
+                self.instance_id,
+                self.epoch,
+                self.host_send_sequence,
+                payload.to_vec(),
+            ),
+        )?)
     }
 
     fn illegal<T>(&mut self, record_type: RecordType) -> Result<T, BrokerError> {
@@ -1018,20 +1134,19 @@ impl ControlSessionBroker {
     }
 }
 
-fn validate_pending(record: Option<&Record>) -> Result<(), BrokerError> {
+fn validate_pending(version: ProtocolVersion, record: Option<&Record>) -> Result<(), BrokerError> {
     if let Some(record) = record {
-        control_session_protocol::encode(record)?;
+        control_session_protocol::encode_for(version, record)?;
     }
     Ok(())
 }
 
-fn advance_sequence(sequence: &mut u64, state: &mut BrokerState) -> Result<(), BrokerError> {
+fn checked_next_sequence(sequence: u64, state: &mut BrokerState) -> Result<u64, BrokerError> {
     let Some(next) = sequence.checked_add(1) else {
         *state = BrokerState::Failed;
         return Err(BrokerError::SequenceOverflow);
     };
-    *sequence = next;
-    Ok(())
+    Ok(next)
 }
 
 fn increment(counter: &mut u64) {
@@ -1059,7 +1174,7 @@ mod tests {
         broker: &mut ControlSessionBroker,
         record: &Record,
     ) -> Result<InputProgress, BrokerError> {
-        let bytes = control_session_protocol::encode(record)?;
+        let bytes = control_session_protocol::encode_for(broker.protocol_version(), record)?;
         broker.accept_guest_input(&bytes)
     }
 
@@ -1067,7 +1182,7 @@ mod tests {
         broker: &mut ControlSessionBroker,
         record: &Record,
     ) -> Result<InputProgress, BrokerError> {
-        let bytes = control_session_protocol::encode(record)?;
+        let bytes = control_session_protocol::encode_for(broker.protocol_version(), record)?;
         broker.accept_host_input(&bytes)
     }
 
@@ -1081,16 +1196,27 @@ mod tests {
             .ok_or(BrokerError::InvalidOutputProgress)?
             .to_vec();
         broker.advance_output(leg, bytes.len())?;
-        Ok(control_session_protocol::decode_exact(&bytes)?)
+        Ok(control_session_protocol::decode_exact_for(
+            broker.protocol_version(),
+            &bytes,
+        )?)
     }
 
     fn ack(broker: &ControlSessionBroker) -> Record {
+        ack_with_credit(broker, control_session_protocol::MIN_RECEIVE_CREDIT)
+    }
+
+    fn ack_with_credit(broker: &ControlSessionBroker, credit: u32) -> Record {
+        let payload = match broker.protocol_version() {
+            ProtocolVersion::V1 => Vec::new(),
+            ProtocolVersion::V2 => control_session_protocol::credit_payload(credit),
+        };
         Record::session(
             RecordType::Ack,
             broker.instance_id(),
             broker.epoch(),
             0,
-            Vec::new(),
+            payload,
         )
     }
 
@@ -1105,6 +1231,32 @@ mod tests {
             RecordType::Reset
         );
         let guest_ack = ack(&broker);
+        feed_guest(&mut broker, &guest_ack)?;
+        broker.begin_host_attachment()?;
+        feed_host(
+            &mut broker,
+            &Record::bootstrap(RecordType::HostAttach, CAPABILITY.to_vec()),
+        )?;
+        assert_eq!(
+            drain_record(&mut broker, OutputLegId::Host)?.record_type,
+            RecordType::Ready
+        );
+        assert_eq!(broker.state(), BrokerState::Active);
+        Ok(broker)
+    }
+
+    fn make_active_v2(window: u32) -> Result<ControlSessionBroker, BrokerError> {
+        let mut broker =
+            ControlSessionBroker::new_with_version(ProtocolVersion::V2, INSTANCE, CAPABILITY);
+        feed_guest(
+            &mut broker,
+            &Record::bootstrap(RecordType::GuestAttach, Vec::new()),
+        )?;
+        assert_eq!(
+            drain_record(&mut broker, OutputLegId::Guest)?.record_type,
+            RecordType::Reset
+        );
+        let guest_ack = ack_with_credit(&broker, window);
         feed_guest(&mut broker, &guest_ack)?;
         broker.begin_host_attachment()?;
         feed_host(
@@ -1386,6 +1538,361 @@ mod tests {
     }
 
     #[test]
+    fn v2_credit_gates_complete_records_and_releases_atomically() -> Result<(), BrokerError> {
+        let mut broker = make_active_v2(control_session_protocol::MIN_RECEIVE_CREDIT)?;
+        let first_payload = vec![0x5a; control_session_protocol::MAX_DATA_LEN];
+        feed_host(
+            &mut broker,
+            &Record::session(RecordType::Data, INSTANCE, 1, 0, first_payload.clone()),
+        )?;
+        assert_eq!(broker.guest_receive_credit(), 0);
+        assert_eq!(
+            feed_host(
+                &mut broker,
+                &Record::session(RecordType::Data, INSTANCE, 1, 1, vec![0x44])
+            )?
+            .status,
+            InputStatus::Backpressured
+        );
+        assert_eq!(
+            drain_record(&mut broker, OutputLegId::Guest)?.payload,
+            first_payload
+        );
+        assert_eq!(
+            broker.accept_host_input(&[])?.status,
+            InputStatus::Backpressured
+        );
+
+        feed_guest(
+            &mut broker,
+            &Record::session(
+                RecordType::Credit,
+                INSTANCE,
+                1,
+                1,
+                control_session_protocol::credit_payload(1),
+            ),
+        )?;
+        assert_eq!(
+            broker.accept_host_input(&[])?.status,
+            InputStatus::RecordAccepted
+        );
+        assert_eq!(broker.guest_receive_credit(), 0);
+        assert_eq!(
+            drain_record(&mut broker, OutputLegId::Guest)?.payload,
+            vec![0x44]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v2_queue_backpressure_does_not_spend_pending_record_credit() -> Result<(), BrokerError> {
+        let mut broker = make_active_v2(control_session_protocol::MAX_RECEIVE_CREDIT)?;
+        let payload = vec![0x5a; control_session_protocol::MAX_DATA_LEN];
+        let mut accepted = 0u32;
+        loop {
+            let progress = feed_host(
+                &mut broker,
+                &Record::session(
+                    RecordType::Data,
+                    INSTANCE,
+                    1,
+                    accepted as u64,
+                    payload.clone(),
+                ),
+            )?;
+            if progress.status == InputStatus::Backpressured {
+                break;
+            }
+            accepted += 1;
+        }
+        let credit_before_retry = broker.guest_receive_credit();
+        assert_eq!(
+            credit_before_retry,
+            control_session_protocol::MAX_RECEIVE_CREDIT
+                - accepted * control_session_protocol::MIN_RECEIVE_CREDIT
+        );
+        assert_eq!(
+            broker.accept_host_input(&[])?.status,
+            InputStatus::Backpressured
+        );
+        assert_eq!(broker.guest_receive_credit(), credit_before_retry);
+
+        let _ = drain_record(&mut broker, OutputLegId::Guest)?;
+        assert_eq!(
+            broker.accept_host_input(&[])?.status,
+            InputStatus::RecordAccepted
+        );
+        assert_eq!(
+            broker.guest_receive_credit(),
+            credit_before_retry - control_session_protocol::MIN_RECEIVE_CREDIT
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v2_invalid_duplicate_and_overflowing_credits_do_not_mint_capacity() -> Result<(), BrokerError>
+    {
+        let mut broker = make_active_v2(control_session_protocol::MIN_RECEIVE_CREDIT)?;
+        let credit = Record::session(
+            RecordType::Credit,
+            INSTANCE,
+            1,
+            1,
+            control_session_protocol::credit_payload(1),
+        );
+        assert!(matches!(
+            feed_guest(&mut broker, &credit),
+            Err(BrokerError::InvalidCredit { .. })
+        ));
+        feed_host(
+            &mut broker,
+            &Record::session(
+                RecordType::Data,
+                INSTANCE,
+                1,
+                0,
+                vec![0; control_session_protocol::MAX_DATA_LEN],
+            ),
+        )?;
+        feed_guest(&mut broker, &credit)?;
+        assert_eq!(broker.guest_receive_credit(), 1);
+        assert!(matches!(
+            feed_guest(&mut broker, &credit),
+            Err(BrokerError::SequenceMismatch { .. })
+        ));
+        assert_eq!(broker.guest_receive_credit(), 1);
+
+        assert!(matches!(
+            feed_guest(
+                &mut broker,
+                &Record::session(
+                    RecordType::Credit,
+                    INSTANCE,
+                    2,
+                    2,
+                    control_session_protocol::credit_payload(1),
+                )
+            ),
+            Err(BrokerError::EpochMismatch { .. })
+        ));
+        assert_eq!(broker.guest_receive_credit(), 1);
+
+        broker.guest_receive_sequence = u64::MAX;
+        let before = broker.guest_receive_credit();
+        assert_eq!(
+            feed_guest(
+                &mut broker,
+                &Record::session(
+                    RecordType::Credit,
+                    INSTANCE,
+                    1,
+                    u64::MAX,
+                    control_session_protocol::credit_payload(1),
+                )
+            ),
+            Err(BrokerError::SequenceOverflow)
+        );
+        assert_eq!(broker.guest_receive_credit(), before);
+        Ok(())
+    }
+
+    #[test]
+    fn v2_zero_credit_does_not_block_disconnect_or_fresh_ack() -> Result<(), BrokerError> {
+        let mut broker = make_active_v2(control_session_protocol::MIN_RECEIVE_CREDIT)?;
+        feed_host(
+            &mut broker,
+            &Record::session(
+                RecordType::Data,
+                INSTANCE,
+                1,
+                0,
+                vec![0x6a; control_session_protocol::MAX_DATA_LEN],
+            ),
+        )?;
+        let _ = drain_record(&mut broker, OutputLegId::Guest)?;
+        assert_eq!(
+            feed_host(
+                &mut broker,
+                &Record::session(RecordType::Data, INSTANCE, 1, 1, vec![1])
+            )?
+            .status,
+            InputStatus::Backpressured
+        );
+
+        broker.host_disconnected()?;
+        assert!(!broker.has_pending_host_record());
+        assert_eq!(
+            (broker.guest_receive_window(), broker.guest_receive_credit()),
+            (0, 0)
+        );
+        feed_guest(
+            &mut broker,
+            &Record::session(
+                RecordType::Credit,
+                INSTANCE,
+                1,
+                1,
+                control_session_protocol::credit_payload(
+                    control_session_protocol::MIN_RECEIVE_CREDIT,
+                ),
+            ),
+        )?;
+        assert_eq!(
+            (broker.guest_receive_window(), broker.guest_receive_credit()),
+            (0, 0)
+        );
+        assert_eq!(
+            drain_record(&mut broker, OutputLegId::Guest)?.record_type,
+            RecordType::Reset
+        );
+
+        broker.begin_host_attachment()?;
+        feed_host(
+            &mut broker,
+            &Record::bootstrap(RecordType::HostAttach, CAPABILITY.to_vec()),
+        )?;
+        assert_eq!(
+            drain_record(&mut broker, OutputLegId::Host)?.record_type,
+            RecordType::Wait
+        );
+        feed_guest(
+            &mut broker,
+            &Record::session(
+                RecordType::Ack,
+                INSTANCE,
+                2,
+                0,
+                control_session_protocol::credit_payload(
+                    control_session_protocol::MIN_RECEIVE_CREDIT,
+                ),
+            ),
+        )?;
+        assert_eq!(broker.state(), BrokerState::Active);
+        assert_eq!(
+            broker.guest_receive_credit(),
+            control_session_protocol::MIN_RECEIVE_CREDIT
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v2_disconnect_preserves_each_started_record_prefix_only() -> Result<(), BrokerError> {
+        let payload = b"body-with-NVXS".to_vec();
+        for split in 0..control_session_protocol::HEADER_LEN + payload.len() {
+            let mut broker = make_active_v2(control_session_protocol::MIN_RECEIVE_CREDIT)?;
+            feed_host(
+                &mut broker,
+                &Record::session(RecordType::Data, INSTANCE, 1, 0, payload.clone()),
+            )?;
+            feed_host(
+                &mut broker,
+                &Record::session(RecordType::Data, INSTANCE, 1, 1, b"drop".to_vec()),
+            )?;
+            assert!(broker.begin_output(OutputLegId::Guest));
+            let encoded = broker
+                .peek_output(OutputLegId::Guest, usize::MAX)
+                .ok_or(BrokerError::InvalidOutputProgress)?
+                .to_vec();
+            broker.advance_output(OutputLegId::Guest, split)?;
+            broker.host_disconnected()?;
+            if split != 0 {
+                assert_eq!(
+                    broker
+                        .peek_output(OutputLegId::Guest, usize::MAX)
+                        .ok_or(BrokerError::InvalidOutputProgress)?,
+                    &encoded[split..]
+                );
+                broker.advance_output(OutputLegId::Guest, encoded.len() - split)?;
+            }
+            assert_eq!(
+                drain_record(&mut broker, OutputLegId::Guest)?.record_type,
+                RecordType::Reset
+            );
+            assert!(!broker.begin_output(OutputLegId::Guest));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn v2_reverse_backpressure_cannot_block_disconnect_recovery() -> Result<(), BrokerError> {
+        let mut broker = make_active_v2(control_session_protocol::MIN_RECEIVE_CREDIT)?;
+        let payload = vec![0x5a; control_session_protocol::MAX_DATA_LEN];
+        let mut sequence = 1;
+        loop {
+            let progress = feed_guest(
+                &mut broker,
+                &Record::session(RecordType::Data, INSTANCE, 1, sequence, payload.clone()),
+            )?;
+            if progress.status == InputStatus::Backpressured {
+                break;
+            }
+            sequence += 1;
+        }
+        assert!(broker.has_pending_guest_record());
+        broker.host_disconnected()?;
+        assert!(!broker.has_pending_guest_record());
+        assert_eq!(broker.output_record_count(OutputLegId::Host), 0);
+        assert_eq!(
+            drain_record(&mut broker, OutputLegId::Guest)?.record_type,
+            RecordType::Reset
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v2_streams_maximum_ttrpc_message_with_bounded_credit() -> Result<(), BrokerError> {
+        let mut broker = make_active_v2(control_session_protocol::MIN_RECEIVE_CREDIT)?;
+        let mut remaining = control_session_protocol::MAX_RECEIVE_CREDIT as usize;
+        let mut host_sequence = 0;
+        let mut guest_sequence = 1;
+        let mut offset = 0usize;
+        while remaining != 0 {
+            let length = remaining.min(control_session_protocol::MAX_DATA_LEN);
+            let payload = (offset..offset + length)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+            feed_host(
+                &mut broker,
+                &Record::session(
+                    RecordType::Data,
+                    INSTANCE,
+                    1,
+                    host_sequence,
+                    payload.clone(),
+                ),
+            )?;
+            assert_eq!(
+                drain_record(&mut broker, OutputLegId::Guest)?.payload,
+                payload
+            );
+            feed_guest(
+                &mut broker,
+                &Record::session(
+                    RecordType::Credit,
+                    INSTANCE,
+                    1,
+                    guest_sequence,
+                    control_session_protocol::credit_payload(length as u32),
+                ),
+            )?;
+            host_sequence += 1;
+            guest_sequence += 1;
+            offset += length;
+            remaining -= length;
+        }
+        assert_eq!(
+            offset,
+            control_session_protocol::MAX_RECEIVE_CREDIT as usize
+        );
+        assert_eq!(
+            broker.guest_receive_credit(),
+            control_session_protocol::MIN_RECEIVE_CREDIT
+        );
+        Ok(())
+    }
+
+    #[test]
     fn epoch_overflow_fails_closed() -> Result<(), BrokerError> {
         let mut broker = make_active()?;
         broker.epoch = u64::MAX;
@@ -1444,6 +1951,69 @@ mod tests {
                 &Record::session(RecordType::Data, INSTANCE, 1, 4, vec![1])
             )
             .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v2_restore_keeps_alignment_but_requires_fresh_credit() -> Result<(), BrokerError> {
+        let mut broker = make_active_v2(control_session_protocol::MIN_RECEIVE_CREDIT)?;
+        feed_host(
+            &mut broker,
+            &Record::session(
+                RecordType::Data,
+                INSTANCE,
+                1,
+                0,
+                b"partially-emitted-v2".to_vec(),
+            ),
+        )?;
+        assert!(broker.begin_output(OutputLegId::Guest));
+        broker.advance_output(OutputLegId::Guest, 7)?;
+        assert!(broker.guest_receive_credit() < control_session_protocol::MIN_RECEIVE_CREDIT);
+
+        let snapshot = broker.snapshot();
+        let new_instance = [0x77; 16];
+        assert!(ControlSessionBroker::restore(snapshot.clone(), new_instance, [0x88; 32]).is_err());
+        let mut restored = ControlSessionBroker::restore_with_version(
+            ProtocolVersion::V2,
+            snapshot,
+            new_instance,
+            [0x88; 32],
+        )?;
+        assert_eq!(restored.protocol_version(), ProtocolVersion::V2);
+        assert_eq!(
+            (
+                restored.guest_receive_window(),
+                restored.guest_receive_credit()
+            ),
+            (0, 0)
+        );
+
+        let remainder = restored
+            .peek_output(OutputLegId::Guest, usize::MAX)
+            .ok_or(BrokerError::InvalidOutputProgress)?
+            .len();
+        restored.advance_output(OutputLegId::Guest, remainder)?;
+        assert_eq!(
+            drain_record(&mut restored, OutputLegId::Guest)?.record_type,
+            RecordType::Reset
+        );
+        feed_guest(
+            &mut restored,
+            &Record::session(
+                RecordType::Ack,
+                new_instance,
+                1,
+                0,
+                control_session_protocol::credit_payload(
+                    control_session_protocol::MIN_RECEIVE_CREDIT,
+                ),
+            ),
+        )?;
+        assert_eq!(
+            restored.guest_receive_credit(),
+            control_session_protocol::MIN_RECEIVE_CREDIT
         );
         Ok(())
     }

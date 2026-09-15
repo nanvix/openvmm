@@ -917,12 +917,18 @@ fn microvm_control_broker_config(
     #[cfg(not(target_os = "linux"))]
     let expected_peer_identity = serial_core::LocalPeerIdentity::Unsupported;
 
+    let protocol_version = match opt.microvm_control_protocol_version {
+        1 => virtio_resources::console::VirtioControlConsoleProtocolVersion::V1,
+        2 => virtio_resources::console::VirtioControlConsoleProtocolVersion::V2,
+        version => anyhow::bail!("unsupported control-console protocol version {version}"),
+    };
     Ok(
         virtio_resources::console::VirtioControlConsoleBrokerConfig {
             instance_id: random_nonzero_bytes("control-console instance ID")?,
             capability,
             expected_peer_identity,
             auth_timeout_ms: opt.microvm_control_auth_timeout_ms,
+            protocol_version,
         },
     )
 }
@@ -1703,6 +1709,31 @@ mod microvm_console_attachment_tests {
         assert_ne!(first.instance_id, second.instance_id);
         assert_ne!(first.capability, [0; 32]);
         assert_ne!(second.capability, [0; 32]);
+        assert_eq!(
+            first.protocol_version,
+            virtio_resources::console::VirtioControlConsoleProtocolVersion::V1
+        );
+    }
+
+    #[test]
+    fn control_console_protocol_v2_requires_explicit_selection() {
+        let options = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--virtio-console",
+            "none",
+            "--microvm-control-console",
+            "none",
+            "--microvm-control-protocol-version",
+            "2",
+        ])
+        .unwrap();
+        let config = microvm_control_broker_config(&options, &SerialConfigCli::None).unwrap();
+        assert_eq!(
+            config.protocol_version,
+            virtio_resources::console::VirtioControlConsoleProtocolVersion::V2
+        );
     }
 
     #[test]
@@ -2387,6 +2418,10 @@ async fn vm_config_from_command_line(
     } else {
         None
     };
+    anyhow::ensure!(
+        microvm_control_console.is_some() || opt.microvm_control_protocol_version == 1,
+        "--microvm-control-protocol-version requires a control console"
+    );
     opt.validate_control_stdin_console(microvm_console.as_ref().map(|(config, _, _)| config))?;
     let microvm_control_broker_config = microvm_control_console
         .as_ref()

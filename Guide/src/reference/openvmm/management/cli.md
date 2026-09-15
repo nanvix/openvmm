@@ -617,6 +617,14 @@ Serial devices can be configured to appear as different devices inside the guest
   A stalled or failed authentication attempt closes the connection without a
   protocol Error record and without changing the broker epoch.
 
+  The hidden `--microvm-control-protocol-version <1|2>` option selects the
+  exact outer wire contract and defaults to version 1. Version 2 adds
+  byte-counted guest receive credits so host DATA is backpressured before the
+  guest's bounded ingress storage is exhausted. Both the guest and host codec
+  must use the selected version; OpenVMM does not negotiate or downgrade it.
+  Restore must select the same version recorded by the saved broker state.
+  See [Control-session Protocol](./control_session_protocol.md).
+
   `none` does not consume stdin and rejects `--microvm-control-auth-stdin`.
   OpenVMM generates an unreachable
   random capability so disconnected process tests remain supported. Secure
