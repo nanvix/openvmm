@@ -2040,6 +2040,9 @@ impl VmService {
                 microvm_filesystem_slot,
                 config.microvm_filesystem.as_ref(),
                 has_console,
+                config.virtio_devices.iter().any(|(_, device)| {
+                    device.id() == openvmm_defs::config::MICROVM_VIRTIO_CONTROL_CONSOLE_ID
+                }),
                 &config.microvm_sandbox_blocks,
             )?;
         }
