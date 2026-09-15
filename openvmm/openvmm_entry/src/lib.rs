@@ -11,6 +11,7 @@ mod cli_args;
 mod crash_dump;
 mod kvp;
 mod meshworker;
+mod microvm_output;
 mod pidfile;
 mod repl;
 mod serial_io;
@@ -95,7 +96,6 @@ use openvmm_defs::config::VpAssignment;
 use openvmm_defs::config::VpciDeviceConfig;
 use openvmm_defs::config::Vtl2BaseAddressType;
 use openvmm_defs::config::Vtl2Config;
-#[cfg(test)]
 use openvmm_defs::config::build_microvm_command_line;
 use openvmm_defs::config::build_microvm_control_command_line;
 use openvmm_defs::rpc::VmRpc;
@@ -200,6 +200,7 @@ struct VmResources {
     console_in: Option<Box<dyn AsyncWrite + Send + Unpin>>,
     /// Keeps the dedicated serial reactor alive while serial I/O objects exist.
     serial_driver: Option<DefaultDriver>,
+    microvm_output_drain: Option<microvm_output::MicrovmOutputDrain>,
     framebuffer_access: Option<FramebufferAccess>,
     shutdown_ic: Option<mesh::Sender<hyperv_ic_resources::shutdown::ShutdownRpc>>,
     kvp_ic: Option<mesh::Sender<hyperv_ic_resources::kvp::KvpConnectRpc>>,
@@ -925,6 +926,18 @@ fn microvm_control_broker_config(
             auth_timeout_ms: opt.microvm_control_auth_timeout_ms,
         },
     )
+}
+
+fn build_effective_microvm_command_line(
+    user_args: &[String],
+    has_console: bool,
+    has_control_console: bool,
+) -> anyhow::Result<String> {
+    if has_control_console {
+        build_microvm_control_command_line(user_args, has_console)
+    } else {
+        build_microvm_command_line(user_args, has_console)
+    }
 }
 
 fn microvm_network_attachment() -> openvmm_helpers::snapshot::SnapshotAttachment {
@@ -1706,6 +1719,19 @@ mod microvm_console_attachment_tests {
     }
 
     #[test]
+    fn boot_only_command_line_preserves_control_free_arguments() {
+        let user_args = [
+            r#"note="left right""#.to_owned(),
+            "--".to_owned(),
+            "driver_async_probe=virtio_mmio".to_owned(),
+            "nvx_control_tty=hvc9".to_owned(),
+            "virtio-mmio.device=0x1000@0xc0000000:1".to_owned(),
+        ];
+        assert!(build_effective_microvm_command_line(&user_args, true, false).is_ok());
+        assert!(build_effective_microvm_command_line(&user_args, true, true).is_err());
+    }
+
+    #[test]
     fn snapshot_downtime_accepts_supported_elapsed_time() {
         let capture = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1);
 
@@ -2264,6 +2290,7 @@ async fn vm_config_from_command_line(
     };
 
     let console_state: RefCell<Option<ConsoleState<'_>>> = RefCell::new(None);
+    let microvm_output_completion = RefCell::new(None);
     let setup_serial = |name: &str, cli_cfg, device| -> anyhow::Result<_> {
         Ok(match cli_cfg {
             SerialConfigCli::Console => {
@@ -2276,28 +2303,19 @@ async fn vm_config_from_command_line(
                     device,
                     input: Box::new(serial_write),
                 });
-                thread::Builder::new()
-                    .name(name.to_owned())
-                    .spawn(move || {
-                        let _ = block_on(futures::io::copy(
-                            serial_read,
-                            &mut AllowStdIo::new(term::raw_stdout()),
-                        ));
-                    })
-                    .unwrap();
+                let completed =
+                    microvm_output::spawn_output(name, serial_read, term::raw_stdout())?;
+                if name == "microvm-portb" {
+                    *microvm_output_completion.borrow_mut() = Some(completed);
+                }
                 Some(config)
             }
             SerialConfigCli::Stderr => {
                 let (config, serial) = serial_io::anonymous_serial_pair(&serial_driver)?;
-                thread::Builder::new()
-                    .name(name.to_owned())
-                    .spawn(move || {
-                        let _ = block_on(futures::io::copy(
-                            serial,
-                            &mut AllowStdIo::new(term::raw_stderr()),
-                        ));
-                    })
-                    .unwrap();
+                let completed = microvm_output::spawn_output(name, serial, term::raw_stderr())?;
+                if name == "microvm-portb" {
+                    *microvm_output_completion.borrow_mut() = Some(completed);
+                }
                 Some(config)
             }
             SerialConfigCli::File(path) => {
@@ -3482,6 +3500,9 @@ async fn vm_config_from_command_line(
         .context("failed to build chipset configuration")?;
 
     if let Some(io) = microvm_portb_cfg {
+        let (drain, output_drain) =
+            microvm_output::MicrovmOutputDrain::new(microvm_output_completion.into_inner());
+        resources.microvm_output_drain = Some(drain);
         let (generation_id, restore_entropy) =
             if opt.restore_entropy || restore_memory_target_requested {
                 fresh_microvm_restore_packet(
@@ -3498,6 +3519,7 @@ async fn vm_config_from_command_line(
                 io,
                 generation_id,
                 restore_entropy,
+                output_drain: Some(output_drain),
             }
             .into_resource(),
         });
@@ -3548,12 +3570,11 @@ async fn vm_config_from_command_line(
             (
                 kernel.into(),
                 initrd.map(Into::into),
-                match opt.machine {
-                    MachineProfileCli::Microvm => {
-                        build_microvm_control_command_line(&opt.cmdline, microvm_console.is_some())?
-                    }
-                    MachineProfileCli::Standard => unreachable!(),
-                },
+                build_effective_microvm_command_line(
+                    &opt.cmdline,
+                    microvm_console.is_some(),
+                    microvm_control_console.is_some(),
+                )?,
             )
         };
 
@@ -6133,6 +6154,7 @@ async fn run_control_inner(
         microvm_control_console_socket_cleanup: resources
             .microvm_control_console_socket_cleanup
             .take(),
+        microvm_output_drain: resources.microvm_output_drain.take(),
         snapshot_memory_file,
         _private_scratch_dir: private_scratch_dir,
         guest_power_actions: vm_controller::GuestPowerActions {
