@@ -1457,6 +1457,7 @@ mod microvm_console_attachment_tests {
             false,
             None,
             false,
+            false,
             &[],
         )
         .unwrap();
@@ -1598,6 +1599,7 @@ mod microvm_console_attachment_tests {
             true,
             Some(&filesystem),
             false,
+            false,
             &[],
         )
         .unwrap();
@@ -1641,6 +1643,7 @@ mod microvm_console_attachment_tests {
             None,
             true,
             None,
+            false,
             false,
             &[],
         )
@@ -4188,6 +4191,7 @@ async fn vm_config_from_command_line(
             microvm_filesystem_slot,
             cfg.microvm_filesystem.as_ref(),
             has_console,
+            false,
             &cfg.microvm_sandbox_blocks,
         )?;
     }
