@@ -123,10 +123,12 @@ pub fn bind_control_serial(_path: &Path) -> io::Result<Resource<SerialBackendHan
     ))
 }
 
-/// Consumes a one-way pipe containing exactly one nonzero control capability.
+/// Consumes a one-way pipe containing exactly one nonzero 32-byte control capability.
 #[cfg(unix)]
 pub fn read_control_capability(mut file: File) -> io::Result<[u8; 32]> {
     use std::os::unix::fs::FileTypeExt;
+
+    const CONTROL_CAPABILITY_LEN: usize = 32;
 
     if !file.metadata()?.file_type().is_fifo() {
         return Err(io::Error::new(
@@ -136,19 +138,33 @@ pub fn read_control_capability(mut file: File) -> io::Result<[u8; 32]> {
     }
     pal::unix::pipe::set_nonblocking(&file, true)?;
 
-    let mut bytes = [0u8; 33];
-    let mut count = 0;
+    let mut capability = [0u8; CONTROL_CAPABILITY_LEN];
+    match file.read_exact(&mut capability) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "control authentication writer was not closed",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "control authentication payload has an invalid length",
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+
+    let mut trailing = [0u8; 1];
     loop {
-        match file.read(&mut bytes[count..]) {
+        match file.read(&mut trailing) {
             Ok(0) => break,
-            Ok(read) => {
-                count += read;
-                if count == bytes.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "control authentication payload has an invalid length",
-                    ));
-                }
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "control authentication payload has an invalid length",
+                ));
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -160,13 +176,7 @@ pub fn read_control_capability(mut file: File) -> io::Result<[u8; 32]> {
             Err(error) => return Err(error),
         }
     }
-    let capability = bytes[..count].try_into().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "control authentication payload has an invalid length",
-        )
-    })?;
-    if capability == [0; 32] {
+    if capability == [0; CONTROL_CAPABILITY_LEN] {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "control authentication capability must not be zero",
