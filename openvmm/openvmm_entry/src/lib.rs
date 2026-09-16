@@ -1193,6 +1193,114 @@ fn canonical_microvm_filesystem_root(
     Ok((canonical, identity_kind, identity))
 }
 
+fn canonical_microvm_filesystem_denied_paths(
+    root_path: &Path,
+    requested: &[PathBuf],
+) -> anyhow::Result<Vec<String>> {
+    #[cfg(unix)]
+    let root_metadata = fs_err::symlink_metadata(root_path).with_context(|| {
+        format!(
+            "failed to inspect microVM filesystem root {}",
+            root_path.display()
+        )
+    })?;
+    let mut relative_paths = Vec::with_capacity(requested.len());
+    for denied in requested {
+        anyhow::ensure!(
+            !denied.as_os_str().is_empty()
+                && !denied.components().any(|component| matches!(
+                    component,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )),
+            "microVM denied path is empty or contains a dot or parent component: {}",
+            denied.display()
+        );
+        let absolute = if denied.is_absolute() {
+            denied.clone()
+        } else {
+            root_path.join(denied)
+        };
+        let canonical = fs_err::canonicalize(&absolute).with_context(|| {
+            format!(
+                "failed to canonicalize microVM denied path {}",
+                absolute.display()
+            )
+        })?;
+        let relative = canonical.strip_prefix(root_path).with_context(|| {
+            format!(
+                "microVM denied path resolves outside the filesystem export root: {}",
+                denied.display()
+            )
+        })?;
+        anyhow::ensure!(
+            !relative.as_os_str().is_empty(),
+            "microVM denied path cannot hide the complete filesystem export"
+        );
+
+        let mut current = root_path.to_owned();
+        for component in relative.components() {
+            let std::path::Component::Normal(component) = component else {
+                anyhow::bail!("microVM denied path contains a non-normal component");
+            };
+            current.push(component);
+            let metadata = fs_err::symlink_metadata(&current).with_context(|| {
+                format!(
+                    "failed to inspect microVM denied path component {}",
+                    current.display()
+                )
+            })?;
+            anyhow::ensure!(
+                !metadata.file_type().is_symlink(),
+                "microVM denied path component is a symbolic link: {}",
+                current.display()
+            );
+            #[cfg(windows)]
+            anyhow::ensure!(
+                std::os::windows::fs::MetadataExt::file_attributes(&metadata) & 0x400 == 0,
+                "microVM denied path component is a reparse point: {}",
+                current.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let denied_metadata = fs_err::symlink_metadata(&canonical)?;
+            anyhow::ensure!(
+                denied_metadata.dev() == root_metadata.dev(),
+                "microVM denied path crosses a nested mount: {}",
+                denied.display()
+            );
+        }
+        relative_paths.push(relative.to_owned());
+    }
+    relative_paths.sort_unstable();
+    for pair in relative_paths.windows(2) {
+        anyhow::ensure!(
+            pair[0] != pair[1] && !pair[1].starts_with(&pair[0]),
+            "microVM denied paths must be unique and non-overlapping"
+        );
+    }
+    let encoded = relative_paths
+        .iter()
+        .map(|path| {
+            path.iter()
+                .map(|component| {
+                    component
+                        .to_str()
+                        .context("microVM denied path is not valid UTF-8")
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+                .map(|components| components.join("/"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    openvmm_defs::config::MicrovmFilesystemConfig::new(
+        "/unused".to_owned(),
+        openvmm_defs::config::MicrovmFilesystemAccess::ReadOnly,
+    )?
+    .with_denied_paths(encoded.clone())?;
+    Ok(encoded)
+}
+
 pub(crate) fn microvm_filesystem_attachment(
     host_path: &Path,
 ) -> anyhow::Result<(String, openvmm_helpers::snapshot::SnapshotAttachment)> {
@@ -1214,6 +1322,25 @@ pub(crate) fn microvm_filesystem_attachment(
             reconnect_timeout_ms: 0,
         },
     ))
+}
+
+fn microvm_filesystem_from_mount(
+    requested: &cli_args::MicrovmMountCli,
+    denied_paths: &[PathBuf],
+) -> anyhow::Result<EffectiveMicrovmFilesystem> {
+    let (root_path, attachment) = microvm_filesystem_attachment(&requested.host_path)?;
+    let denied_paths =
+        canonical_microvm_filesystem_denied_paths(Path::new(&root_path), denied_paths)?;
+    let config = openvmm_defs::config::MicrovmFilesystemConfig::new(
+        requested.guest_target.clone(),
+        requested.access,
+    )?
+    .with_denied_paths(denied_paths)?;
+    Ok(EffectiveMicrovmFilesystem {
+        config,
+        root_path,
+        attachment,
+    })
 }
 
 pub(crate) fn validate_microvm_filesystem_private_storage(
@@ -1279,7 +1406,8 @@ pub(crate) fn microvm_filesystem_from_snapshot(
         "rw" => openvmm_defs::config::MicrovmFilesystemAccess::ReadWrite,
         mode => anyhow::bail!("snapshot microVM filesystem access mode '{mode}' is unsupported"),
     };
-    openvmm_defs::config::MicrovmFilesystemConfig::new(saved.guest_mount_target.clone(), access)
+    openvmm_defs::config::MicrovmFilesystemConfig::new(saved.guest_mount_target.clone(), access)?
+        .with_denied_paths(saved.denied_paths.clone())
         .context("snapshot microVM filesystem policy is invalid")
 }
 
@@ -1307,22 +1435,12 @@ fn microvm_filesystem_slot_from_snapshot(
 
 fn effective_microvm_filesystem(
     requested: Option<&cli_args::MicrovmMountCli>,
+    denied_paths: &[PathBuf],
     restore: Option<&openvmm_helpers::snapshot::SnapshotMachineContract>,
 ) -> anyhow::Result<Option<EffectiveMicrovmFilesystem>> {
     let Some(restore) = restore else {
         return requested
-            .map(|requested| {
-                let config = openvmm_defs::config::MicrovmFilesystemConfig::new(
-                    requested.guest_target.clone(),
-                    requested.access,
-                )?;
-                let (root_path, attachment) = microvm_filesystem_attachment(&requested.host_path)?;
-                Ok(EffectiveMicrovmFilesystem {
-                    config,
-                    root_path,
-                    attachment,
-                })
-            })
+            .map(|requested| microvm_filesystem_from_mount(requested, denied_paths))
             .transpose();
     };
 
@@ -1347,16 +1465,7 @@ fn effective_microvm_filesystem(
                 == openvmm_helpers::snapshot::MICROVM_FILESYSTEM_SLOT_VERSION,
             "snapshot does not support restore-time microVM filesystem attachment"
         );
-        let config = openvmm_defs::config::MicrovmFilesystemConfig::new(
-            requested.guest_target.clone(),
-            requested.access,
-        )?;
-        let (root_path, attachment) = microvm_filesystem_attachment(&requested.host_path)?;
-        return Ok(Some(EffectiveMicrovmFilesystem {
-            config,
-            root_path,
-            attachment,
-        }));
+        return microvm_filesystem_from_mount(requested, denied_paths).map(Some);
     };
     let requested = requested
         .context("snapshot restore requires a fresh --mount attachment for fs:microvm0")?;
@@ -1365,24 +1474,24 @@ fn effective_microvm_filesystem(
         requested.guest_target == config.guest_mount_target && requested.access == config.access,
         "restore-time mount target or access mode does not match the snapshot contract"
     );
-    let (root_path, attachment) = microvm_filesystem_attachment(&requested.host_path)?;
+    let effective = microvm_filesystem_from_mount(requested, denied_paths)?;
     anyhow::ensure!(
         !saved.canonical_host_path.is_empty(),
         "snapshot filesystem canonical host path is missing; this snapshot predates path-bound filesystem restore"
     );
     anyhow::ensure!(
-        root_path == saved.canonical_host_path,
+        effective.root_path == saved.canonical_host_path,
         "restore-time filesystem canonical host path does not match the snapshot contract"
     );
     anyhow::ensure!(
-        Some(&attachment) == saved_attachment,
+        Some(&effective.attachment) == saved_attachment,
         "restore-time filesystem root identity does not match the snapshot attachment"
     );
-    Ok(Some(EffectiveMicrovmFilesystem {
-        config,
-        root_path,
-        attachment,
-    }))
+    anyhow::ensure!(
+        effective.config == config,
+        "restore-time filesystem denied paths do not match the snapshot contract"
+    );
+    Ok(Some(effective))
 }
 
 /// Build a flat list of switches with their parent port assignments.
@@ -2108,12 +2217,48 @@ mod microvm_console_attachment_tests {
     }
 
     #[test]
+    fn filesystem_denied_paths_are_canonical_and_root_scoped() {
+        let root = tempfile::tempdir().unwrap();
+        let secrets = root.path().join("secrets");
+        std::fs::create_dir(&secrets).unwrap();
+        let options = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--mount",
+            &format!("/mnt/share,{},rw", root.path().display()),
+            "--mount-deny",
+            secrets.to_str().unwrap(),
+        ])
+        .unwrap();
+        options.validate_microvm_options().unwrap();
+        let filesystem = effective_microvm_filesystem(
+            options.microvm_mount.as_ref(),
+            &options.microvm_mount_deny,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(filesystem.config.denied_paths, vec!["secrets".to_owned()]);
+
+        let outside = tempfile::tempdir().unwrap();
+        assert!(
+            canonical_microvm_filesystem_denied_paths(root.path(), &[outside.path().to_owned()])
+                .is_err()
+        );
+        assert!(
+            canonical_microvm_filesystem_denied_paths(root.path(), &[secrets.clone(), secrets])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn filesystem_restore_requires_same_live_root_identity() {
         let root = tempfile::tempdir().unwrap();
         let contract = filesystem_contract(root.path());
         let options = restore_mount_options(root.path(), "ro");
         let restored =
-            effective_microvm_filesystem(options.microvm_mount.as_ref(), Some(&contract))
+            effective_microvm_filesystem(options.microvm_mount.as_ref(), &[], Some(&contract))
                 .unwrap()
                 .unwrap();
         assert_eq!(restored.config.guest_mount_target, "/mnt/share");
@@ -2124,6 +2269,7 @@ mod microvm_console_attachment_tests {
         assert!(
             effective_microvm_filesystem(
                 replacement_options.microvm_mount.as_ref(),
+                &[],
                 Some(&contract)
             )
             .is_err()
@@ -2141,7 +2287,8 @@ mod microvm_console_attachment_tests {
 
         let options = restore_mount_options(&moved, "ro");
         assert!(
-            effective_microvm_filesystem(options.microvm_mount.as_ref(), Some(&contract)).is_err()
+            effective_microvm_filesystem(options.microvm_mount.as_ref(), &[], Some(&contract))
+                .is_err()
         );
     }
 
@@ -2149,12 +2296,16 @@ mod microvm_console_attachment_tests {
     fn filesystem_restore_rejects_missing_or_changed_policy() {
         let root = tempfile::tempdir().unwrap();
         let contract = filesystem_contract(root.path());
-        assert!(effective_microvm_filesystem(None, Some(&contract)).is_err());
+        assert!(effective_microvm_filesystem(None, &[], Some(&contract)).is_err());
 
         let changed_mode = restore_mount_options(root.path(), "rw");
         assert!(
-            effective_microvm_filesystem(changed_mode.microvm_mount.as_ref(), Some(&contract))
-                .is_err()
+            effective_microvm_filesystem(
+                changed_mode.microvm_mount.as_ref(),
+                &[],
+                Some(&contract),
+            )
+            .is_err()
         );
     }
 
@@ -2162,7 +2313,7 @@ mod microvm_console_attachment_tests {
     fn filesystem_restore_without_mount_preserves_dormant_slot() {
         let contract = dormant_filesystem_contract();
         assert!(
-            effective_microvm_filesystem(None, Some(&contract))
+            effective_microvm_filesystem(None, &[], Some(&contract))
                 .unwrap()
                 .is_none()
         );
@@ -2174,7 +2325,7 @@ mod microvm_console_attachment_tests {
         let contract = dormant_filesystem_contract();
         let options = restore_mount_options(root.path(), "rw");
         let filesystem =
-            effective_microvm_filesystem(options.microvm_mount.as_ref(), Some(&contract))
+            effective_microvm_filesystem(options.microvm_mount.as_ref(), &[], Some(&contract))
                 .unwrap()
                 .unwrap();
         assert_eq!(filesystem.config.guest_mount_target, "/mnt/share");
@@ -2193,11 +2344,14 @@ mod microvm_console_attachment_tests {
         let root = tempfile::tempdir().unwrap();
         let contract = network_contract();
         let options = restore_mount_options(root.path(), "ro");
-        let error =
-            match effective_microvm_filesystem(options.microvm_mount.as_ref(), Some(&contract)) {
-                Err(error) => error,
-                Ok(_) => panic!("legacy snapshot unexpectedly accepted a restore-time mount"),
-            };
+        let error = match effective_microvm_filesystem(
+            options.microvm_mount.as_ref(),
+            &[],
+            Some(&contract),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("legacy snapshot unexpectedly accepted a restore-time mount"),
+        };
         assert!(
             error
                 .to_string()
@@ -2337,7 +2491,11 @@ async fn vm_config_from_command_line(
         false
     };
     let effective_microvm_filesystem = if is_microvm {
-        effective_microvm_filesystem(opt.microvm_mount.as_ref(), restore_machine_contract)?
+        effective_microvm_filesystem(
+            opt.microvm_mount.as_ref(),
+            &opt.microvm_mount_deny,
+            restore_machine_contract,
+        )?
     } else {
         None
     };
@@ -4206,6 +4364,7 @@ async fn vm_config_from_command_line(
                     stable_id: MICROVM_FILESYSTEM_STABLE_ID.to_owned(),
                     root_identity: filesystem.attachment.identity.clone(),
                     read_only: filesystem.config.access.is_read_only(),
+                    denied_paths: filesystem.config.denied_paths.clone(),
                 },
             )
         } else {
