@@ -902,12 +902,12 @@ fn microvm_control_broker_config(
             opt.microvm_control_auth_stdin,
             "live microVM control console requires --microvm-control-auth-stdin"
         );
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         {
             serial_io::read_control_capability_from_stdin()
                 .context("failed to read control-console authentication capability from stdin")?
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             anyhow::bail!("secure live microVM control consoles are unavailable on this platform")
         }
@@ -915,7 +915,15 @@ fn microvm_control_broker_config(
     #[cfg(target_os = "linux")]
     let expected_peer_identity =
         serial_core::LocalPeerIdentity::UnixUid(pal::unix::effective_user_id());
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    let expected_peer_identity = {
+        let sid = pal::windows::security::current_process_user_sid()
+            .context("failed to resolve the OpenVMM process user SID")?;
+        let (bytes, length) = sid.to_fixed_bytes();
+        serial_core::LocalPeerIdentity::windows_sid(bytes, length)
+            .context("failed to encode the OpenVMM process user SID")?
+    };
+    #[cfg(not(any(target_os = "linux", windows)))]
     let expected_peer_identity = serial_core::LocalPeerIdentity::Unsupported;
 
     Ok(
@@ -933,6 +941,7 @@ fn build_effective_microvm_command_line(
     has_console: bool,
     has_control_console: bool,
     workload_identity: Option<cli_args::MicrovmWorkloadIdentityCli>,
+    lifecycle: Option<cli_args::MicrovmLifecycleCli>,
 ) -> anyhow::Result<String> {
     let mut cmdline = if has_control_console {
         build_microvm_control_command_line(user_args, has_console)
@@ -944,6 +953,12 @@ fn build_effective_microvm_command_line(
             &mut cmdline,
             identity.uid,
             identity.gid,
+        )?;
+    }
+    if let Some(lifecycle) = lifecycle {
+        openvmm_defs::config::append_microvm_lifecycle(
+            &mut cmdline,
+            lifecycle == cli_args::MicrovmLifecycleCli::Managed,
         )?;
     }
     Ok(cmdline)
@@ -1738,8 +1753,8 @@ mod microvm_console_attachment_tests {
             "nvx_control_tty=hvc9".to_owned(),
             "virtio-mmio.device=0x1000@0xc0000000:1".to_owned(),
         ];
-        assert!(build_effective_microvm_command_line(&user_args, true, false, None).is_ok());
-        assert!(build_effective_microvm_command_line(&user_args, true, true, None).is_err());
+        assert!(build_effective_microvm_command_line(&user_args, true, false, None, None).is_ok());
+        assert!(build_effective_microvm_command_line(&user_args, true, true, None, None).is_err());
     }
 
     #[test]
@@ -1749,7 +1764,7 @@ mod microvm_console_attachment_tests {
             gid: 65_534,
         };
         let command_line =
-            build_effective_microvm_command_line(&[], false, false, Some(identity)).unwrap();
+            build_effective_microvm_command_line(&[], false, false, Some(identity), None).unwrap();
         assert!(command_line.contains("nvx_workload_uid=65534"));
         assert!(command_line.contains("nvx_workload_gid=65534"));
         assert!(
@@ -1758,6 +1773,33 @@ mod microvm_console_attachment_tests {
                 false,
                 false,
                 Some(identity),
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn workload_lifecycle_is_host_owned() {
+        let command_line = build_effective_microvm_command_line(
+            &[],
+            true,
+            true,
+            Some(cli_args::MicrovmWorkloadIdentityCli {
+                uid: 65_534,
+                gid: 65_534,
+            }),
+            Some(cli_args::MicrovmLifecycleCli::Managed),
+        )
+        .unwrap();
+        assert!(command_line.contains("nvx_lifecycle=managed"));
+        assert!(
+            build_effective_microvm_command_line(
+                &["nvx_lifecycle=one-shot".to_owned()],
+                true,
+                true,
+                None,
+                Some(cli_args::MicrovmLifecycleCli::Managed),
             )
             .is_err()
         );
@@ -3612,6 +3654,7 @@ async fn vm_config_from_command_line(
                     microvm_console.is_some(),
                     microvm_control_console.is_some(),
                     opt.microvm_workload_identity,
+                    opt.microvm_lifecycle,
                 )?,
             )
         };

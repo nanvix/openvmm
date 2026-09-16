@@ -9,7 +9,7 @@ use pal_async::pipe::PolledPipe;
 use serial_socket::net::OpenSocketSerialConfig;
 use std::fs::File;
 use std::io;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::io::Read;
 use std::net::SocketAddr;
 use std::net::TcpStream;
@@ -115,7 +115,42 @@ pub fn bind_control_serial(path: &Path) -> io::Result<Resource<SerialBackendHand
     Ok(OpenSocketSerialConfig::from(listener).into_resource())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+pub fn bind_control_serial(path: &Path) -> io::Result<Resource<SerialBackendHandle>> {
+    use pal::windows::security::LocalSecurityDescriptor;
+    use serial_socket::windows::OpenWindowsPipeSerialConfig;
+
+    const NAMED_PIPE_PREFIX: &str = "//./pipe/";
+
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let name = normalized.strip_prefix(NAMED_PIPE_PREFIX).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "control endpoint must name a Windows //./pipe/... endpoint",
+        )
+    })?;
+    if name.is_empty() || name.contains('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "control endpoint must contain one nonempty Windows named-pipe name",
+        ));
+    }
+
+    let user_sid = pal::windows::security::current_process_user_sid()?;
+    let descriptor = format!("D:P(A;;GA;;;SY)(A;;GA;;;{})", user_sid.to_string_sid())
+        .parse::<LocalSecurityDescriptor>()?;
+    let pipe = pal::windows::pipe::new_named_pipe_with_security(
+        path,
+        windows_sys::Win32::Foundation::GENERIC_READ
+            | windows_sys::Win32::Foundation::GENERIC_WRITE,
+        pal::windows::pipe::Disposition::Create,
+        pal::windows::pipe::PipeMode::Byte,
+        &descriptor,
+    )?;
+    Ok(OpenWindowsPipeSerialConfig::from(pipe).into_resource())
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 pub fn bind_control_serial(_path: &Path) -> io::Result<Resource<SerialBackendHandle>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -124,36 +159,62 @@ pub fn bind_control_serial(_path: &Path) -> io::Result<Resource<SerialBackendHan
 }
 
 /// Consumes a one-way pipe containing exactly one nonzero 32-byte control capability.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn read_control_capability(mut file: File) -> io::Result<[u8; 32]> {
-    use std::os::unix::fs::FileTypeExt;
-
     const CONTROL_CAPABILITY_LEN: usize = 32;
 
-    if !file.metadata()?.file_type().is_fifo() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "control authentication input is not a one-way pipe",
-        ));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+
+        if !file.metadata()?.file_type().is_fifo() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "control authentication input is not a one-way pipe",
+            ));
+        }
+        pal::unix::pipe::set_nonblocking(&file, true)?;
     }
-    pal::unix::pipe::set_nonblocking(&file, true)?;
+    #[cfg(windows)]
+    {
+        use pal::windows::pipe::PipeExt as _;
+        use windows_sys::Win32::System::Pipes::PIPE_NOWAIT;
+
+        if !pal::windows::pipe::is_pipe(&file) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "control authentication input is not a one-way pipe",
+            ));
+        }
+        file.set_pipe_mode(PIPE_NOWAIT)?;
+    }
 
     let mut capability = [0u8; CONTROL_CAPABILITY_LEN];
-    match file.read_exact(&mut capability) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "control authentication writer was not closed",
-            ));
+    let mut offset = 0;
+    while offset != capability.len() {
+        match file.read(&mut capability[offset..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "control authentication payload has an invalid length",
+                ));
+            }
+            Ok(count) => offset += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if control_pipe_would_block(&error) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "control authentication writer was not closed",
+                ));
+            }
+            Err(error) if control_pipe_is_closed(&error) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "control authentication payload has an invalid length",
+                ));
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "control authentication payload has an invalid length",
-            ));
-        }
-        Err(error) => return Err(error),
     }
 
     let mut trailing = [0u8; 1];
@@ -167,12 +228,13 @@ pub fn read_control_capability(mut file: File) -> io::Result<[u8; 32]> {
                 ));
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(error) if control_pipe_would_block(&error) => {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "control authentication writer was not closed",
                 ));
             }
+            Err(error) if control_pipe_is_closed(&error) => break,
             Err(error) => return Err(error),
         }
     }
@@ -185,6 +247,38 @@ pub fn read_control_capability(mut file: File) -> io::Result<[u8; 32]> {
     Ok(capability)
 }
 
+fn control_pipe_would_block(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_NO_DATA as i32)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn control_pipe_is_closed(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(
+            error.raw_os_error().map(|value| value as u32),
+            Some(
+                windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE
+                    | windows_sys::Win32::Foundation::ERROR_PIPE_NOT_CONNECTED
+            )
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 /// Reads the prepared authentication pipe without taking ownership of descriptor 0.
 #[cfg(target_os = "linux")]
 pub fn read_control_capability_from_stdin() -> io::Result<[u8; 32]> {
@@ -192,6 +286,15 @@ pub fn read_control_capability_from_stdin() -> io::Result<[u8; 32]> {
 
     let stdin = io::stdin();
     read_control_capability(File::from(stdin.as_fd().try_clone_to_owned()?))
+}
+
+/// Reads the prepared authentication pipe without taking ownership of handle 0.
+#[cfg(windows)]
+pub fn read_control_capability_from_stdin() -> io::Result<[u8; 32]> {
+    use std::os::windows::io::AsHandle as _;
+
+    let stdin = io::stdin();
+    read_control_capability(File::from(stdin.as_handle().try_clone_to_owned()?))
 }
 
 fn bind_serial_inner(
@@ -464,5 +567,30 @@ mod tests {
         assert_eq!(metadata.uid(), pal::unix::effective_user_id());
         assert!(bind_control_serial(&path).is_err());
         drop(listener);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::io::Write as _;
+    use test_with_tracing::test;
+
+    #[test]
+    fn control_capability_requires_an_exact_closed_windows_pipe() {
+        let (read, mut write) = pal::windows::pipe::pair().unwrap();
+        let mut capability = [0x5a; 32];
+        capability[0] = 0;
+        write.write_all(&capability).unwrap();
+        drop(write);
+        assert_eq!(read_control_capability(read).unwrap(), capability);
+
+        let (read, mut write) = pal::windows::pipe::pair().unwrap();
+        write.write_all(&capability[..31]).unwrap();
+        drop(write);
+        assert_eq!(
+            read_control_capability(read).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 }

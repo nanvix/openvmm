@@ -33,6 +33,19 @@ pub enum LocalPeerIdentity {
     Unsupported,
 }
 
+impl LocalPeerIdentity {
+    /// Constructs a validated Windows SID identity.
+    pub fn windows_sid(bytes: [u8; 68], length: u8) -> std::io::Result<Self> {
+        if !(8..=68).contains(&length) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows SID length is outside the supported range",
+            ));
+        }
+        Ok(Self::WindowsSid { bytes, length })
+    }
+}
+
 /// Trait for types providing serial IO.
 pub trait SerialIo: AsyncRead + AsyncWrite + Send + InspectMut + Unpin {
     /// Returns true if the backend is already connected.
