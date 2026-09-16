@@ -1019,6 +1019,8 @@ fn effective_microvm_network(
         anyhow::ensure!(
             opt.network_profile.is_none()
                 && opt.net_tap.is_none()
+                && opt.network_egress.is_none()
+                && opt.network_ingress.is_none()
                 && opt.allow_host.is_empty()
                 && opt.block_host.is_empty()
                 && opt.allow_endpoint.is_empty(),
