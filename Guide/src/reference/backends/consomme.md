@@ -54,6 +54,13 @@ allowed guest-initiated flow are not treated as new inbound connections.
 Ingress `allow` is rejected before VM resources are opened because portable
 NAT does not expose arbitrary guest listeners.
 
+The generic egress rule form accepts destination IPv4 addresses or CIDRs with
+an optional TCP or UDP destination port. Deny rules take precedence over allow
+rules, and the explicit directional default handles traffic that matches
+neither list. Filtering and malformed-packet rejection occur before Consomme
+creates a host socket. Port-specific policies reject IPv4 fragments rather
+than allowing later fragments to bypass transport checks.
+
 Snapshot restore creates a fresh endpoint generation. Host sockets and NAT
 flow tables are not saved. Virtio-net capture drains descriptor ownership
 before state is saved, and restored guest software must establish new
