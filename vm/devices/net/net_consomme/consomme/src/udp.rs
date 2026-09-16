@@ -461,7 +461,7 @@ impl<T: Client> Access<'_, T> {
         let mut dst_sock_addr = self
             .inner
             .state
-            .resolve_destination(&dst_sock_addr)
+            .resolve_destination(&dst_sock_addr, IpProtocol::Udp)
             .ok_or(DropReason::DestinationNotAllowed)?;
         if self.inner.state.params.is_local_address(&dst_sock_addr) {
             // This packet is destined for a local address. If the port matches a listener,

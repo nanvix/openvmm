@@ -61,11 +61,19 @@ neither list. Filtering and malformed-packet rejection occur before Consomme
 creates a host socket. Port-specific policies reject IPv4 fragments rather
 than allowing later fragments to bypass transport checks.
 
-Host-loopback policy is explicit for microVMs. General allow maps the
-guest-visible gateway to host loopback, permits host-local destinations, and
-may install explicit localhost-to-guest TCP/UDP forwards. Deny rejects general
-gateway socket traffic and all host-to-guest forwards. One exact gateway TCP
-port may remain mapped as a proxy exception; other ports stay blocked.
+The portable profile does not provide generic bidirectional host-loopback
+connectivity. Explicit `--host-loopback allow` without any
+`--host-loopback-forward` is rejected before VM resources are opened.
+With deliberate TCP/UDP forwards, `allow` maps the guest-visible gateway to
+host loopback, permits host-local destinations subject to egress policy, and
+publishes only the specified localhost-to-guest ports. This is port publishing,
+not a generic bidirectional allow contract.
+
+Omitting `--host-loopback` preserves the existing guest-to-host mapping but
+does not publish guest ports. `deny` rejects general gateway socket traffic
+and all host-to-guest forwards. One exact gateway TCP port may remain mapped
+as a proxy exception; UDP on that same port and other host service ports stay
+blocked even when ordinary egress is allowed.
 
 Snapshot restore creates a fresh endpoint generation. Host sockets and NAT
 flow tables are not saved. Virtio-net capture drains descriptor ownership
