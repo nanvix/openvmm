@@ -134,6 +134,17 @@ describes the source definitions.
   accompany `--allow-host` or `--allow-endpoint`. Contradictory default and
   rule combinations are rejected at the same validation boundary.
 
+  `--network-egress-allow <RULE>` and `--network-egress-deny <RULE>` provide
+  the generic L3/L4 policy form. A rule is either `IPv4[/PREFIX]` or
+  `IPv4[/PREFIX]:tcp:PORT` / `IPv4[/PREFIX]:udp:PORT`. These flags require an
+  explicit `--network-egress` default, accept at most 256 rules in each list,
+  and cannot be mixed with the legacy `--allow-host`, `--block-host`, or
+  `--allow-endpoint` forms. Deny rules are evaluated before allow rules.
+  Address-only rules apply to every IPv4 protocol; port-specific policies
+  reject fragmented IPv4 traffic because later fragments do not carry a
+  verifiable transport header. Parsing, canonicalization, and contradictory
+  option checks complete before VM resources are opened.
+
   Networked snapshots record the `portable` profile, drain accepted TX and
   endpoint-ready RX at the capture boundary, rewind unused guest RX
   descriptors, and recreate a fresh Consomme endpoint generation on restore.
