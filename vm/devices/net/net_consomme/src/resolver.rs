@@ -70,6 +70,13 @@ impl ResolveResource<NetEndpointHandleKind, ConsommeHandle> for ConsommeResolver
                 )
                 .map_err(ResolveConsommeError::InvalidStaticIpv4)?;
         }
+        if let Some(allow) = resource.allow_host_local_access {
+            state.allow_host_local_access = allow;
+        }
+        if let Some(map) = resource.map_gateway_to_host_loopback {
+            state.map_gateway_to_host_loopback = map;
+        }
+        state.gateway_loopback_proxy_port = resource.gateway_loopback_proxy_port;
         let port_forwards: Vec<PortForwardConfig> = resource
             .ports
             .into_iter()

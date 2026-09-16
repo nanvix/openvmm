@@ -3672,17 +3672,20 @@ fn validate_machine_contract_shape(
                 && network.gateway_mac == parsed.gateway_mac.to_bytes(),
             "snapshot static network identity is not canonical"
         );
+        let valid_policy_requirement = match network.egress_policy_mode.as_str() {
+            "allow-all" => !network.egress_policy_required,
+            "deny-all" | "allow-list" | "block-list" | "endpoint" => network.egress_policy_required,
+            "rules" => true,
+            _ => false,
+        };
         anyhow::ensure!(
-            matches!(
-                network.egress_policy_mode.as_str(),
-                "allow-all" | "deny-all" | "allow-list" | "block-list" | "endpoint"
-            ) && network.egress_policy_required == (network.egress_policy_mode != "allow-all"),
+            valid_policy_requirement,
             "snapshot egress policy requirement is invalid"
         );
         anyhow::ensure!(
             matches!(
                 network.egress_policy_encoding_version,
-                0 | 1 | net_backend_resources::egress::EGRESS_POLICY_ENCODING_VERSION
+                0 | 1 | 2 | net_backend_resources::egress::EGRESS_POLICY_ENCODING_VERSION
             ),
             "snapshot egress policy encoding version {} is unsupported",
             network.egress_policy_encoding_version
