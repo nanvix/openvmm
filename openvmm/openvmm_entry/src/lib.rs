@@ -932,12 +932,21 @@ fn build_effective_microvm_command_line(
     user_args: &[String],
     has_console: bool,
     has_control_console: bool,
+    workload_identity: Option<cli_args::MicrovmWorkloadIdentityCli>,
 ) -> anyhow::Result<String> {
-    if has_control_console {
+    let mut cmdline = if has_control_console {
         build_microvm_control_command_line(user_args, has_console)
     } else {
         build_microvm_command_line(user_args, has_console)
+    }?;
+    if let Some(identity) = workload_identity {
+        openvmm_defs::config::append_microvm_workload_identity(
+            &mut cmdline,
+            identity.uid,
+            identity.gid,
+        )?;
     }
+    Ok(cmdline)
 }
 
 fn microvm_network_attachment() -> openvmm_helpers::snapshot::SnapshotAttachment {
@@ -1729,8 +1738,29 @@ mod microvm_console_attachment_tests {
             "nvx_control_tty=hvc9".to_owned(),
             "virtio-mmio.device=0x1000@0xc0000000:1".to_owned(),
         ];
-        assert!(build_effective_microvm_command_line(&user_args, true, false).is_ok());
-        assert!(build_effective_microvm_command_line(&user_args, true, true).is_err());
+        assert!(build_effective_microvm_command_line(&user_args, true, false, None).is_ok());
+        assert!(build_effective_microvm_command_line(&user_args, true, true, None).is_err());
+    }
+
+    #[test]
+    fn workload_identity_is_host_owned_and_fixed() {
+        let identity = cli_args::MicrovmWorkloadIdentityCli {
+            uid: 65_534,
+            gid: 65_534,
+        };
+        let command_line =
+            build_effective_microvm_command_line(&[], false, false, Some(identity)).unwrap();
+        assert!(command_line.contains("nvx_workload_uid=65534"));
+        assert!(command_line.contains("nvx_workload_gid=65534"));
+        assert!(
+            build_effective_microvm_command_line(
+                &["nvx_workload_uid=1".to_owned()],
+                false,
+                false,
+                Some(identity),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3576,6 +3606,7 @@ async fn vm_config_from_command_line(
                     &opt.cmdline,
                     microvm_console.is_some(),
                     microvm_control_console.is_some(),
+                    opt.microvm_workload_identity,
                 )?,
             )
         };
