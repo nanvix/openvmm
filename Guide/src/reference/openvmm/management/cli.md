@@ -120,6 +120,20 @@ describes the source definitions.
   the independent destination, TCP, or port check. No implicit DNS exception is
   added.
 
+  `--network-egress <allow|deny>` and `--network-ingress <allow|deny>` map
+  directional network default actions onto the portable profile. Egress defaults
+  to `allow`; ingress defaults to `deny`, preserving the profile's existing
+  behavior when neither option is present. Egress `deny` without allow rules
+  blocks every guest-originated frame before Consomme opens a host socket.
+  Responses belonging to a guest-initiated flow remain permitted when ingress
+  is denied; unsolicited connections toward the guest remain unavailable.
+
+  The portable profile cannot truthfully provide unrestricted inbound
+  connectivity, so `--network-ingress allow` is rejected before VM resources
+  are opened. Egress `allow` may accompany `--block-host`; egress `deny` may
+  accompany `--allow-host` or `--allow-endpoint`. Contradictory default and
+  rule combinations are rejected at the same validation boundary.
+
   Networked snapshots record the `portable` profile, drain accepted TX and
   endpoint-ready RX at the capture boundary, rewind unused guest RX
   descriptors, and recreate a fresh Consomme endpoint generation on restore.
