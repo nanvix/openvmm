@@ -1715,6 +1715,7 @@ impl VmService {
                         stable_id: "fs:microvm0".to_owned(),
                         root_identity: attachment.identity.clone(),
                         read_only: filesystem.access.is_read_only(),
+                        denied_paths: Vec::new(),
                     },
                 }
                 .into_resource(),
@@ -1885,6 +1886,7 @@ impl VmService {
                             stable_id: "fs:microvm0".to_owned(),
                             root_identity: attachment.identity.clone(),
                             read_only: filesystem.access.is_read_only(),
+                            denied_paths: Vec::new(),
                         },
                     }
                     .into_resource();
