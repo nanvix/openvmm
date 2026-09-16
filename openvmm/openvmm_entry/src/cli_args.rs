@@ -816,6 +816,10 @@ options:
     #[clap(long, value_enum, value_name = "MODE")]
     pub microvm_lifecycle: Option<MicrovmLifecycleCli>,
 
+    /// Write one bounded local JSON outcome report after microVM teardown.
+    #[clap(long, value_name = "PATH")]
+    pub microvm_report: Option<PathBuf>,
+
     /// Attach a vhost-user device via a Unix socket.
     ///
     /// The first positional argument is the socket path. Options:
@@ -1862,6 +1866,7 @@ impl Options {
                     && self.microvm_sandbox_block.is_empty()
                     && self.microvm_workload_identity.is_none()
                     && self.microvm_lifecycle.is_none()
+                    && self.microvm_report.is_none()
                     && self.restore_processors.is_none()
                     && self.restore_memory.is_none()
                     && self.memory_capacity.is_none()

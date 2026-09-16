@@ -12,6 +12,7 @@ mod crash_dump;
 mod kvp;
 mod meshworker;
 mod microvm_output;
+mod microvm_report;
 mod pidfile;
 mod repl;
 mod serial_io;
@@ -5831,14 +5832,35 @@ fn new_hvsock_service_id(port: u32) -> Guid {
 }
 
 async fn run_control(driver: &DefaultDriver, opt: Options) -> anyhow::Result<i32> {
-    let mut mesh = Some(VmmMesh::new(&driver, opt.single_process)?);
+    let report = microvm_report::MicrovmReportPlan::from_options(&opt)?;
+    let mut mesh = match VmmMesh::new(&driver, opt.single_process) {
+        Ok(mesh) => Some(mesh),
+        Err(error) => {
+            let result = Err(error);
+            if let Some(report) = report {
+                report.write(&result)?;
+            }
+            return result;
+        }
+    };
     let result = run_control_inner(driver, &mut mesh, opt).await;
     // If setup failed before the mesh was handed to the controller, shut it
     // down so the child host process exits cleanly without noisy logs.
     if let Some(mesh) = mesh {
         mesh.shutdown().await;
     }
-    result
+    let report_result = match report {
+        Some(report) => report.write(&result),
+        None => Ok(()),
+    };
+    match (result, report_result) {
+        (Ok(code), Ok(())) => Ok(code),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(report_error)) => Err(error.context(format!(
+            "microVM run failed and its bounded report could not be written: {report_error:#}"
+        ))),
+    }
 }
 
 async fn run_control_inner(
@@ -5846,6 +5868,7 @@ async fn run_control_inner(
     mesh_slot: &mut Option<VmmMesh>,
     mut opt: Options,
 ) -> anyhow::Result<i32> {
+    let enforce_teardown = opt.machine == MachineProfileCli::Microvm;
     let mesh = mesh_slot.as_ref().unwrap();
     let mut private_scratch_dir = None;
     let mut restore_gate_required = false;
@@ -6462,11 +6485,18 @@ async fn run_control_inner(
 
     // Wait for the controller task to finish (it stops the VM worker and
     // shuts down the mesh).
-    controller_task.await;
+    let teardown = controller_task.await;
     drop(serial_driver);
 
     // run_repl returns the exit status: the code the guest drove via an opt-in
     // exit (VmControllerEvent::ExitRequested), or 0 when the VM stopped normally.
+    if enforce_teardown && !teardown.complete() {
+        let teardown_error = vm_controller::MicrovmTeardownError(teardown);
+        return match repl_result {
+            Ok(_) => Err(teardown_error.into()),
+            Err(error) => Err(error.context(teardown_error)),
+        };
+    }
     repl_result
 }
 
