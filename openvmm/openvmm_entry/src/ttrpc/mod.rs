@@ -2303,10 +2303,11 @@ impl VmService {
         };
 
         // Spawn the controller task.
-        let controller_task = self.driver.spawn(
-            "vm-controller",
-            controller.run(vm_controller_recv, event_send, notify_recv),
-        );
+        let controller_task = self.driver.spawn("vm-controller", async move {
+            let _ = controller
+                .run(vm_controller_recv, event_send, notify_recv)
+                .await;
+        });
 
         self.vm_controller = Some(vm_controller_send);
         self.vm_controller_events = Some(event_recv);

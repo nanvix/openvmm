@@ -160,6 +160,29 @@ pub struct VmController {
     pub(crate) guest_power_actions: GuestPowerActions,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MicrovmTeardownStatus {
+    pub(crate) vm_worker_stopped: bool,
+    pub(crate) auxiliary_workers_stopped: bool,
+}
+
+impl MicrovmTeardownStatus {
+    pub(crate) fn complete(self) -> bool {
+        self.vm_worker_stopped && self.auxiliary_workers_stopped
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct MicrovmTeardownError(pub(crate) MicrovmTeardownStatus);
+
+impl std::fmt::Display for MicrovmTeardownError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("one or more microVM workers failed to stop cleanly")
+    }
+}
+
+impl std::error::Error for MicrovmTeardownError {}
+
 enum GuestSnapshotAction {
     Continue,
     Terminate { exit_code: i32 },
@@ -231,7 +254,7 @@ impl VmController {
         mut rpc_recv: mesh::Receiver<VmControllerRpc>,
         event_send: mesh::Sender<VmControllerEvent>,
         mut notify_recv: mesh::Receiver<HaltReason>,
-    ) {
+    ) -> MicrovmTeardownStatus {
         enum Event {
             Rpc(VmControllerRpc),
             RpcClosed,
@@ -340,7 +363,10 @@ impl VmController {
                     tracing::info!(?reason, "guest halted");
                     if let HaltReason::PowerOffWithStatus { code } = reason {
                         self.request_exit(i32::from(code), &event_send).await;
-                        return;
+                        return MicrovmTeardownStatus {
+                            vm_worker_stopped: true,
+                            auxiliary_workers_stopped: true,
+                        };
                     }
                     // On a guest crash, write a `.vmrs` dump (if configured)
                     // before applying the crash action, since a `Reset` action
@@ -369,7 +395,10 @@ impl VmController {
                             // exit instead.
                             tracing::info!(exit_code = code, "requesting exit on guest halt");
                             self.request_exit(i32::from(code), &event_send).await;
-                            return;
+                            return MicrovmTeardownStatus {
+                                vm_worker_stopped: true,
+                                auxiliary_workers_stopped: true,
+                            };
                         }
                         GuestPowerAction::Reset => {
                             // Reboot the VM in place.
@@ -400,13 +429,18 @@ impl VmController {
 
         // Ensure all workers are cleaned up before shutting down the mesh.
         self.vm_worker.stop();
-        if let Err(err) = self.vm_worker.join().await {
-            tracing::error!(
-                error = err.as_ref() as &dyn std::error::Error,
-                "vm worker join failed"
-            );
-        }
+        let vm_worker_stopped = match self.vm_worker.join().await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::error!(
+                    error = err.as_ref() as &dyn std::error::Error,
+                    "vm worker join failed"
+                );
+                false
+            }
+        };
 
+        let mut auxiliary_workers_stopped = true;
         if let Some(mut vnc) = self.vnc_worker.take() {
             vnc.stop();
             if let Err(err) = vnc.join().await {
@@ -414,6 +448,7 @@ impl VmController {
                     error = err.as_ref() as &dyn std::error::Error,
                     "vnc worker join failed"
                 );
+                auxiliary_workers_stopped = false;
             }
         }
 
@@ -424,10 +459,15 @@ impl VmController {
                     error = err.as_ref() as &dyn std::error::Error,
                     "gdb worker join failed"
                 );
+                auxiliary_workers_stopped = false;
             }
         }
 
         self.mesh.shutdown().await;
+        MicrovmTeardownStatus {
+            vm_worker_stopped,
+            auxiliary_workers_stopped,
+        }
     }
 
     async fn request_exit(&mut self, code: i32, events: &mesh::Sender<VmControllerEvent>) {
