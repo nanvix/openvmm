@@ -4,6 +4,7 @@
 use super::UnicodeString;
 use super::chk_status;
 use super::dos_to_nt_path;
+use super::security::SecurityDescriptor;
 use super::status_to_error;
 // TODO: Revert this ntapi fallback once windows/windows-sys expose
 // NtCreateNamedPipeFile directly.
@@ -46,13 +47,16 @@ use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
+use windows_sys::Win32::Storage::FileSystem::FILE_TYPE_PIPE;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA;
+use windows_sys::Win32::Storage::FileSystem::GetFileType;
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::System::Ioctl::FILE_ANY_ACCESS;
 use windows_sys::Win32::System::Ioctl::FILE_DEVICE_NAMED_PIPE;
 use windows_sys::Win32::System::Ioctl::METHOD_BUFFERED;
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Pipes::DisconnectNamedPipe;
+use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
 use windows_sys::Win32::System::Pipes::GetNamedPipeHandleStateW;
 use windows_sys::Win32::System::Pipes::GetNamedPipeInfo;
 use windows_sys::Win32::System::Pipes::PIPE_SERVER_END;
@@ -151,6 +155,28 @@ pub fn new_named_pipe(
         },
         true,
         mode == PipeMode::Message,
+        None,
+    )
+}
+
+pub fn new_named_pipe_with_security(
+    path: impl AsRef<Path>,
+    access: u32,
+    disposition: Disposition,
+    mode: PipeMode,
+    security_descriptor: &SecurityDescriptor,
+) -> io::Result<File> {
+    create_named_pipe(
+        null_mut(),
+        path.as_ref(),
+        access,
+        match disposition {
+            Disposition::Create => FILE_CREATE,
+            Disposition::Open => FILE_OPEN,
+        },
+        true,
+        mode == PipeMode::Message,
+        Some(security_descriptor),
     )
 }
 
@@ -161,6 +187,7 @@ fn create_named_pipe(
     disposition: u32,
     overlapped: bool,
     message_mode: bool,
+    security_descriptor: Option<&SecurityDescriptor>,
 ) -> Result<File, io::Error> {
     unsafe {
         let mut pathu = if root.is_null() {
@@ -174,7 +201,12 @@ fn create_named_pipe(
             RootDirectory: root.cast::<c_void>(),
             ObjectName: pathu.as_mut_ptr(),
             Attributes: OBJ_CASE_INSENSITIVE,
-            SecurityDescriptor: null_mut(),
+            SecurityDescriptor: security_descriptor.map_or(null_mut(), |descriptor| {
+                descriptor
+                    .as_ptr()
+                    .cast::<windows_sys::Win32::Security::SECURITY_DESCRIPTOR>()
+                    .cast_const()
+            }),
             SecurityQualityOfService: null_mut(),
         };
 
@@ -222,6 +254,7 @@ pub fn bidirectional_pair(message_mode: bool) -> io::Result<(File, File)> {
             FILE_CREATE,
             false,
             message_mode,
+            None,
         )?;
 
         let mut empty_name = zeroed();
@@ -246,6 +279,21 @@ pub fn bidirectional_pair(message_mode: bool) -> io::Result<(File, File)> {
         let write_pipe = File::from_raw_handle(write_pipe_handle.cast::<c_void>());
         Ok((read_pipe, write_pipe))
     }
+}
+
+pub fn client_process_id(pipe: &File) -> io::Result<u32> {
+    let mut process_id = 0;
+    // SAFETY: `pipe` is a live named-pipe handle and the output pointer is
+    // valid for the documented call.
+    if unsafe { GetNamedPipeClientProcessId(pipe.as_raw_handle(), &mut process_id) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(process_id)
+}
+
+pub fn is_pipe(file: &File) -> bool {
+    // SAFETY: `file` owns a valid Windows handle.
+    unsafe { GetFileType(file.as_raw_handle()) == FILE_TYPE_PIPE }
 }
 
 pub trait PipeExt {

@@ -215,6 +215,13 @@ describes the source definitions.
   unavailable. Workload requests cannot replace this identity. Snapshot
   restore takes the captured identity from the authoritative command line and
   rejects an override.
+* `--microvm-lifecycle <one-shot|managed>`: Select the host-owned workload
+  lifecycle written into the initial microVM command line. `one-shot` starts
+  one workload and expects the guest to terminate the VM when it completes.
+  `managed` keeps the guest supervisor resident for multiple sequential
+  workload requests and requires a fixed workload identity plus a live,
+  authenticated `--microvm-control-console`. Snapshot restore takes the
+  captured lifecycle and rejects an override.
 * `--restore-snapshot <DIR>`: Restore a microVM from a committed snapshot.
   The manifest supplies the authoritative RAM size, topology, ABI,
   fixed device inventory, effective kernel command line, source backend, CPU
@@ -615,11 +622,17 @@ Serial devices can be configured to appear as different devices inside the guest
   `nvx_control_tty=hvc2`.
 
   On Linux, the only live backend is `listen=PATH`, and PATH is always an
-  AF_UNIX socket. TCP, client-connect, terminal, file, stdout/stderr, and
-  inherited console backends are rejected. A listener's parent must already be
-  an owned, non-symlink directory with mode `0700`; OpenVMM exclusively binds
-  the socket, sets and verifies mode `0600`, and never removes a pre-existing
-  path. OpenVMM verifies `SO_PEERCRED` before accepting the protocol attachment.
+  AF_UNIX socket. Its parent must already be an owned, non-symlink directory
+  with mode `0700`; OpenVMM exclusively binds the socket, sets and verifies
+  mode `0600`, and verifies `SO_PEERCRED` before accepting the protocol
+  attachment.
+
+  On Windows, `listen=//./pipe/openvmm-microvm-<NAME>` creates one byte-mode
+  named pipe with a protected DACL granting access only to LocalSystem and the
+  OpenVMM process user. OpenVMM obtains the connecting process ID from the pipe,
+  resolves its token user SID, and requires it to match the OpenVMM process
+  user before capability authentication. TCP, client-connect, terminal, file,
+  stdout/stderr, and inherited control backends are rejected on every platform.
 
   A live endpoint also requires the hidden launcher option
   `--microvm-control-auth-stdin`. The launcher must attach a prepared readable
@@ -643,11 +656,8 @@ Serial devices can be configured to appear as different devices inside the guest
   [Control-session Protocol](./control_session_protocol.md).
 
   `none` does not consume stdin and rejects `--microvm-control-auth-stdin`.
-  OpenVMM generates an unreachable
-  random capability so disconnected process tests remain supported. Secure
-  Windows named-pipe SID verification and restrictive DACL creation are not
-  yet available in PAL, so live control-console endpoints are rejected on
-  Windows rather than falling back to capability-only authentication.
+  OpenVMM generates an unreachable random capability so disconnected process
+  tests remain supported.
 
   The numeric `--microvm-control-auth-handle` interface is not supported.
   Launchers must explicitly select the stdin contract; there is no fallback
