@@ -178,6 +178,29 @@ pub enum MicrovmNetworkActionCli {
     Deny,
 }
 
+/// Fixed numeric identity for microVM workloads.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct MicrovmWorkloadIdentityCli {
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+}
+
+impl FromStr for MicrovmWorkloadIdentityCli {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (uid, gid) = value
+            .split_once(':')
+            .filter(|(_, gid)| !gid.contains(':'))
+            .context("expected <UID>:<GID>")?;
+        let uid = uid.parse::<u32>().context("invalid workload UID")?;
+        let gid = gid.parse::<u32>().context("invalid workload GID")?;
+        anyhow::ensure!(uid != 0, "microVM workload UID must be nonzero");
+        anyhow::ensure!(gid != 0, "microVM workload GID must be nonzero");
+        Ok(Self { uid, gid })
+    }
+}
+
 /// Capture tier for a microVM sandbox snapshot.
 #[derive(Debug, Copy, Clone, ValueEnum, PartialEq, Eq)]
 pub enum SnapshotTierCli {
@@ -714,6 +737,13 @@ options:
     /// address and IRQ independent of option order.
     #[clap(long, value_name = "ROLE:DISK")]
     pub microvm_sandbox_block: Vec<MicrovmSandboxBlockCli>,
+
+    /// Run guest workloads under this fixed non-root numeric identity.
+    ///
+    /// The identity is part of the initial-boot command line and cannot be
+    /// replaced when restoring a snapshot.
+    #[clap(long, value_name = "UID:GID")]
+    pub microvm_workload_identity: Option<MicrovmWorkloadIdentityCli>,
 
     /// Attach a vhost-user device via a Unix socket.
     ///
@@ -1719,12 +1749,13 @@ impl Options {
                     && self.allow_endpoint.is_empty()
                     && self.microvm_mount.is_none()
                     && self.microvm_sandbox_block.is_empty()
+                    && self.microvm_workload_identity.is_none()
                     && self.restore_processors.is_none()
                     && self.restore_memory.is_none()
                     && self.memory_capacity.is_none()
                     && self.microvm_control_console.is_none()
                     && !self.microvm_control_auth_stdin,
-                "--network-profile, --net-tap, --mount, --microvm-sandbox-block, --microvm-control-console, --microvm-control-auth-stdin, --restore-processors, --restore-memory, --memory-capacity, and microVM network policy require a microVM machine"
+                "--network-profile, --net-tap, --mount, --microvm-sandbox-block, --microvm-workload-identity, --microvm-control-console, --microvm-control-auth-stdin, --restore-processors, --restore-memory, --memory-capacity, and microVM network policy require a microVM machine"
             );
             return Ok(());
         }
@@ -1782,6 +1813,10 @@ impl Options {
             }
         }
         if self.restore_snapshot.is_some() {
+            anyhow::ensure!(
+                self.microvm_workload_identity.is_none(),
+                "--microvm-workload-identity is fixed by the captured microVM command line"
+            );
             anyhow::ensure!(
                 self.net.is_empty(),
                 "microVM restore takes network addressing from saved state; do not pass --net"
@@ -6869,6 +6904,51 @@ mod tests {
         let standard =
             Options::try_parse_from(["openvmm", "--allow-endpoint", "192.0.2.7:443"]).unwrap();
         assert!(standard.validate_microvm_options().is_err());
+    }
+
+    #[test]
+    fn test_microvm_workload_identity_is_non_root_and_not_restorable() {
+        for identity in ["0:1", "1:0", "root:1", "1:root", "1", "1:2:3"] {
+            assert!(
+                Options::try_parse_from([
+                    "openvmm",
+                    "--machine",
+                    "microvm",
+                    "--microvm-workload-identity",
+                    identity,
+                ])
+                .is_err()
+            );
+        }
+
+        let options = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--microvm-workload-identity",
+            "65534:65534",
+        ])
+        .unwrap();
+        assert_eq!(
+            options.microvm_workload_identity,
+            Some(MicrovmWorkloadIdentityCli {
+                uid: 65_534,
+                gid: 65_534,
+            })
+        );
+        options.validate_microvm_options().unwrap();
+
+        let restore = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--restore-snapshot",
+            "snapshot",
+            "--microvm-workload-identity",
+            "65534:65534",
+        ])
+        .unwrap();
+        assert!(restore.validate_microvm_options().is_err());
     }
 
     #[test]
