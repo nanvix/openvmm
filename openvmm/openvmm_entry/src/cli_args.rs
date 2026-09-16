@@ -998,6 +998,31 @@ options:
     #[clap(long)]
     pub virtio_console: Option<SerialConfigCli>,
 
+    /// dedicated microVM control console backed by a local serial endpoint
+    ///
+    /// Accepts listen=\<path\> or none. The boot
+    /// virtio-console is required and remains the only kernel console.
+    #[clap(long, value_name = "SERIAL")]
+    pub microvm_control_console: Option<SerialConfigCli>,
+
+    /// read the control-console capability from a prepared stdin pipe
+    #[clap(
+        long,
+        hide = true,
+        requires("microvm_control_console"),
+        conflicts_with_all = ["rpc", "ttrpc", "grpc", "relay_console_path", "write_saved_state_proto", "paused"]
+    )]
+    pub microvm_control_auth_stdin: bool,
+
+    /// maximum time for a control-console client to authenticate
+    #[clap(
+        long = "microvm-control-auth-timeout-ms",
+        value_name = "MILLISECONDS",
+        default_value_t = 5000,
+        hide = true
+    )]
+    pub microvm_control_auth_timeout_ms: u64,
+
     /// attach the virtio-console device to the specified PCIe port
     #[clap(long, value_name = "PORT", requires("virtio_console"))]
     pub virtio_console_pcie_port: Option<String>,
@@ -1674,8 +1699,10 @@ impl Options {
                     && self.microvm_sandbox_block.is_empty()
                     && self.restore_processors.is_none()
                     && self.restore_memory.is_none()
-                    && self.memory_capacity.is_none(),
-                "--network-profile, --net-tap, --mount, --microvm-sandbox-block, --restore-processors, --restore-memory, --memory-capacity, and microVM egress policy require a microVM machine"
+                    && self.memory_capacity.is_none()
+                    && self.microvm_control_console.is_none()
+                    && !self.microvm_control_auth_stdin,
+                "--network-profile, --net-tap, --mount, --microvm-sandbox-block, --microvm-control-console, --microvm-control-auth-stdin, --restore-processors, --restore-memory, --memory-capacity, and microVM egress policy require a microVM machine"
             );
             return Ok(());
         }
@@ -1823,6 +1850,44 @@ impl Options {
             self.virtio_console.is_some() || self.virtio_console_pcie_port.is_none(),
             "--virtio-console-pcie-port requires --virtio-console"
         );
+        self.validate_control_stdin_console(self.virtio_console.as_ref())?;
+        if let Some(control_console) = &self.microvm_control_console {
+            anyhow::ensure!(
+                self.virtio_console.is_some() || self.restore_snapshot.is_some(),
+                "--microvm-control-console requires --virtio-console for a fresh boot"
+            );
+            anyhow::ensure!(
+                matches!(
+                    control_console,
+                    SerialConfigCli::Pipe(_) | SerialConfigCli::None
+                ),
+                "microVM control console requires listen=... or none"
+            );
+            anyhow::ensure!(
+                (1..=60_000).contains(&self.microvm_control_auth_timeout_ms),
+                "--microvm-control-auth-timeout-ms must be between 1 and 60000"
+            );
+            if matches!(control_console, SerialConfigCli::None) {
+                anyhow::ensure!(
+                    !self.microvm_control_auth_stdin,
+                    "--microvm-control-auth-stdin is not used with a disconnected control console"
+                );
+            } else {
+                anyhow::ensure!(
+                    cfg!(target_os = "linux"),
+                    "live microVM control consoles require Linux SO_PEERCRED support; secure Windows named-pipe SID/ACL support is not implemented"
+                );
+                anyhow::ensure!(
+                    self.microvm_control_auth_stdin,
+                    "live microVM control console requires --microvm-control-auth-stdin"
+                );
+            }
+        } else {
+            anyhow::ensure!(
+                !self.microvm_control_auth_stdin,
+                "--microvm-control-auth-stdin requires --microvm-control-console"
+            );
+        }
         anyhow::ensure!(
             self.disk.is_empty()
                 && self.nvme.is_empty()
@@ -1966,6 +2031,18 @@ impl Options {
             "microVM does not support VFIO or IOMMU devices"
         );
 
+        Ok(())
+    }
+
+    pub(crate) fn validate_control_stdin_console(
+        &self,
+        boot_console: Option<&SerialConfigCli>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.microvm_control_auth_stdin
+                || !matches!(boot_console, Some(SerialConfigCli::Console)),
+            "--microvm-control-auth-stdin reserves stdin; use a socket or none for the boot console"
+        );
         Ok(())
     }
 
@@ -6332,7 +6409,11 @@ mod tests {
         assert_eq!(
             with_control_console,
             format!(
-                "{MICROVM_CONSOLE_COMMAND_LINE} virtio_mmio.device=0x1000@0xd0002000:7 virtio_mmio.device=0x1000@0xd0007000:3 nvx_control_tty=hvc2"
+                "{MICROVM_CONSOLE_COMMAND_LINE} \
+                 virtio_mmio.device=0x1000@0xd0002000:7 \
+                 virtio_mmio.device=0x1000@0xd0007000:3 \
+                 {}",
+                openvmm_defs::config::MICROVM_CONTROL_TTY_COMMAND_LINE
             )
         );
 
@@ -6412,6 +6493,20 @@ mod tests {
         ] {
             assert!(build_microvm_command_line(&[reserved.into()], false).is_err());
         }
+        for reserved in [
+            "nvx_control_tty=hvc9",
+            "nvx-control-tty=hvc9",
+            "driver_async_probe=virtio_console",
+            "driver-async-probe=virtio_console",
+            "virtio-mmio.device=0x1000@0xd0007000:3",
+        ] {
+            assert!(build_microvm_control_command_line(&[reserved.into()], false).is_err());
+            assert!(build_microvm_command_line(&[reserved.into()], false).is_ok());
+        }
+        for delimiter in ["--", "\"driver-async-probe=virtio_console\""] {
+            assert!(build_microvm_control_command_line(&[delimiter.into()], false).is_err());
+            assert!(build_microvm_command_line(&[delimiter.into()], false).is_ok());
+        }
         assert!(build_microvm_command_line(&["foo=bar\0baz".into()], false).is_err());
         assert!(
             build_microvm_command_line(&["x".repeat(MICROVM_COMMAND_LINE_MAX_SIZE)], false)
@@ -6443,6 +6538,49 @@ mod tests {
         ])
         .unwrap();
         valid_console.validate_microvm_options().unwrap();
+        let valid_control_console = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--virtio-console",
+            "none",
+            "--microvm-control-console",
+            "none",
+        ])
+        .unwrap();
+        valid_control_console.validate_microvm_options().unwrap();
+        assert!(
+            Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--microvm-control-protocol-version",
+                "1",
+            ])
+            .is_err()
+        );
+        let valid_restore_control_console = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--restore-snapshot",
+            "snapshot",
+            "--microvm-control-console",
+            "listen=control.sock",
+            "--microvm-control-auth-stdin",
+        ])
+        .unwrap();
+        if cfg!(target_os = "linux") {
+            valid_restore_control_console
+                .validate_microvm_options()
+                .unwrap();
+        } else {
+            assert!(
+                valid_restore_control_console
+                    .validate_microvm_options()
+                    .is_err()
+            );
+        }
         let valid_network = Options::try_parse_from([
             "openvmm",
             "--machine",
@@ -6495,6 +6633,41 @@ mod tests {
                 "--virtio-console-pcie-port",
                 "port0",
             ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--microvm-control-console",
+                "none",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--virtio-console",
+                "none",
+                "--microvm-control-console",
+                "listen=tcp:127.0.0.1:5555",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--virtio-console",
+                "none",
+                "--microvm-control-console",
+                "listen=control.sock",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--virtio-console",
+                "none",
+                "--microvm-control-console",
+                "none",
+                "--microvm-control-auth-stdin",
+            ],
             vec!["openvmm", "--machine", "microvm", "--net", "consomme"],
             vec![
                 "openvmm",
@@ -6516,6 +6689,62 @@ mod tests {
             let options = Options::try_parse_from(args).unwrap();
             assert!(options.validate_microvm_options().is_err());
         }
+    }
+
+    #[test]
+    fn control_auth_stdin_is_explicit_and_exclusive() {
+        let args = [
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--virtio-console",
+            "none",
+            "--microvm-control-console",
+            "listen=control.sock",
+            "--microvm-control-auth-stdin",
+        ];
+        let options = Options::try_parse_from(args).unwrap();
+        assert!(options.microvm_control_auth_stdin);
+        assert_eq!(
+            options.validate_microvm_options().is_ok(),
+            cfg!(target_os = "linux")
+        );
+        assert!(
+            options
+                .validate_control_stdin_console(Some(&SerialConfigCli::Console))
+                .unwrap_err()
+                .to_string()
+                .contains("reserves stdin")
+        );
+        for console in [
+            SerialConfigCli::None,
+            SerialConfigCli::Pipe("boot.sock".into()),
+        ] {
+            options
+                .validate_control_stdin_console(Some(&console))
+                .unwrap();
+        }
+        for extra in [
+            vec!["--rpc", "path=management.sock"],
+            vec!["--ttrpc", "management.sock"],
+            vec!["--grpc", "management.sock"],
+            vec!["--relay-console-path", "console.sock"],
+            vec!["--write-saved-state-proto", "proto"],
+            vec!["--paused"],
+            vec!["--microvm-control-auth-handle", "0"],
+        ] {
+            assert!(Options::try_parse_from(args.into_iter().chain(extra)).is_err());
+        }
+        assert!(Options::try_parse_from(["openvmm", "--microvm-control-auth-stdin"]).is_err());
+        assert!(
+            Options::try_parse_from([
+                "openvmm",
+                "--microvm-control-console",
+                "listen=control.sock",
+                "--microvm-control-auth-stdin=0",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
