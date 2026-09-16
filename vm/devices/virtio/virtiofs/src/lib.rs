@@ -734,12 +734,23 @@ impl VirtioFs {
         let mut mount_options = LxVolumeOptions::new();
         mount_options.readonly(profile.is_readonly()).sandbox(true);
         let volume = mount_options.new_volume(root_path)?;
+        let denied_identities = profile
+            .denied_paths()
+            .iter()
+            .map(|path| {
+                volume
+                    .lstat(path)
+                    .map(|stat| (stat.device_nr, stat.inode_nr))
+            })
+            .collect::<lx::Result<Vec<_>>>()?;
         let mut inodes = InodeMap::new(false);
         let volume = Arc::new(VirtioFsVolume::new_with_strict_paths(
             volume,
             0,
             profile.is_readonly(),
             true,
+            profile.denied_paths().to_vec(),
+            denied_identities,
         ));
         let (root_inode, root_stat) = VirtioFsInode::new(Arc::clone(&volume), PathBuf::new())?;
         profile.validate_opened_root(root_path, &root_stat)?;
@@ -1349,6 +1360,9 @@ fn validate_saved_identity(
 
 fn validate_reopenable_alias(volume: &VirtioFsVolume, path: &Path) -> anyhow::Result<lx::Stat> {
     validate_relative_path(path, true).map_err(anyhow::Error::from)?;
+    volume
+        .ensure_path_allowed(path)
+        .map_err(anyhow::Error::from)?;
     let mut prefix = PathBuf::new();
     for component in path.components() {
         let std::path::Component::Normal(component) = component else {
@@ -2124,6 +2138,7 @@ mod microvm_tests {
             MICROVM_ATTACHMENT_ID.to_owned(),
             microvm_root_identity(root_path).unwrap(),
             true,
+            Vec::new(),
         )
         .unwrap()
     }
@@ -2224,6 +2239,36 @@ mod microvm_tests {
         );
         fs.inner.files.write().next_handle = 0;
         assert_eq!(fs.preflight_file_insert().unwrap_err(), lx::Error::ENOSPC);
+    }
+
+    #[test]
+    fn microvm_denied_subtree_is_not_lookupable() {
+        let temporary_directory = tempdir().unwrap();
+        let root_path = temporary_directory.path();
+        std::fs::create_dir(root_path.join("allowed")).unwrap();
+        std::fs::create_dir(root_path.join("secrets")).unwrap();
+        std::fs::write(root_path.join("secrets").join("token"), b"secret").unwrap();
+        let profile = MicroVmVirtioFsProfile::from_attachment(
+            MICROVM_ATTACHMENT_ID.to_owned(),
+            microvm_root_identity(root_path).unwrap(),
+            false,
+            vec!["secrets".to_owned()],
+        )
+        .unwrap();
+        let fs = VirtioFs::new_microvm(root_path, profile).unwrap();
+        let root = fs.get_inode(FUSE_ROOT_ID).unwrap();
+
+        let denied = match root.lookup_child(lx::LxStr::from_bytes(b"secrets")) {
+            Err(error) => error,
+            Ok(_) => panic!("denied subtree was lookupable"),
+        };
+        assert_eq!(denied, lx::Error::EACCES);
+        root.lookup_child(lx::LxStr::from_bytes(b"allowed"))
+            .unwrap();
+        assert_eq!(
+            root.child_path(lx::LxStr::from_bytes(b"..")).unwrap_err(),
+            lx::Error::EINVAL
+        );
     }
 
     #[test]
