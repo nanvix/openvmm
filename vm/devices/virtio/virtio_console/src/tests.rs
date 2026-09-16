@@ -8,6 +8,9 @@
 //! descriptor rings just as a guest driver would.
 
 use crate::VirtioConsoleDevice;
+use crate::control_session_protocol;
+use crate::control_session_protocol::Record;
+use crate::control_session_protocol::RecordType;
 use chipset_device::io::IoResult;
 use chipset_device::mmio::MmioIntercept;
 use futures::AsyncRead;
@@ -18,6 +21,7 @@ use pal_async::DefaultDriver;
 use pal_async::async_test;
 use pal_event::Event;
 use parking_lot::Mutex;
+use serial_core::LocalPeerIdentity;
 use serial_core::SerialIo;
 use std::collections::VecDeque;
 use std::io;
@@ -26,6 +30,7 @@ use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
+use std::time::Duration;
 use test_with_tracing::test;
 use virtio::DeviceQueueState;
 use virtio::QueueResources;
@@ -41,6 +46,7 @@ use virtio::test_helpers::wait_for_used;
 use virtio::test_helpers::write_descriptor;
 use virtio::transport::VirtioMmioDevice;
 use virtio_resources::console::VirtioConsoleDisconnectPolicy;
+use virtio_resources::console::VirtioControlConsoleBrokerConfig;
 use vmcore::device_state::ChangeDeviceState;
 use vmcore::interrupt::Interrupt;
 use vmcore::line_interrupt::LineInterrupt;
@@ -65,7 +71,7 @@ const TX_USED_ADDR: u64 = 0x12000;
 
 // Data area for payloads
 const DATA_BASE: u64 = 0x20000;
-const TOTAL_MEM_SIZE: usize = 0x30000;
+const TOTAL_MEM_SIZE: usize = 0x200000;
 
 // --- MockSerialIo ---
 
@@ -87,8 +93,13 @@ struct MockShared {
     write_limit_then_disconnect: Option<usize>,
     /// If set, each poll_write accepts at most this many bytes (persistent).
     max_write_size: Option<usize>,
+    write_blocked: bool,
+    write_waker: Option<Waker>,
     read_error_then_disconnect: bool,
+    connect_error: bool,
+    disconnect_error: bool,
     disconnect_poll_count: usize,
+    peer_identity: Option<LocalPeerIdentity>,
 }
 
 /// A mock `SerialIo` implementation backed by shared state.
@@ -113,6 +124,10 @@ impl SerialIo for MockSerialIo {
 
     fn poll_connect(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut shared = self.shared.lock();
+        if shared.connect_error {
+            shared.connect_error = false;
+            return Poll::Ready(Err(io::Error::other("injected connect error")));
+        }
         if shared.connected {
             Poll::Ready(Ok(()))
         } else {
@@ -124,6 +139,10 @@ impl SerialIo for MockSerialIo {
     fn poll_disconnect(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut shared = self.shared.lock();
         shared.disconnect_poll_count += 1;
+        if shared.disconnect_error {
+            shared.disconnect_error = false;
+            return Poll::Ready(Err(io::Error::other("injected disconnect error")));
+        }
         if shared.read_error_then_disconnect {
             shared.read_error_then_disconnect = false;
             shared.connected = false;
@@ -135,6 +154,15 @@ impl SerialIo for MockSerialIo {
             shared.disconnect_waker = Some(cx.waker().clone());
             Poll::Pending
         }
+    }
+
+    fn local_peer_identity(&self) -> io::Result<Option<LocalPeerIdentity>> {
+        Ok(self.shared.lock().peer_identity.clone())
+    }
+
+    fn disconnect_current(&mut self) -> io::Result<()> {
+        self.shared.lock().connected = false;
+        Ok(())
     }
 }
 
@@ -166,12 +194,16 @@ impl AsyncRead for MockSerialIo {
 impl AsyncWrite for MockSerialIo {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let mut shared = self.shared.lock();
         if !shared.connected {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        if shared.write_blocked {
+            shared.write_waker = Some(cx.waker().clone());
+            return Poll::Pending;
         }
         if let Some(limit) = shared.write_limit_then_disconnect.take() {
             let n = buf.len().min(limit);
@@ -263,6 +295,16 @@ impl MockSerialHandle {
         self.shared.lock().max_write_size = Some(max);
     }
 
+    fn set_write_blocked(&self, blocked: bool) {
+        let mut shared = self.shared.lock();
+        shared.write_blocked = blocked;
+        if !blocked {
+            if let Some(waker) = shared.write_waker.take() {
+                waker.wake();
+            }
+        }
+    }
+
     fn set_read_error_then_disconnect(&self) {
         let mut shared = self.shared.lock();
         shared.read_error_then_disconnect = true;
@@ -273,6 +315,22 @@ impl MockSerialHandle {
 
     fn disconnect_poll_count(&self) -> usize {
         self.shared.lock().disconnect_poll_count
+    }
+
+    fn is_connected(&self) -> bool {
+        self.shared.lock().connected
+    }
+
+    fn set_disconnect_error(&self) {
+        let mut shared = self.shared.lock();
+        shared.disconnect_error = true;
+        if let Some(waker) = shared.disconnect_waker.take() {
+            waker.wake();
+        }
+    }
+
+    fn set_peer_identity(&self, identity: Option<LocalPeerIdentity>) {
+        self.shared.lock().peer_identity = identity;
     }
 }
 
@@ -286,8 +344,13 @@ fn new_mock_serial() -> (MockSerialIo, MockSerialHandle) {
         disconnect_waker: None,
         write_limit_then_disconnect: None,
         max_write_size: None,
+        write_blocked: false,
+        write_waker: None,
         read_error_then_disconnect: false,
+        connect_error: false,
+        disconnect_error: false,
         disconnect_poll_count: 0,
+        peer_identity: Some(LocalPeerIdentity::UnixUid(1000)),
     }));
     (
         MockSerialIo {
@@ -324,6 +387,39 @@ impl TestHarness {
         driver: &DefaultDriver,
         disconnect_policy: VirtioConsoleDisconnectPolicy,
     ) -> Self {
+        Self::new_with_device(driver, |driver_source, io| {
+            VirtioConsoleDevice::new_with_policy(driver_source, io, disconnect_policy)
+        })
+    }
+
+    fn new_broker(driver: &DefaultDriver, instance_id: [u8; 16], capability: [u8; 32]) -> Self {
+        Self::new_broker_with_timeout(driver, instance_id, capability, 5000)
+    }
+
+    fn new_broker_with_timeout(
+        driver: &DefaultDriver,
+        instance_id: [u8; 16],
+        capability: [u8; 32],
+        auth_timeout_ms: u64,
+    ) -> Self {
+        Self::new_with_device(driver, |driver_source, io| {
+            VirtioConsoleDevice::new_broker(
+                driver_source,
+                io,
+                VirtioControlConsoleBrokerConfig {
+                    instance_id,
+                    capability,
+                    expected_peer_identity: LocalPeerIdentity::UnixUid(1000),
+                    auth_timeout_ms,
+                },
+            )
+        })
+    }
+
+    fn new_with_device(
+        driver: &DefaultDriver,
+        make_device: impl FnOnce(&VmTaskDriverSource, Box<dyn SerialIo>) -> VirtioConsoleDevice,
+    ) -> Self {
         let mem = GuestMemory::allocate(TOTAL_MEM_SIZE);
 
         init_avail_ring(&mem, RX_AVAIL_ADDR);
@@ -334,8 +430,7 @@ impl TestHarness {
         let (io, handle) = new_mock_serial();
 
         let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
-        let device =
-            VirtioConsoleDevice::new_with_policy(&driver_source, Box::new(io), disconnect_policy);
+        let device = make_device(&driver_source, Box::new(io));
 
         let rx_event = Event::new();
         let rx_interrupt_event = Event::new();
@@ -421,6 +516,22 @@ impl TestHarness {
         let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(self.driver.clone()));
         self.device =
             VirtioConsoleDevice::new_with_policy(&driver_source, Box::new(io), disconnect_policy);
+        self.handle = handle;
+    }
+
+    fn replace_with_broker(&mut self, instance_id: [u8; 16], capability: [u8; 32]) {
+        let (io, handle) = new_mock_serial();
+        let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(self.driver.clone()));
+        self.device = VirtioConsoleDevice::new_broker(
+            &driver_source,
+            Box::new(io),
+            VirtioControlConsoleBrokerConfig {
+                instance_id,
+                capability,
+                expected_peer_identity: LocalPeerIdentity::UnixUid(1000),
+                auth_timeout_ms: 5000,
+            },
+        );
         self.handle = handle;
     }
 
@@ -518,6 +629,34 @@ impl TestHarness {
         .await
     }
 
+    async fn send_guest_bytes(&mut self, desc_index: u16, bytes: &[u8]) {
+        self.post_tx_and_signal(desc_index, bytes);
+        let (used_id, used_len) = self.wait_for_tx_used().await;
+        assert_eq!(used_id, desc_index);
+        assert_eq!(used_len, 0);
+    }
+
+    async fn receive_guest_bytes(&mut self, desc_index: u16, size: u32) -> Vec<u8> {
+        let gpa = self.post_rx_buffer_and_signal(desc_index, size);
+        let (used_id, used_len) = self.wait_for_rx_used().await;
+        assert_eq!(used_id, desc_index);
+        let mut bytes = vec![0; used_len as usize];
+        self.mem.read_at(gpa, &mut bytes).unwrap();
+        bytes
+    }
+
+    async fn receive_guest_exact(&mut self, first_desc_index: u16, mut size: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(size);
+        let mut desc_index = first_desc_index;
+        while size != 0 {
+            let chunk = size.min(super::BUF_SIZE);
+            bytes.extend(self.receive_guest_bytes(desc_index, chunk as u32).await);
+            size -= chunk;
+            desc_index = (desc_index + 1) % QUEUE_SIZE;
+        }
+        bytes
+    }
+
     /// Disable the device.
     async fn disable(&mut self) {
         self.device.stop_queue(0).await;
@@ -561,6 +700,24 @@ async fn yield_until(mut condition: impl FnMut() -> bool) {
         yield_now().await;
     }
     assert!(condition(), "condition did not become true");
+}
+
+fn encode(record: &Record) -> Vec<u8> {
+    control_session_protocol::encode(record).unwrap()
+}
+
+fn decode(bytes: &[u8]) -> Record {
+    control_session_protocol::decode_exact(bytes).unwrap()
+}
+
+fn ack(instance_id: [u8; 16], epoch: u64) -> Record {
+    Record::session(
+        RecordType::Ack,
+        instance_id,
+        epoch,
+        0,
+        control_session_protocol::credit_payload(control_session_protocol::MIN_RECEIVE_CREDIT),
+    )
 }
 
 // --- Tests ---
@@ -1061,6 +1218,7 @@ async fn saved_state_validator_rejects_wrong_schema(driver: DefaultDriver) {
         partial_transmit: 0,
         staged_rx: Vec::new(),
         disconnect_policy_id: 0,
+        broker: None,
     });
     assert!(
         validator(
@@ -1103,6 +1261,7 @@ async fn saved_state_validator_rejects_tx_offset_past_descriptor(driver: Default
         partial_transmit: 6,
         staged_rx: Vec::new(),
         disconnect_policy_id: 0,
+        broker: None,
     });
     let queues = [
         DeviceQueueState {
@@ -1146,6 +1305,7 @@ async fn inactive_transport_restore_defers_console_private_state(driver: Default
         partial_transmit: 0,
         staged_rx: staged_rx.clone(),
         disconnect_policy_id: 0,
+        broker: None,
     }));
 
     let destination_harness = TestHarness::new(&driver);
@@ -1190,6 +1350,7 @@ async fn inactive_transport_restore_defers_console_private_state(driver: Default
         partial_transmit: 0,
         staged_rx: vec![0; super::MAX_STAGED_RX_BYTES + 1],
         disconnect_policy_id: 0,
+        broker: None,
     }));
     let invalid_harness = TestHarness::new(&driver);
     let mut invalid_destination = VirtioMmioDevice::new(
@@ -1203,4 +1364,745 @@ async fn inactive_transport_restore_defers_console_private_state(driver: Default
     )
     .unwrap();
     assert!(invalid_destination.restore(invalid).is_err());
+}
+
+const BROKER_INSTANCE: [u8; 16] = [0x51; 16];
+const BROKER_CAPABILITY: [u8; 32] = [0xa7; 32];
+
+async fn activate_broker(harness: &mut TestHarness) {
+    harness
+        .send_guest_bytes(
+            0,
+            &encode(&Record::bootstrap(RecordType::GuestAttach, Vec::new())),
+        )
+        .await;
+    let reset = decode(&harness.receive_guest_bytes(0, 128).await);
+    assert_eq!(reset.record_type, RecordType::Reset);
+    assert_eq!(reset.instance_id, BROKER_INSTANCE);
+
+    harness
+        .send_guest_bytes(1, &encode(&ack(BROKER_INSTANCE, 1)))
+        .await;
+    harness.handle.inject_rx_data(&encode(&Record::bootstrap(
+        RecordType::HostAttach,
+        BROKER_CAPABILITY.to_vec(),
+    )));
+    yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
+    let ready = decode(&harness.handle.take_tx_data());
+    assert_eq!(ready.record_type, RecordType::Ready);
+}
+
+#[async_test]
+async fn broker_cold_attach_ready_and_bidirectional_data(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    harness.enable().await;
+
+    harness.handle.inject_rx_data(&encode(&Record::bootstrap(
+        RecordType::HostAttach,
+        BROKER_CAPABILITY.to_vec(),
+    )));
+    yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
+    let wait = decode(&harness.handle.take_tx_data());
+    assert_eq!(wait.record_type, RecordType::Wait);
+
+    harness
+        .send_guest_bytes(
+            0,
+            &encode(&Record::bootstrap(RecordType::GuestAttach, Vec::new())),
+        )
+        .await;
+    let reset = decode(&harness.receive_guest_bytes(0, 128).await);
+    assert_eq!((reset.record_type, reset.epoch), (RecordType::Reset, 1));
+    harness
+        .send_guest_bytes(1, &encode(&ack(BROKER_INSTANCE, 1)))
+        .await;
+    yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
+    assert_eq!(
+        decode(&harness.handle.take_tx_data()).record_type,
+        RecordType::Ready
+    );
+
+    harness
+        .send_guest_bytes(
+            2,
+            &encode(&Record::session(
+                RecordType::Data,
+                BROKER_INSTANCE,
+                1,
+                1,
+                b"guest-to-host".to_vec(),
+            )),
+        )
+        .await;
+    yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN + 13)
+        .await;
+    let host_record = decode(&harness.handle.take_tx_data());
+    assert_eq!(host_record.payload, b"guest-to-host");
+
+    harness.handle.inject_rx_data(&encode(&Record::session(
+        RecordType::Data,
+        BROKER_INSTANCE,
+        1,
+        0,
+        b"host-to-guest".to_vec(),
+    )));
+    let guest_record = decode(&harness.receive_guest_bytes(1, 128).await);
+    assert_eq!(guest_record.payload, b"host-to-guest");
+}
+
+#[async_test]
+async fn broker_rejects_wrong_identity_before_reserving_host_slot(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    harness
+        .handle
+        .set_peer_identity(Some(LocalPeerIdentity::UnixUid(1001)));
+    harness.enable().await;
+    yield_until(|| !harness.handle.is_connected()).await;
+
+    harness
+        .send_guest_bytes(
+            0,
+            &encode(&Record::bootstrap(RecordType::GuestAttach, Vec::new())),
+        )
+        .await;
+    let reset = decode(&harness.receive_guest_bytes(0, 128).await);
+    assert_eq!((reset.record_type, reset.epoch), (RecordType::Reset, 1));
+
+    harness
+        .handle
+        .set_peer_identity(Some(LocalPeerIdentity::UnixUid(1000)));
+    harness.handle.reconnect();
+    harness.handle.inject_rx_data(&encode(&Record::bootstrap(
+        RecordType::HostAttach,
+        BROKER_CAPABILITY.to_vec(),
+    )));
+    yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
+    let wait = decode(&harness.handle.take_tx_data());
+    assert_eq!((wait.record_type, wait.epoch), (RecordType::Wait, 1));
+}
+
+#[async_test]
+async fn broker_rejects_wrong_capability_without_epoch_advance(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    harness.enable().await;
+    harness.handle.inject_rx_data(&encode(&Record::bootstrap(
+        RecordType::HostAttach,
+        [0x7d; 32].to_vec(),
+    )));
+    yield_until(|| !harness.handle.is_connected()).await;
+    assert!(harness.handle.tx_data().is_empty());
+
+    harness
+        .send_guest_bytes(
+            0,
+            &encode(&Record::bootstrap(RecordType::GuestAttach, Vec::new())),
+        )
+        .await;
+    let reset = decode(&harness.receive_guest_bytes(0, 128).await);
+    assert_eq!((reset.record_type, reset.epoch), (RecordType::Reset, 1));
+
+    harness.handle.reconnect();
+    harness.handle.inject_rx_data(&encode(&Record::bootstrap(
+        RecordType::HostAttach,
+        BROKER_CAPABILITY.to_vec(),
+    )));
+    yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
+    let wait = decode(&harness.handle.take_tx_data());
+    assert_eq!((wait.record_type, wait.epoch), (RecordType::Wait, 1));
+}
+
+#[async_test]
+async fn broker_auth_timeout_frees_slot_without_epoch_advance(driver: DefaultDriver) {
+    let mut harness =
+        TestHarness::new_broker_with_timeout(&driver, BROKER_INSTANCE, BROKER_CAPABILITY, 5);
+    harness.enable().await;
+    let mut timer = pal_async::timer::PolledTimer::new(&driver);
+    timer.sleep(Duration::from_millis(20)).await;
+    yield_until(|| !harness.handle.is_connected()).await;
+
+    harness
+        .send_guest_bytes(
+            0,
+            &encode(&Record::bootstrap(RecordType::GuestAttach, Vec::new())),
+        )
+        .await;
+    let reset = decode(&harness.receive_guest_bytes(0, 128).await);
+    assert_eq!((reset.record_type, reset.epoch), (RecordType::Reset, 1));
+
+    harness.handle.reconnect();
+    harness.handle.inject_rx_data(&encode(&Record::bootstrap(
+        RecordType::HostAttach,
+        BROKER_CAPABILITY.to_vec(),
+    )));
+    yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
+    let wait = decode(&harness.handle.take_tx_data());
+    assert_eq!((wait.record_type, wait.epoch), (RecordType::Wait, 1));
+}
+
+#[async_test]
+async fn broker_quiesce_stops_new_host_input(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    harness.enable().await;
+    activate_broker(&mut harness).await;
+
+    harness.device.quiesce_input().await.unwrap();
+    let host_data = encode(&Record::session(
+        RecordType::Data,
+        BROKER_INSTANCE,
+        1,
+        0,
+        b"after-quiesce".to_vec(),
+    ));
+    harness.handle.inject_rx_data(&host_data);
+    for _ in 0..20 {
+        yield_now().await;
+    }
+    assert_eq!(harness.handle.pending_rx_len(), host_data.len());
+
+    harness.device.resume_input().await.unwrap();
+    yield_until(|| harness.handle.pending_rx_len() == 0).await;
+    let record = decode(
+        &harness
+            .receive_guest_bytes(3, control_session_protocol::HEADER_LEN as u32 + 32)
+            .await,
+    );
+    assert_eq!(
+        (record.record_type, record.payload),
+        (RecordType::Data, b"after-quiesce".to_vec())
+    );
+}
+
+#[async_test]
+async fn broker_host_lifecycle_error_does_not_stop_guest_worker(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    harness.enable().await;
+    activate_broker(&mut harness).await;
+
+    harness.handle.set_disconnect_error();
+    let reset = decode(
+        &harness
+            .receive_guest_bytes(3, control_session_protocol::HEADER_LEN as u32)
+            .await,
+    );
+    assert_eq!((reset.record_type, reset.epoch), (RecordType::Reset, 2));
+    harness
+        .send_guest_bytes(4, &encode(&ack(BROKER_INSTANCE, 2)))
+        .await;
+    assert!(harness.device.stop_queue(0).await.is_some());
+    assert!(harness.device.stop_queue(1).await.is_some());
+    let (worker, state) = harness.device.worker.get();
+    let crate::ConsoleWorkerMode::Broker(mode) = &worker.mode else {
+        panic!("expected broker worker");
+    };
+    assert_eq!(
+        mode.broker.state(),
+        crate::control_session_broker::BrokerState::ReadyNoHost
+    );
+    assert!(state.is_some());
+}
+
+#[async_test]
+async fn broker_disconnect_emits_reset_without_guest_eof(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    harness.enable().await;
+    activate_broker(&mut harness).await;
+
+    harness.handle.disconnect();
+    let reset = decode(&harness.receive_guest_bytes(1, 128).await);
+    assert_eq!(
+        (reset.record_type, reset.instance_id, reset.epoch),
+        (RecordType::Reset, BROKER_INSTANCE, 2)
+    );
+
+    harness.handle.reconnect();
+    harness.handle.inject_rx_data(&encode(&Record::bootstrap(
+        RecordType::HostAttach,
+        BROKER_CAPABILITY.to_vec(),
+    )));
+    yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
+    let wait = decode(&harness.handle.take_tx_data());
+    assert_eq!((wait.record_type, wait.epoch), (RecordType::Wait, 2));
+}
+
+#[async_test]
+async fn broker_zero_credit_disconnects_and_reconnects_without_guest_release(
+    driver: DefaultDriver,
+) {
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    harness.enable().await;
+    activate_broker(&mut harness).await;
+
+    let full_host_record = encode(&Record::session(
+        RecordType::Data,
+        BROKER_INSTANCE,
+        1,
+        0,
+        vec![0x5a; control_session_protocol::MAX_DATA_LEN],
+    ));
+    let full_guest_record = encode(&Record::session(
+        RecordType::Data,
+        BROKER_INSTANCE,
+        1,
+        1,
+        vec![0x5a; control_session_protocol::MAX_DATA_LEN],
+    ));
+    harness.handle.inject_rx_data(&full_host_record);
+    assert_eq!(
+        harness
+            .receive_guest_exact(2, full_guest_record.len())
+            .await,
+        full_guest_record
+    );
+
+    let blocked = encode(&Record::session(
+        RecordType::Data,
+        BROKER_INSTANCE,
+        1,
+        1,
+        vec![0x44],
+    ));
+    harness.handle.inject_rx_data(&blocked);
+    yield_until(|| harness.handle.pending_rx_len() == 0).await;
+
+    harness.handle.disconnect();
+    let reset = decode(
+        &harness
+            .receive_guest_exact(4, control_session_protocol::HEADER_LEN)
+            .await,
+    );
+    assert_eq!((reset.record_type, reset.epoch), (RecordType::Reset, 2));
+
+    harness.handle.reconnect();
+    harness.handle.inject_rx_data(&encode(&Record::bootstrap(
+        RecordType::HostAttach,
+        BROKER_CAPABILITY.to_vec(),
+    )));
+    yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
+    assert_eq!(
+        decode(&harness.handle.take_tx_data()).record_type,
+        RecordType::Wait
+    );
+    harness
+        .send_guest_bytes(5, &encode(&ack(BROKER_INSTANCE, 2)))
+        .await;
+    yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
+    assert_eq!(
+        decode(&harness.handle.take_tx_data()).record_type,
+        RecordType::Ready
+    );
+}
+
+#[async_test]
+async fn broker_disconnect_finishes_partial_data_before_reset(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    harness.enable().await;
+    activate_broker(&mut harness).await;
+
+    let host_data = encode(&Record::session(
+        RecordType::Data,
+        BROKER_INSTANCE,
+        1,
+        0,
+        b"partially-emitted".to_vec(),
+    ));
+    let guest_data = encode(&Record::session(
+        RecordType::Data,
+        BROKER_INSTANCE,
+        1,
+        1,
+        b"partially-emitted".to_vec(),
+    ));
+    harness.handle.inject_rx_data(&host_data);
+    let first = harness.receive_guest_bytes(2, 13).await;
+    assert_eq!(first, guest_data[..13]);
+
+    harness.handle.disconnect();
+    let remainder = harness.receive_guest_exact(3, guest_data.len() - 13).await;
+    let mut completed = first;
+    completed.extend(remainder);
+    assert_eq!(completed, guest_data);
+    assert_eq!(
+        decode(
+            &harness
+                .receive_guest_exact(5, control_session_protocol::HEADER_LEN)
+                .await,
+        )
+        .record_type,
+        RecordType::Reset
+    );
+}
+
+#[async_test]
+async fn broker_device_reset_requires_a_fresh_host_attachment(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    harness.enable().await;
+    activate_broker(&mut harness).await;
+
+    harness.device.stop_queue(0).await;
+    harness.device.stop_queue(1).await;
+    harness.device.reset().await;
+    {
+        let (worker, _) = harness.device.worker.get();
+        let mode = match &worker.mode {
+            super::ConsoleWorkerMode::Broker(mode) => mode,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            mode.broker.state(),
+            crate::control_session_broker::BrokerState::AwaitGuestAttach
+        );
+        assert!(!mode.broker.host_is_connected());
+    }
+
+    harness.handle.disconnect();
+    harness.reset_rings();
+    harness.enable().await;
+    harness
+        .send_guest_bytes(
+            0,
+            &encode(&Record::bootstrap(RecordType::GuestAttach, Vec::new())),
+        )
+        .await;
+    let reset = decode(&harness.receive_guest_bytes(0, 128).await);
+    assert_eq!(
+        (reset.record_type, reset.instance_id, reset.epoch),
+        (RecordType::Reset, BROKER_INSTANCE, 1)
+    );
+}
+
+#[async_test]
+async fn broker_fragmentation_partial_host_writes_and_backpressure(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    harness.enable().await;
+
+    let guest_attach = encode(&Record::bootstrap(RecordType::GuestAttach, Vec::new()));
+    harness.send_guest_bytes(0, &guest_attach[..17]).await;
+    harness.send_guest_bytes(1, &guest_attach[17..]).await;
+    assert_eq!(
+        decode(&harness.receive_guest_bytes(0, 128).await).record_type,
+        RecordType::Reset
+    );
+    harness
+        .send_guest_bytes(2, &encode(&ack(BROKER_INSTANCE, 1)))
+        .await;
+
+    harness.handle.set_max_write_size(3);
+    let host_attach = encode(&Record::bootstrap(
+        RecordType::HostAttach,
+        BROKER_CAPABILITY.to_vec(),
+    ));
+    harness.handle.inject_rx_data(&host_attach[..11]);
+    for _ in 0..5 {
+        yield_now().await;
+    }
+    harness.handle.inject_rx_data(&host_attach[11..]);
+    yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
+    assert_eq!(
+        decode(&harness.handle.take_tx_data()).record_type,
+        RecordType::Ready
+    );
+
+    harness.handle.set_write_blocked(true);
+    for sequence in 1..=18 {
+        harness
+            .send_guest_bytes(
+                ((sequence + 2) % u64::from(QUEUE_SIZE)) as u16,
+                &encode(&Record::session(
+                    RecordType::Data,
+                    BROKER_INSTANCE,
+                    1,
+                    sequence,
+                    vec![sequence as u8],
+                )),
+            )
+            .await;
+    }
+    assert!(harness.handle.tx_data().is_empty());
+    harness.handle.set_write_blocked(false);
+    let expected = 18 * (control_session_protocol::HEADER_LEN + 1);
+    yield_until(|| harness.handle.tx_data().len() >= expected).await;
+    let bytes = harness.handle.take_tx_data();
+    let mut offset = 0;
+    for sequence in 1..=18 {
+        let end = offset + control_session_protocol::HEADER_LEN + 1;
+        let record = decode(&bytes[offset..end]);
+        assert_eq!(
+            (record.sequence, record.payload),
+            (sequence, vec![sequence as u8])
+        );
+        offset = end;
+    }
+    assert_eq!(offset, bytes.len());
+}
+
+#[async_test]
+async fn broker_restore_finishes_old_output_then_uses_fresh_identity(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    harness.enable().await;
+    activate_broker(&mut harness).await;
+
+    let old_data = encode(&Record::session(
+        RecordType::Data,
+        BROKER_INSTANCE,
+        1,
+        0,
+        b"partially-emitted".to_vec(),
+    ));
+    harness.handle.inject_rx_data(&old_data);
+    let first = harness.receive_guest_bytes(1, 13).await;
+    assert_eq!(first, old_data[..13]);
+
+    let old_guest_data = encode(&Record::session(
+        RecordType::Data,
+        BROKER_INSTANCE,
+        1,
+        1,
+        b"partially-parsed".to_vec(),
+    ));
+    harness.send_guest_bytes(2, &old_guest_data[..19]).await;
+
+    let receive_state = harness.device.stop_queue(0).await.unwrap();
+    let transmit_state = harness.device.stop_queue(1).await.unwrap();
+    let saved = harness.device.save_device().unwrap().unwrap();
+
+    const NEW_INSTANCE: [u8; 16] = [0x62; 16];
+    const NEW_CAPABILITY: [u8; 32] = [0xb8; 32];
+    harness.replace_with_broker(NEW_INSTANCE, NEW_CAPABILITY);
+    harness.device.restore_device(Some(saved)).unwrap();
+    assert!(!harness.handle.is_connected());
+    {
+        let (worker, _) = harness.device.worker.get();
+        let crate::ConsoleWorkerMode::Broker(mode) = &worker.mode else {
+            panic!("expected broker worker");
+        };
+        assert_eq!(
+            (
+                mode.broker.guest_receive_window(),
+                mode.broker.guest_receive_credit()
+            ),
+            (0, 0)
+        );
+    }
+    harness
+        .enable_with_state(Some(receive_state), Some(transmit_state))
+        .await;
+
+    let remainder = harness.receive_guest_bytes(2, 128).await;
+    let mut completed_old_output = first;
+    completed_old_output.extend(remainder);
+    let completed_old_output = decode(&completed_old_output);
+    assert_eq!(completed_old_output.payload, b"partially-emitted");
+    assert_eq!(completed_old_output.instance_id, BROKER_INSTANCE);
+    let new_reset = decode(&harness.receive_guest_bytes(3, 128).await);
+    assert_eq!(
+        (
+            new_reset.record_type,
+            new_reset.instance_id,
+            new_reset.epoch
+        ),
+        (RecordType::Reset, NEW_INSTANCE, 1)
+    );
+
+    harness.handle.reconnect();
+    harness.handle.inject_rx_data(&encode(&Record::bootstrap(
+        RecordType::HostAttach,
+        BROKER_CAPABILITY.to_vec(),
+    )));
+    yield_until(|| !harness.handle.is_connected()).await;
+    harness.handle.reconnect();
+    harness.handle.inject_rx_data(&encode(&Record::bootstrap(
+        RecordType::HostAttach,
+        NEW_CAPABILITY.to_vec(),
+    )));
+    yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
+    let wait = decode(&harness.handle.take_tx_data());
+    assert_eq!(
+        (wait.record_type, wait.instance_id, wait.epoch),
+        (RecordType::Wait, NEW_INSTANCE, 1)
+    );
+
+    harness.send_guest_bytes(3, &old_guest_data[19..]).await;
+    harness
+        .send_guest_bytes(4, &encode(&ack(NEW_INSTANCE, 1)))
+        .await;
+}
+
+#[async_test]
+async fn direct_and_broker_saved_state_schemas_are_not_interchangeable(driver: DefaultDriver) {
+    let mut direct = TestHarness::new(&driver);
+    direct.enable().await;
+    direct.device.stop_queue(0).await;
+    direct.device.stop_queue(1).await;
+    let direct_saved = direct.device.save_device().unwrap().unwrap();
+    let direct_state: crate::saved_state::SavedState = direct_saved.parse().unwrap();
+    assert_eq!(
+        direct_state.schema_version,
+        super::DIRECT_SAVED_STATE_VERSION
+    );
+    assert!(direct_state.broker.is_none());
+
+    let mut broker = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    assert!(broker.device.restore_device(Some(direct_saved)).is_err());
+
+    broker.enable().await;
+    broker.device.stop_queue(0).await;
+    broker.device.stop_queue(1).await;
+    let broker_saved = broker.device.save_device().unwrap().unwrap();
+    let broker_state: crate::saved_state::SavedState = broker_saved.parse().unwrap();
+    assert_eq!(
+        broker_state.schema_version,
+        super::BROKER_SAVED_STATE_VERSION
+    );
+    assert!(broker_state.broker.is_some());
+
+    let (io, _) = new_mock_serial();
+    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+    let mut direct_device = VirtioConsoleDevice::new(&driver_source, Box::new(io));
+    assert!(direct_device.restore_device(Some(broker_saved)).is_err());
+}
+
+#[async_test]
+async fn direct_schema_v1_allows_staged_rx_without_receive_queue(driver: DefaultDriver) {
+    let (io, _) = new_mock_serial();
+    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+    let device = VirtioConsoleDevice::new(&driver_source, Box::new(io));
+    let state = crate::saved_state::SavedState {
+        schema_version: super::DIRECT_SAVED_STATE_VERSION,
+        columns: 0,
+        rows: 0,
+        partial_transmit: 0,
+        staged_rx: vec![1],
+        disconnect_policy_id: 0,
+        broker: None,
+    };
+    let saved = SavedStateBlob::new(state);
+    let validator = device.device_state_validator();
+    assert!(
+        validator(
+            Some(&saved),
+            &VirtioDeviceFeatures::new(),
+            &[],
+            &GuestMemory::empty(),
+        )
+        .is_ok()
+    );
+}
+
+#[async_test]
+async fn oversized_saved_state_is_rejected_before_nested_decode(driver: DefaultDriver) {
+    let (io, _) = new_mock_serial();
+    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+    let device = VirtioConsoleDevice::new(&driver_source, Box::new(io));
+    let state = crate::saved_state::SavedState {
+        schema_version: super::DIRECT_SAVED_STATE_VERSION,
+        columns: 0,
+        rows: 0,
+        partial_transmit: 0,
+        staged_rx: vec![0; super::MAX_SAVED_STATE_BYTES],
+        disconnect_policy_id: 0,
+        broker: None,
+    };
+    let saved = SavedStateBlob::new(state);
+    assert!(saved.encoded_len() > super::MAX_SAVED_STATE_BYTES);
+    let validator = device.device_state_validator();
+    assert!(
+        validator(
+            Some(&saved),
+            &VirtioDeviceFeatures::new(),
+            &[],
+            &GuestMemory::empty(),
+        )
+        .is_err()
+    );
+}
+
+#[async_test]
+async fn broker_state_validator_rejects_malformed_private_state(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    harness.enable().await;
+    harness.device.stop_queue(0).await;
+    harness.device.stop_queue(1).await;
+    let saved = harness.device.save_device().unwrap().unwrap();
+    let mut state: crate::saved_state::SavedState = saved.parse().unwrap();
+    state.broker.as_mut().unwrap().guest_parser.header_count = u32::MAX;
+    let malformed = SavedStateBlob::new(state);
+    let validator = harness.device.device_state_validator();
+    assert!(
+        validator(
+            Some(&malformed),
+            &VirtioDeviceFeatures::new(),
+            &[],
+            &GuestMemory::empty(),
+        )
+        .is_err()
+    );
+
+    let mut state: crate::saved_state::SavedState = saved.parse().unwrap();
+    let broker = state.broker.as_mut().unwrap();
+    broker.instance_id = [0x44; 16].to_vec();
+    broker.guest_output.current = Some(crate::saved_state::SavedEncodedRecord {
+        bytes: encode(&Record::session(
+            RecordType::Reset,
+            BROKER_INSTANCE,
+            1,
+            0,
+            Vec::new(),
+        )),
+        offset: 1,
+    });
+    let malformed = SavedStateBlob::new(state);
+    assert!(
+        validator(
+            Some(&malformed),
+            &VirtioDeviceFeatures::new(),
+            &[],
+            &GuestMemory::empty(),
+        )
+        .is_err()
+    );
+}
+
+#[async_test]
+async fn malformed_host_input_detaches_without_panicking(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    harness.enable().await;
+    harness
+        .handle
+        .inject_rx_data(&[0x99; control_session_protocol::HEADER_LEN]);
+    for _ in 0..20 {
+        yield_now().await;
+    }
+    yield_until(|| !harness.handle.is_connected()).await;
+    harness.handle.reconnect();
+    harness.handle.inject_rx_data(&encode(&Record::bootstrap(
+        RecordType::HostAttach,
+        BROKER_CAPABILITY.to_vec(),
+    )));
+    yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
+    assert_eq!(
+        decode(&harness.handle.take_tx_data()).record_type,
+        RecordType::Wait
+    );
+}
+
+#[async_test]
+async fn malformed_guest_input_recovers_after_device_reset(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    harness.enable().await;
+    activate_broker(&mut harness).await;
+    harness.post_tx_and_signal(2, &[0x99; control_session_protocol::HEADER_LEN]);
+    for _ in 0..20 {
+        yield_now().await;
+    }
+
+    assert!(harness.device.stop_queue(0).await.is_some());
+    assert!(harness.device.stop_queue(1).await.is_some());
+    assert!(!harness.handle.is_connected());
+    assert!(harness.handle.tx_data().is_empty());
+
+    harness.device.reset().await;
+    harness.handle.reconnect();
+    harness.reset_rings();
+    harness.enable().await;
+    activate_broker(&mut harness).await;
 }
