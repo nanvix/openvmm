@@ -28,7 +28,6 @@ use vm_resource::Resource;
 use vm_resource::ResourceId;
 use vm_resource::declare_static_resolver;
 use vm_resource::kind::SerialBackendHandle;
-use windows_sys::Win32::Foundation::ERROR_PIPE_NOT_CONNECTED;
 
 #[derive(Debug, MeshPayload)]
 pub struct OpenWindowsPipeSerialConfig {
@@ -127,18 +126,22 @@ impl WindowsPipeSerialBackend {
     }
 
     fn disconnect(&mut self) -> io::Result<()> {
+        if !matches!(self.state, PipeState::Connected(_)) {
+            return Ok(());
+        }
         if let PipeState::Connected(pipe) = std::mem::replace(&mut self.state, PipeState::Done) {
             self.peer_identity = None;
             let pipe = pipe.into_inner();
             match pipe.disconnect_pipe() {
-                Ok(()) => {
-                    self.state = PipeState::Listening(ListeningPipe::new(&self.driver, pipe)?);
-                }
-                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_NOT_CONNECTED as i32) => {
-                    self.state = PipeState::Listening(ListeningPipe::new(&self.driver, pipe)?);
-                }
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotConnected | io::ErrorKind::BrokenPipe
+                    ) => {}
                 Err(error) => return Err(error),
             }
+            self.state = PipeState::Listening(ListeningPipe::new(&self.driver, pipe)?);
         }
         Ok(())
     }

@@ -102,6 +102,7 @@ struct MockShared {
     read_error_then_disconnect: bool,
     connect_error: bool,
     disconnect_error: bool,
+    disconnect_current_error: bool,
     disconnect_poll_count: usize,
     peer_identity: Option<LocalPeerIdentity>,
 }
@@ -165,7 +166,11 @@ impl SerialIo for MockSerialIo {
     }
 
     fn disconnect_current(&mut self) -> io::Result<()> {
-        self.shared.lock().connected = false;
+        let mut shared = self.shared.lock();
+        if shared.disconnect_current_error {
+            return Err(io::Error::other("injected disconnect_current error"));
+        }
+        shared.connected = false;
         Ok(())
     }
 }
@@ -333,6 +338,10 @@ impl MockSerialHandle {
         }
     }
 
+    fn set_disconnect_current_error(&self) {
+        self.shared.lock().disconnect_current_error = true;
+    }
+
     fn set_peer_identity(&self, identity: Option<LocalPeerIdentity>) {
         self.shared.lock().peer_identity = identity;
     }
@@ -353,6 +362,7 @@ fn new_mock_serial() -> (MockSerialIo, MockSerialHandle) {
         read_error_then_disconnect: false,
         connect_error: false,
         disconnect_error: false,
+        disconnect_current_error: false,
         disconnect_poll_count: 0,
         peer_identity: Some(LocalPeerIdentity::UnixUid(1000)),
     }));
@@ -1746,6 +1756,118 @@ async fn broker_disconnect_finishes_partial_data_before_reset(driver: DefaultDri
         )
         .record_type,
         RecordType::Reset
+    );
+}
+
+#[async_test]
+async fn broker_initial_device_reset_preserves_connected_host(driver: DefaultDriver) {
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    assert!(harness.handle.is_connected());
+
+    harness.device.reset().await;
+    {
+        let (worker, _) = harness.device.worker.get();
+        let mode = match &worker.mode {
+            super::ConsoleWorkerMode::Broker(mode) => mode,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            mode.broker.state(),
+            crate::control_session_broker::BrokerState::AwaitGuestAttach
+        );
+        assert!(!mode.broker.host_is_connected());
+    }
+    assert!(harness.handle.is_connected());
+
+    harness.enable().await;
+    harness.handle.inject_rx_data(&encode(&Record::bootstrap(
+        RecordType::HostAttach,
+        BROKER_CAPABILITY.to_vec(),
+    )));
+    yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
+    assert_eq!(
+        decode(&harness.handle.take_tx_data()).record_type,
+        RecordType::Wait
+    );
+    assert!(harness.handle.is_connected());
+}
+
+#[async_test]
+async fn broker_device_reset_keeps_quarantined_host_in_waiting_for_disconnect(
+    driver: DefaultDriver,
+) {
+    let mut harness = TestHarness::new_broker(&driver, BROKER_INSTANCE, BROKER_CAPABILITY);
+    harness
+        .handle
+        .set_peer_identity(Some(LocalPeerIdentity::UnixUid(4242)));
+    harness.handle.set_disconnect_current_error();
+    harness.enable().await;
+
+    yield_until(|| harness.handle.disconnect_poll_count() > 0).await;
+    let receive_state = harness.device.stop_queue(0).await;
+    let transmit_state = harness.device.stop_queue(1).await;
+    {
+        let (worker, _) = harness.device.worker.get();
+        let mode = match &worker.mode {
+            super::ConsoleWorkerMode::Broker(mode) => mode,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            mode.broker.state(),
+            crate::control_session_broker::BrokerState::AwaitGuestAttach
+        );
+        assert!(!mode.broker.host_is_connected());
+        assert_eq!(
+            mode.transport_state,
+            HostTransportState::WaitingForDisconnect
+        );
+    }
+    assert!(harness.handle.is_connected());
+
+    harness.device.reset().await;
+    {
+        let (worker, _) = harness.device.worker.get();
+        let mode = match &worker.mode {
+            super::ConsoleWorkerMode::Broker(mode) => mode,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            mode.broker.state(),
+            crate::control_session_broker::BrokerState::AwaitGuestAttach
+        );
+        assert!(!mode.broker.host_is_connected());
+        assert_eq!(
+            mode.transport_state,
+            HostTransportState::WaitingForDisconnect
+        );
+    }
+    assert!(harness.handle.is_connected());
+
+    harness
+        .enable_with_state(receive_state, transmit_state)
+        .await;
+    harness
+        .handle
+        .set_peer_identity(Some(LocalPeerIdentity::UnixUid(1000)));
+    let host_attach = encode(&Record::bootstrap(
+        RecordType::HostAttach,
+        BROKER_CAPABILITY.to_vec(),
+    ));
+    harness.handle.inject_rx_data(&host_attach);
+    for _ in 0..20 {
+        yield_now().await;
+    }
+    assert_eq!(harness.handle.pending_rx_len(), host_attach.len());
+    assert!(harness.handle.tx_data().is_empty());
+
+    let disconnect_polls_before = harness.handle.disconnect_poll_count();
+    harness.handle.disconnect();
+    yield_until(|| harness.handle.disconnect_poll_count() > disconnect_polls_before).await;
+    harness.handle.reconnect();
+    yield_until(|| harness.handle.tx_data().len() >= control_session_protocol::HEADER_LEN).await;
+    assert_eq!(
+        decode(&harness.handle.take_tx_data()).record_type,
+        RecordType::Wait
     );
 }
 
