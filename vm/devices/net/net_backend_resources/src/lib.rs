@@ -125,6 +125,13 @@ pub mod consomme {
         pub recv: Option<mesh::Receiver<ConsommeRequest>>,
         /// Optional exact static identity, mutually exclusive with `cidr`.
         pub static_ipv4: Option<StaticIpv4Config>,
+        /// Override guest access to host-local destination addresses.
+        pub allow_host_local_access: Option<bool>,
+        /// Override translation of the guest gateway onto host loopback.
+        pub map_gateway_to_host_loopback: Option<bool>,
+        /// Exact gateway TCP port translated to host loopback even when the
+        /// general gateway mapping is disabled.
+        pub gateway_loopback_proxy_port: Option<u16>,
     }
 
     impl ResourceId<NetEndpointHandleKind> for ConsommeHandle {

@@ -145,6 +145,23 @@ describes the source definitions.
   verifiable transport header. Parsing, canonicalization, and contradictory
   option checks complete before VM resources are opened.
 
+  `--host-loopback <allow|deny>` controls host-local connectivity in both
+  directions. The default is `allow`, preserving the portable profile's
+  existing guest-gateway-to-host-loopback mapping. `deny` blocks general
+  gateway and host-local destinations and rejects every
+  `--host-loopback-forward`.
+
+  `--network-proxy <IPv4:TCP-PORT>` preserves one exact proxy endpoint when
+  host loopback is denied. The guest-visible address must equal the derived
+  gateway, and only that TCP port is translated to host loopback. The exception
+  is included in the snapshot policy digest.
+
+  `--host-loopback-forward <tcp|udp:HOST-PORT:GUEST-PORT>` binds one localhost
+  port and forwards it into the guest. It requires explicit
+  `--host-loopback allow`; duplicate bindings and more than 64 forwards are
+  rejected before resources are opened. Live forwards are process-local
+  attachments and are rejected for snapshot capture or restore.
+
   Networked snapshots record the `portable` profile, drain accepted TX and
   endpoint-ready RX at the capture boundary, rewind unused guest RX
   descriptors, and recreate a fresh Consomme endpoint generation on restore.

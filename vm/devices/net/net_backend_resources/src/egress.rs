@@ -10,7 +10,8 @@ use std::str::FromStr;
 use thiserror::Error;
 
 /// Current encoding version used for snapshot egress-policy digests.
-pub const EGRESS_POLICY_ENCODING_VERSION: u32 = 2;
+pub const EGRESS_POLICY_ENCODING_VERSION: u32 = 3;
+const PREVIOUS_EGRESS_POLICY_ENCODING_VERSION: u32 = 2;
 const LEGACY_EGRESS_POLICY_ENCODING_VERSION: u32 = 1;
 const ETHERNET_BROADCAST: [u8; 6] = [0xff; 6];
 const ETHERNET_UNSPECIFIED: [u8; 6] = [0; 6];
@@ -361,6 +362,14 @@ pub enum InvalidEgressPolicy {
     /// A decoded policy carried next hops that do not match its bound rules.
     #[error("egress policy next hops do not match the bound endpoint rules")]
     InvalidNextHops,
+    /// A proxy exception did not use the guest-visible gateway address.
+    #[error("network proxy address {actual} must match the guest gateway {expected}")]
+    InvalidProxyAddress {
+        /// Supplied proxy address.
+        actual: Ipv4Addr,
+        /// Required guest-visible address.
+        expected: Ipv4Addr,
+    },
 }
 
 /// Egress policy bound to one static microVM link.
@@ -372,6 +381,8 @@ pub struct EgressPolicy {
     gateway_ipv4: Ipv4Addr,
     next_hops: Vec<Ipv4Addr>,
     mode: EgressPolicyMode,
+    host_loopback: EgressAction,
+    proxy_endpoint: Option<TcpEndpoint>,
 }
 
 impl EgressPolicy {
@@ -485,7 +496,33 @@ impl EgressPolicy {
             gateway_ipv4,
             next_hops,
             mode,
+            host_loopback: EgressAction::Allow,
+            proxy_endpoint: None,
         })
+    }
+
+    /// Applies the host-loopback posture and optional exact proxy exception.
+    pub fn with_host_loopback(
+        mut self,
+        host_loopback: EgressAction,
+        proxy_endpoint: Option<TcpEndpoint>,
+    ) -> Result<Self, InvalidEgressPolicy> {
+        if let Some(proxy) = proxy_endpoint
+            && proxy.address != self.gateway_ipv4
+        {
+            return Err(InvalidEgressPolicy::InvalidProxyAddress {
+                actual: proxy.address,
+                expected: self.gateway_ipv4,
+            });
+        }
+        if proxy_endpoint.is_some() && !self.next_hops.contains(&self.gateway_ipv4) {
+            self.next_hops.push(self.gateway_ipv4);
+            self.next_hops.sort_unstable();
+            self.next_hops.dedup();
+        }
+        self.host_loopback = host_loopback;
+        self.proxy_endpoint = proxy_endpoint;
+        Ok(self)
     }
 
     /// Revalidates canonical fields after a serialized policy crosses a boundary.
@@ -496,7 +533,8 @@ impl EgressPolicy {
             self.guest_mac,
             self.gateway_ipv4,
             self.mode.clone(),
-        )?;
+        )?
+        .with_host_loopback(self.host_loopback, self.proxy_endpoint)?;
         if rebound.mode != self.mode {
             return Err(InvalidEgressPolicy::NonCanonicalRules);
         }
@@ -526,6 +564,16 @@ impl EgressPolicy {
     /// Returns the canonical next hops that ARP may resolve.
     pub fn next_hops(&self) -> &[Ipv4Addr] {
         &self.next_hops
+    }
+
+    /// Returns whether general host-loopback connectivity is permitted.
+    pub fn host_loopback_action(&self) -> EgressAction {
+        self.host_loopback
+    }
+
+    /// Returns the exact proxy endpoint exempted from host-loopback denial.
+    pub fn proxy_endpoint(&self) -> Option<TcpEndpoint> {
+        self.proxy_endpoint
     }
 
     /// Returns whether packet parsing and filtering are active.
@@ -636,14 +684,15 @@ impl EgressPolicy {
 
     /// Returns stable bytes suitable for a policy digest.
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        self.canonical_bytes_v2()
+        self.canonical_bytes_v3()
     }
 
     /// Returns canonical bytes for a supported snapshot encoding version.
     pub fn canonical_bytes_for_version(&self, version: u32) -> Option<Vec<u8>> {
         match version {
             LEGACY_EGRESS_POLICY_ENCODING_VERSION => Some(self.canonical_bytes_v1()),
-            EGRESS_POLICY_ENCODING_VERSION => Some(self.canonical_bytes_v2()),
+            PREVIOUS_EGRESS_POLICY_ENCODING_VERSION => Some(self.canonical_bytes_v2()),
+            EGRESS_POLICY_ENCODING_VERSION => Some(self.canonical_bytes_v3()),
             _ => None,
         }
     }
@@ -673,6 +722,23 @@ impl EgressPolicy {
         bytes
     }
 
+    fn canonical_bytes_v3(&self) -> Vec<u8> {
+        let mut bytes = self.canonical_bytes_v2();
+        bytes[0] = EGRESS_POLICY_ENCODING_VERSION as u8;
+        bytes.push(match self.host_loopback {
+            EgressAction::Allow => 0,
+            EgressAction::Deny => 1,
+        });
+        if let Some(proxy) = self.proxy_endpoint {
+            bytes.push(1);
+            bytes.extend_from_slice(&proxy.address.octets());
+            bytes.extend_from_slice(&proxy.port.to_be_bytes());
+        } else {
+            bytes.push(0);
+        }
+        bytes
+    }
+
     /// Validates and authorizes an Ethernet frame before backend submission.
     pub fn authorize_frame(
         &self,
@@ -682,7 +748,7 @@ impl EgressPolicy {
         if !self.is_active() {
             return Ok(());
         }
-        if matches!(self.mode, EgressPolicyMode::DenyAll) {
+        if matches!(self.mode, EgressPolicyMode::DenyAll) && self.proxy_endpoint.is_none() {
             return Err(EgressDenied::AllTrafficDenied);
         }
         ensure_available(frame_prefix, frame_length, 14, "Ethernet header")?;
@@ -782,6 +848,23 @@ impl EgressPolicy {
 
         let destination = read_ipv4(frame, offset + 16);
         let fragments = read_u16(frame, offset + 6) & 0x3fff;
+        if let Some(proxy) = self.proxy_endpoint
+            && destination == proxy.address
+            && fragments == 0
+            && frame[offset + 9] == 6
+        {
+            validate_transport(
+                frame,
+                frame_length,
+                offset,
+                header_length,
+                total_length,
+                fragments,
+            )?;
+            if read_u16(frame, offset + header_length + 2) == proxy.port {
+                return Ok(());
+            }
+        }
         match &self.mode {
             EgressPolicyMode::AllowAll => Ok(()),
             EgressPolicyMode::DenyAll => Err(EgressDenied::AllTrafficDenied),
@@ -1576,6 +1659,44 @@ mod tests {
             Err(EgressDenied::FragmentDenied)
         );
         assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn host_loopback_denial_preserves_only_the_exact_proxy() {
+        let proxy: TcpEndpoint = "10.0.0.1:8443".parse().unwrap();
+        let policy = bind(EgressPolicyMode::DenyAll)
+            .with_host_loopback(EgressAction::Deny, Some(proxy))
+            .unwrap();
+        assert_eq!(policy.host_loopback_action(), EgressAction::Deny);
+        assert_eq!(policy.proxy_endpoint(), Some(proxy));
+        assert_eq!(policy.next_hops(), &[GATEWAY_IPV4]);
+
+        let arp = arp_request(GATEWAY_IPV4, ETHERNET_BROADCAST, ETHERNET_UNSPECIFIED);
+        policy.authorize_frame(&arp, arp.len()).unwrap();
+        let allowed = tcp_frame(GATEWAY_IPV4, 8443);
+        policy.authorize_frame(&allowed, allowed.len()).unwrap();
+        let denied = tcp_frame(GATEWAY_IPV4, 8080);
+        assert_eq!(
+            policy.authorize_frame(&denied, denied.len()),
+            Err(EgressDenied::AllTrafficDenied)
+        );
+        assert_ne!(
+            policy
+                .canonical_bytes_for_version(PREVIOUS_EGRESS_POLICY_ENCODING_VERSION)
+                .unwrap(),
+            policy.canonical_bytes()
+        );
+        assert!(policy.validate().is_ok());
+
+        let invalid_proxy: TcpEndpoint = "192.0.2.1:8443".parse().unwrap();
+        assert_eq!(
+            bind(EgressPolicyMode::AllowAll)
+                .with_host_loopback(EgressAction::Deny, Some(invalid_proxy)),
+            Err(InvalidEgressPolicy::InvalidProxyAddress {
+                actual: Ipv4Addr::new(192, 0, 2, 1),
+                expected: GATEWAY_IPV4,
+            })
+        );
     }
 
     #[test]

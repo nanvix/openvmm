@@ -210,6 +210,55 @@ pub enum MicrovmLifecycleCli {
     Managed,
 }
 
+/// Protocol for a localhost-to-guest port forward.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MicrovmLoopbackForwardProtocol {
+    /// Forward a TCP listener.
+    Tcp,
+    /// Forward a UDP socket.
+    Udp,
+}
+
+/// Explicit localhost port allowed to initiate traffic toward the guest.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MicrovmLoopbackForwardCli {
+    pub(crate) protocol: MicrovmLoopbackForwardProtocol,
+    pub(crate) host_port: u16,
+    pub(crate) guest_port: u16,
+}
+
+impl FromStr for MicrovmLoopbackForwardCli {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let fields = value.split(':').collect::<Vec<_>>();
+        let [protocol, host_port, guest_port] = fields.as_slice() else {
+            anyhow::bail!("expected <tcp|udp>:<HOST-PORT>:<GUEST-PORT>");
+        };
+        let protocol = match *protocol {
+            "tcp" => MicrovmLoopbackForwardProtocol::Tcp,
+            "udp" => MicrovmLoopbackForwardProtocol::Udp,
+            other => anyhow::bail!("invalid loopback-forward protocol '{other}'"),
+        };
+        let host_port = host_port
+            .parse::<u16>()
+            .context("invalid loopback-forward host port")?;
+        let guest_port = guest_port
+            .parse::<u16>()
+            .context("invalid loopback-forward guest port")?;
+        anyhow::ensure!(host_port != 0, "loopback-forward host port must be nonzero");
+        anyhow::ensure!(
+            guest_port != 0,
+            "loopback-forward guest port must be nonzero"
+        );
+        Ok(Self {
+            protocol,
+            host_port,
+            guest_port,
+        })
+    }
+}
+
 /// Capture tier for a microVM sandbox snapshot.
 #[derive(Debug, Copy, Clone, ValueEnum, PartialEq, Eq)]
 pub enum SnapshotTierCli {
@@ -845,6 +894,18 @@ options:
         value_name = "IPv4[/PREFIX][:tcp|udp:PORT]"
     )]
     pub network_egress_deny: Vec<net_backend_resources::egress::EgressRule>,
+
+    /// Permit or deny host-loopback connectivity in both directions.
+    #[clap(long, value_enum, value_name = "ACTION")]
+    pub host_loopback: Option<MicrovmNetworkActionCli>,
+
+    /// Exact guest-gateway TCP endpoint retained when host loopback is denied.
+    #[clap(long, value_name = "IPv4:TCP-PORT")]
+    pub network_proxy: Option<net_backend_resources::egress::TcpEndpoint>,
+
+    /// Forward one localhost TCP/UDP port into the guest.
+    #[clap(long, value_name = "tcp|udp:HOST-PORT:GUEST-PORT")]
+    pub host_loopback_forward: Vec<MicrovmLoopbackForwardCli>,
 
     /// Select a preconfigured Linux TAP for a microVM NIC.
     ///
@@ -1782,6 +1843,9 @@ impl Options {
                     && self.network_ingress.is_none()
                     && self.network_egress_allow.is_empty()
                     && self.network_egress_deny.is_empty()
+                    && self.host_loopback.is_none()
+                    && self.network_proxy.is_none()
+                    && self.host_loopback_forward.is_empty()
                     && self.allow_host.is_empty()
                     && self.block_host.is_empty()
                     && self.allow_endpoint.is_empty()
@@ -2126,6 +2190,33 @@ impl Options {
             "microVM egress policy permits at most 256 allow rules and 256 deny rules"
         );
         anyhow::ensure!(
+            self.host_loopback_forward.len() <= 64,
+            "microVM host loopback permits at most 64 explicit port forwards"
+        );
+        if !self.host_loopback_forward.is_empty() {
+            anyhow::ensure!(
+                self.host_loopback == Some(MicrovmNetworkActionCli::Allow),
+                "--host-loopback-forward requires explicit --host-loopback allow"
+            );
+            anyhow::ensure!(
+                self.snapshot_destination.is_none() && self.restore_snapshot.is_none(),
+                "microVM snapshots do not support live host-loopback port forwards"
+            );
+            let mut forwards = self.host_loopback_forward.clone();
+            forwards.sort_unstable();
+            forwards.dedup();
+            anyhow::ensure!(
+                forwards.len() == self.host_loopback_forward.len(),
+                "microVM host-loopback port forwards must be unique"
+            );
+            anyhow::ensure!(
+                forwards.windows(2).all(|pair| {
+                    pair[0].protocol != pair[1].protocol || pair[0].host_port != pair[1].host_port
+                }),
+                "microVM host-loopback forwards cannot bind one protocol and host port more than once"
+            );
+        }
+        anyhow::ensure!(
             self.network_egress_allow.is_empty() && self.network_egress_deny.is_empty()
                 || self.network_egress.is_some(),
             "--network-egress is required with --network-egress-allow or --network-egress-deny"
@@ -2153,6 +2244,9 @@ impl Options {
                 && self.allow_endpoint.is_empty()
                 && self.network_egress_allow.is_empty()
                 && self.network_egress_deny.is_empty()
+                && self.host_loopback.is_none()
+                && self.network_proxy.is_none()
+                && self.host_loopback_forward.is_empty()
                 && self.network_egress.is_none()
                 && self.network_ingress.is_none())
                 || !self.net.is_empty()
@@ -2233,6 +2327,14 @@ impl Options {
             network.derived_gateway_ipv4,
             mode,
         )
+        .and_then(|policy| {
+            policy.with_host_loopback(
+                self.host_loopback
+                    .unwrap_or(MicrovmNetworkActionCli::Allow)
+                    .into(),
+                self.network_proxy,
+            )
+        })
     }
 }
 
@@ -7087,6 +7189,99 @@ mod tests {
             ])
             .unwrap();
             assert!(mixed_legacy.validate_microvm_options().is_err());
+        }
+
+        #[test]
+        fn test_microvm_host_loopback_policy_is_bidirectional_and_proxy_scoped() {
+            let network: openvmm_defs::config::MicrovmNetworkConfig =
+                "10.0.0.2/24".parse().unwrap();
+            let denied = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--net",
+                "10.0.0.2/24",
+                "--network-profile",
+                "portable",
+                "--host-loopback",
+                "deny",
+                "--network-proxy",
+                "10.0.0.1:8443",
+            ])
+            .unwrap();
+            denied.validate_microvm_options().unwrap();
+            let policy = denied.microvm_egress_policy(&network).unwrap();
+            assert_eq!(
+                policy.host_loopback_action(),
+                net_backend_resources::egress::EgressAction::Deny
+            );
+            assert_eq!(policy.proxy_endpoint().unwrap().port(), 8443);
+
+            let wrong_proxy = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--net",
+                "10.0.0.2/24",
+                "--network-profile",
+                "portable",
+                "--host-loopback",
+                "deny",
+                "--network-proxy",
+                "192.0.2.1:8443",
+            ])
+            .unwrap();
+            assert!(wrong_proxy.validate_microvm_options().is_err());
+
+            let denied_forward = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--net",
+                "10.0.0.2/24",
+                "--network-profile",
+                "portable",
+                "--host-loopback",
+                "deny",
+                "--host-loopback-forward",
+                "tcp:3000:8080",
+            ])
+            .unwrap();
+            assert!(denied_forward.validate_microvm_options().is_err());
+
+            let allowed_forward = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--net",
+                "10.0.0.2/24",
+                "--network-profile",
+                "portable",
+                "--host-loopback",
+                "allow",
+                "--host-loopback-forward",
+                "tcp:3000:8080",
+            ])
+            .unwrap();
+            allowed_forward.validate_microvm_options().unwrap();
+
+            let duplicate_forward = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--net",
+                "10.0.0.2/24",
+                "--network-profile",
+                "portable",
+                "--host-loopback",
+                "allow",
+                "--host-loopback-forward",
+                "tcp:3000:8080",
+                "--host-loopback-forward",
+                "tcp:3000:8081",
+            ])
+            .unwrap();
+            assert!(duplicate_forward.validate_microvm_options().is_err());
         }
 
         let options = Options::try_parse_from([

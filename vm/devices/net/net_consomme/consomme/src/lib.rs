@@ -206,6 +206,9 @@ pub struct ConsommeParams {
     pub allow_host_local_access: bool,
     /// If true, translate guest traffic to the IPv4 gateway onto host loopback.
     pub map_gateway_to_host_loopback: bool,
+    /// Exact gateway TCP port translated to host loopback independently of the
+    /// general gateway mapping.
+    pub gateway_loopback_proxy_port: Option<u16>,
     /// Per-connection TCP receive ring buffer bounds (guest-to-host).
     pub tcp_rx_buffer: TcpBufferBounds,
     /// Per-connection TCP transmit ring buffer bounds (host-to-guest).
@@ -279,6 +282,7 @@ impl ConsommeParams {
             skip_ipv6_checks: false,
             allow_host_local_access: false,
             map_gateway_to_host_loopback: false,
+            gateway_loopback_proxy_port: None,
             tcp_rx_buffer: DEFAULT_TCP_BUFFER_BOUNDS,
             tcp_tx_buffer: DEFAULT_TCP_BUFFER_BOUNDS,
         })
@@ -548,18 +552,19 @@ impl ConsommeState {
     /// Resolve a destination address that the guest is sending to. If it is a
     /// virtual mapped address, return the real host address. Otherwise return
     /// the address unchanged.
-    fn resolve_destination(&self, addr: &SocketAddr) -> SocketAddr {
-        if self.params.map_gateway_to_host_loopback
-            && let SocketAddr::V4(address) = addr
+    fn resolve_destination(&self, addr: &SocketAddr) -> Option<SocketAddr> {
+        if let SocketAddr::V4(address) = addr
             && *address.ip() == self.params.gateway_ip
         {
-            return SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, address.port()));
+            return (self.params.map_gateway_to_host_loopback
+                || self.params.gateway_loopback_proxy_port == Some(address.port()))
+            .then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, address.port())));
         }
         let ip = addr.ip();
         if let Some(real_ip) = self.local_addr_map.resolve_virtual(&ip) {
-            SocketAddr::new(real_ip, addr.port())
+            Some(SocketAddr::new(real_ip, addr.port()))
         } else {
-            *addr
+            Some(*addr)
         }
     }
 }

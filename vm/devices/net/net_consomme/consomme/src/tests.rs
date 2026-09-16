@@ -424,7 +424,36 @@ fn static_ipv4_identity_is_exact_and_disables_ipv6_advertisement() {
         consomme
             .state
             .resolve_destination(&"192.168.5.33:8080".parse().unwrap()),
-        "127.0.0.1:8080".parse().unwrap()
+        Some("127.0.0.1:8080".parse().unwrap())
+    );
+}
+
+#[test]
+fn gateway_loopback_can_be_denied_with_one_proxy_exception() {
+    let mut params = ConsommeParams::new().unwrap();
+    params
+        .set_static_ipv4(
+            Ipv4Addr::new(192, 168, 5, 37),
+            28,
+            Ipv4Addr::new(192, 168, 5, 33),
+            [0x52, 0x54, 0, 168, 5, 33],
+        )
+        .unwrap();
+    params.map_gateway_to_host_loopback = false;
+    params.gateway_loopback_proxy_port = Some(8443);
+    let consomme = Consomme::new(params);
+
+    assert_eq!(
+        consomme
+            .state
+            .resolve_destination(&"192.168.5.33:8080".parse().unwrap()),
+        None
+    );
+    assert_eq!(
+        consomme
+            .state
+            .resolve_destination(&"192.168.5.33:8443".parse().unwrap()),
+        Some("127.0.0.1:8443".parse().unwrap())
     );
 }
 
