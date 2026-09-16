@@ -144,6 +144,116 @@ impl FromStr for TcpEndpoint {
     }
 }
 
+/// Default action for a rule-based egress policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, MeshPayload)]
+pub enum EgressAction {
+    /// Permit traffic that matches no rule.
+    Allow,
+    /// Deny traffic that matches no rule.
+    Deny,
+}
+
+/// Optional transport restriction for an egress rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, MeshPayload)]
+pub enum EgressTransport {
+    /// Match every IPv4 protocol and port.
+    Any,
+    /// Match one TCP destination port.
+    Tcp,
+    /// Match one UDP destination port.
+    Udp,
+}
+
+/// A canonical IPv4 destination rule with an optional TCP or UDP port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, MeshPayload)]
+pub struct EgressRule {
+    destination: Ipv4Cidr,
+    transport: EgressTransport,
+    port: u16,
+}
+
+impl EgressRule {
+    /// Returns the destination prefix.
+    pub fn destination(self) -> Ipv4Cidr {
+        self.destination
+    }
+
+    /// Returns the optional transport restriction.
+    pub fn transport(self) -> EgressTransport {
+        self.transport
+    }
+
+    /// Returns the restricted port, or zero for an address-only rule.
+    pub fn port(self) -> u16 {
+        self.port
+    }
+
+    fn matches(self, destination: Ipv4Addr, transport: Option<(EgressTransport, u16)>) -> bool {
+        if !self.destination.contains(destination) {
+            return false;
+        }
+        match self.transport {
+            EgressTransport::Any => true,
+            expected => {
+                transport.is_some_and(|(actual, port)| actual == expected && port == self.port)
+            }
+        }
+    }
+}
+
+/// Error returned when parsing an L3/L4 egress rule.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ParseEgressRuleError {
+    /// The rule did not use the supported address or address/protocol/port form.
+    #[error("expected <IPv4[/PREFIX]> or <IPv4[/PREFIX]>:<tcp|udp>:<PORT>")]
+    InvalidFormat,
+    /// The destination prefix is invalid.
+    #[error(transparent)]
+    InvalidDestination(#[from] ParseIpv4CidrError),
+    /// The transport is not TCP or UDP.
+    #[error("invalid egress transport '{0}'; expected tcp or udp")]
+    InvalidTransport(String),
+    /// The port is not a `u16`.
+    #[error("invalid egress port '{0}'")]
+    InvalidPort(String),
+    /// Port zero is not a connectable destination.
+    #[error("egress rule port must be nonzero")]
+    ZeroPort,
+}
+
+impl FromStr for EgressRule {
+    type Err = ParseEgressRuleError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let fields = value.split(':').collect::<Vec<_>>();
+        let (destination, transport, port) = match fields.as_slice() {
+            [destination] => (destination.parse()?, EgressTransport::Any, 0),
+            [destination, protocol, port] => {
+                let transport = match *protocol {
+                    "tcp" => EgressTransport::Tcp,
+                    "udp" => EgressTransport::Udp,
+                    other => {
+                        return Err(ParseEgressRuleError::InvalidTransport(other.to_owned()));
+                    }
+                };
+                let port = port
+                    .parse::<u16>()
+                    .map_err(|_| ParseEgressRuleError::InvalidPort((*port).to_owned()))?;
+                if port == 0 {
+                    return Err(ParseEgressRuleError::ZeroPort);
+                }
+                (destination.parse()?, transport, port)
+            }
+            _ => return Err(ParseEgressRuleError::InvalidFormat),
+        };
+        Ok(Self {
+            destination,
+            transport,
+            port,
+        })
+    }
+}
+
 /// Run-scoped egress policy mode.
 #[derive(Clone, Debug, PartialEq, Eq, MeshPayload)]
 pub enum EgressPolicyMode {
@@ -157,6 +267,15 @@ pub enum EgressPolicyMode {
     TcpEndpoints(Vec<TcpEndpoint>),
     /// Deny every guest-originated frame.
     DenyAll,
+    /// Apply canonical allow and deny rules with deny precedence.
+    Rules {
+        /// Action for traffic that matches no rule.
+        default_action: EgressAction,
+        /// Rules that permit matching traffic.
+        allow: Vec<EgressRule>,
+        /// Rules that reject matching traffic before allow evaluation.
+        deny: Vec<EgressRule>,
+    },
 }
 
 /// Reason an endpoint address cannot be used by exact endpoint policy.
@@ -300,6 +419,12 @@ impl EgressPolicy {
                 endpoints.sort_unstable();
                 endpoints.dedup();
             }
+            EgressPolicyMode::Rules { allow, deny, .. } => {
+                allow.sort_unstable();
+                allow.dedup();
+                deny.sort_unstable();
+                deny.dedup();
+            }
             EgressPolicyMode::AllowAll | EgressPolicyMode::DenyAll => {}
         }
 
@@ -339,6 +464,17 @@ impl EgressPolicy {
                 next_hops.sort_unstable();
                 next_hops.dedup();
                 next_hops
+            }
+            EgressPolicyMode::Rules {
+                default_action,
+                allow,
+                ..
+            } => {
+                if *default_action == EgressAction::Deny && allow.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![gateway_ipv4]
+                }
             }
         };
 
@@ -383,6 +519,7 @@ impl EgressPolicy {
             EgressPolicyMode::AllowList(_) => "allow-list",
             EgressPolicyMode::BlockList(_) => "block-list",
             EgressPolicyMode::TcpEndpoints(_) => "endpoint",
+            EgressPolicyMode::Rules { .. } => "rules",
         }
     }
 
@@ -393,7 +530,15 @@ impl EgressPolicy {
 
     /// Returns whether packet parsing and filtering are active.
     pub fn is_active(&self) -> bool {
-        !matches!(self.mode, EgressPolicyMode::AllowAll)
+        match &self.mode {
+            EgressPolicyMode::AllowAll => false,
+            EgressPolicyMode::Rules {
+                default_action: EgressAction::Allow,
+                deny,
+                ..
+            } if deny.is_empty() => false,
+            _ => true,
+        }
     }
 
     /// Returns whether the gateway DNS proxy is reachable under this policy.
@@ -408,7 +553,85 @@ impl EgressPolicy {
                 !rules.iter().any(|rule| rule.contains(self.gateway_ipv4))
             }
             EgressPolicyMode::TcpEndpoints(_) => false,
+            EgressPolicyMode::Rules { .. } => {
+                self.rules_allow_destination(self.gateway_ipv4, Some((EgressTransport::Tcp, 53)))
+                    || self.rules_allow_destination(
+                        self.gateway_ipv4,
+                        Some((EgressTransport::Udp, 53)),
+                    )
+            }
         }
+    }
+
+    /// Returns canonical rule counts without exposing destinations.
+    pub fn rule_counts(&self) -> (usize, usize) {
+        match &self.mode {
+            EgressPolicyMode::Rules { allow, deny, .. } => (allow.len(), deny.len()),
+            EgressPolicyMode::AllowList(rules) => (rules.len(), 0),
+            EgressPolicyMode::BlockList(rules) => (0, rules.len()),
+            EgressPolicyMode::TcpEndpoints(rules) => (rules.len(), 0),
+            EgressPolicyMode::AllowAll | EgressPolicyMode::DenyAll => (0, 0),
+        }
+    }
+
+    fn rules_allow_destination(
+        &self,
+        destination: Ipv4Addr,
+        transport: Option<(EgressTransport, u16)>,
+    ) -> bool {
+        let EgressPolicyMode::Rules {
+            default_action,
+            allow,
+            deny,
+        } = &self.mode
+        else {
+            return false;
+        };
+        if deny.iter().any(|rule| rule.matches(destination, transport)) {
+            return false;
+        }
+        if allow
+            .iter()
+            .any(|rule| rule.matches(destination, transport))
+        {
+            return true;
+        }
+        *default_action == EgressAction::Allow
+    }
+
+    fn rules_allow_arp(&self, target: Ipv4Addr) -> bool {
+        let EgressPolicyMode::Rules {
+            default_action,
+            allow,
+            deny,
+        } = &self.mode
+        else {
+            return false;
+        };
+        if target == self.gateway_ipv4 {
+            return *default_action == EgressAction::Allow || !allow.is_empty();
+        }
+        if deny
+            .iter()
+            .any(|rule| rule.transport == EgressTransport::Any && rule.destination.contains(target))
+        {
+            return false;
+        }
+        if allow.iter().any(|rule| rule.destination.contains(target)) {
+            return true;
+        }
+        *default_action == EgressAction::Allow
+    }
+
+    fn rules_have_transport_restrictions(&self) -> bool {
+        matches!(
+            &self.mode,
+            EgressPolicyMode::Rules { allow, deny, .. }
+                if allow
+                    .iter()
+                    .chain(deny)
+                    .any(|rule| rule.transport != EgressTransport::Any)
+        )
     }
 
     /// Returns stable bytes suitable for a policy digest.
@@ -515,7 +738,10 @@ impl EgressPolicy {
         let target = read_ipv4(frame, offset + 24);
         if sender_hardware != self.guest_mac.to_bytes()
             || sender != self.guest_ipv4
-            || !self.next_hops.contains(&target)
+            || !(match &self.mode {
+                EgressPolicyMode::Rules { .. } => self.rules_allow_arp(target),
+                _ => self.next_hops.contains(&target),
+            })
             || (!broadcast_request && !unicast_refresh)
         {
             return Err(EgressDenied::ArpDenied);
@@ -611,6 +837,22 @@ impl EgressPolicy {
                     Err(EgressDenied::EndpointDenied)
                 }
             }
+            EgressPolicyMode::Rules { .. } => {
+                let transport = rule_transport(
+                    frame,
+                    frame_length,
+                    offset,
+                    header_length,
+                    total_length,
+                    fragments,
+                    self.rules_have_transport_restrictions(),
+                )?;
+                if self.rules_allow_destination(destination, transport) {
+                    Ok(())
+                } else {
+                    Err(EgressDenied::DestinationDenied)
+                }
+            }
         }
     }
 }
@@ -649,6 +891,9 @@ pub enum EgressDenied {
     /// Exact endpoint mode denied the protocol, address, or TCP port.
     #[error("traffic does not match an allowed TCP endpoint")]
     EndpointDenied,
+    /// Port-specific rules cannot safely authorize fragmented transport headers.
+    #[error("IPv4 fragments are denied by port-specific egress policy")]
+    FragmentDenied,
 }
 
 fn prefix_mask(prefix_length: u8) -> u32 {
@@ -717,6 +962,19 @@ fn append_policy_mode(bytes: &mut Vec<u8>, mode: &EgressPolicyMode) {
                 bytes.extend_from_slice(&endpoint.port.to_be_bytes());
             }
         }
+        EgressPolicyMode::Rules {
+            default_action,
+            allow,
+            deny,
+        } => {
+            bytes.push(5);
+            bytes.push(match default_action {
+                EgressAction::Allow => 0,
+                EgressAction::Deny => 1,
+            });
+            append_rules(bytes, allow);
+            append_rules(bytes, deny);
+        }
     }
 }
 
@@ -727,6 +985,23 @@ fn append_cidrs(bytes: &mut Vec<u8>, rules: &[Ipv4Cidr]) {
     for rule in rules {
         bytes.extend_from_slice(&rule.network.octets());
         bytes.push(rule.prefix_length);
+    }
+}
+
+fn append_rules(bytes: &mut Vec<u8>, rules: &[EgressRule]) {
+    let mut rules = rules.to_vec();
+    rules.sort_unstable();
+    rules.dedup();
+    bytes.extend_from_slice(&(rules.len() as u64).to_be_bytes());
+    for rule in rules {
+        bytes.extend_from_slice(&rule.destination.network.octets());
+        bytes.push(rule.destination.prefix_length);
+        bytes.push(match rule.transport {
+            EgressTransport::Any => 0,
+            EgressTransport::Tcp => 1,
+            EgressTransport::Udp => 2,
+        });
+        bytes.extend_from_slice(&rule.port.to_be_bytes());
     }
 }
 
@@ -806,6 +1081,38 @@ fn validate_transport(
         _ => {}
     }
     Ok(())
+}
+
+fn rule_transport(
+    frame: &[u8],
+    frame_length: usize,
+    ip_offset: usize,
+    ip_header_length: usize,
+    ip_total_length: usize,
+    fragments: u16,
+    has_transport_restrictions: bool,
+) -> Result<Option<(EgressTransport, u16)>, EgressDenied> {
+    validate_transport(
+        frame,
+        frame_length,
+        ip_offset,
+        ip_header_length,
+        ip_total_length,
+        fragments,
+    )?;
+    if fragments != 0 {
+        return if has_transport_restrictions {
+            Err(EgressDenied::FragmentDenied)
+        } else {
+            Ok(None)
+        };
+    }
+    let transport_offset = ip_offset + ip_header_length;
+    Ok(match frame[ip_offset + 9] {
+        6 => Some((EgressTransport::Tcp, read_u16(frame, transport_offset + 2))),
+        17 => Some((EgressTransport::Udp, read_u16(frame, transport_offset + 2))),
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -1197,6 +1504,78 @@ mod tests {
             allow.authorize_frame(&other_arp, other_arp.len()),
             Err(EgressDenied::ArpDenied)
         );
+    }
+
+    #[test]
+    fn l3_l4_rules_parse_and_apply_deny_precedence() {
+        assert_eq!(
+            "192.0.2.9/24:tcp:443".parse::<EgressRule>().unwrap(),
+            EgressRule {
+                destination: "192.0.2.0/24".parse().unwrap(),
+                transport: EgressTransport::Tcp,
+                port: 443,
+            }
+        );
+        assert_eq!(
+            "198.51.100.0/24".parse::<EgressRule>().unwrap().transport(),
+            EgressTransport::Any
+        );
+        for invalid in [
+            "192.0.2.0/24:icmp:8",
+            "192.0.2.0/24:tcp:0",
+            "192.0.2.0/24:tcp",
+            "192.0.2.0/24:tcp:443:extra",
+        ] {
+            assert!(invalid.parse::<EgressRule>().is_err(), "{invalid}");
+        }
+
+        let policy = bind(EgressPolicyMode::Rules {
+            default_action: EgressAction::Deny,
+            allow: vec![
+                "192.0.2.0/24:tcp:443".parse().unwrap(),
+                "192.0.2.0/24:udp:53".parse().unwrap(),
+                "10.0.0.9".parse().unwrap(),
+                "192.0.2.0/24:tcp:443".parse().unwrap(),
+            ],
+            deny: vec!["192.0.2.7:tcp:443".parse().unwrap()],
+        });
+        assert_eq!(policy.mode_name(), "rules");
+        assert_eq!(policy.rule_counts(), (3, 1));
+        assert_eq!(policy.next_hops(), &[GATEWAY_IPV4]);
+
+        let allowed_tcp = tcp_frame(Ipv4Addr::new(192, 0, 2, 8), 443);
+        policy
+            .authorize_frame(&allowed_tcp, allowed_tcp.len())
+            .unwrap();
+        let denied_by_precedence = tcp_frame(Ipv4Addr::new(192, 0, 2, 7), 443);
+        assert_eq!(
+            policy.authorize_frame(&denied_by_precedence, denied_by_precedence.len()),
+            Err(EgressDenied::DestinationDenied)
+        );
+        let wrong_port = tcp_frame(Ipv4Addr::new(192, 0, 2, 8), 80);
+        assert_eq!(
+            policy.authorize_frame(&wrong_port, wrong_port.len()),
+            Err(EgressDenied::DestinationDenied)
+        );
+        let allowed_udp = udp_frame(Ipv4Addr::new(192, 0, 2, 7), 53);
+        policy
+            .authorize_frame(&allowed_udp, allowed_udp.len())
+            .unwrap();
+
+        let on_link = Ipv4Addr::new(10, 0, 0, 9);
+        let on_link_arp = arp_request(on_link, ETHERNET_BROADCAST, ETHERNET_UNSPECIFIED);
+        policy
+            .authorize_frame(&on_link_arp, on_link_arp.len())
+            .unwrap();
+
+        let mut fragment = allowed_tcp;
+        fragment[20..22].copy_from_slice(&0x2000u16.to_be_bytes());
+        set_ipv4_checksum(&mut fragment, 14);
+        assert_eq!(
+            policy.authorize_frame(&fragment, fragment.len()),
+            Err(EgressDenied::FragmentDenied)
+        );
+        assert!(policy.validate().is_ok());
     }
 
     #[test]

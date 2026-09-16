@@ -254,6 +254,15 @@ impl From<MicrovmNetworkProfileCli> for MicrovmNetworkProfile {
     }
 }
 
+impl From<MicrovmNetworkActionCli> for net_backend_resources::egress::EgressAction {
+    fn from(value: MicrovmNetworkActionCli) -> Self {
+        match value {
+            MicrovmNetworkActionCli::Allow => Self::Allow,
+            MicrovmNetworkActionCli::Deny => Self::Deny,
+        }
+    }
+}
+
 impl From<MachineProfileCli> for MachineProfile {
     fn from(value: MachineProfileCli) -> Self {
         match value {
@@ -822,6 +831,20 @@ options:
     /// guest-initiated flows but exposes no listener for new inbound connections.
     #[clap(long, value_enum, value_name = "ACTION")]
     pub network_ingress: Option<MicrovmNetworkActionCli>,
+
+    /// Permit matching IPv4 destinations, optionally restricted by TCP/UDP port.
+    #[clap(
+        long = "network-egress-allow",
+        value_name = "IPv4[/PREFIX][:tcp|udp:PORT]"
+    )]
+    pub network_egress_allow: Vec<net_backend_resources::egress::EgressRule>,
+
+    /// Deny matching IPv4 destinations before evaluating allow rules.
+    #[clap(
+        long = "network-egress-deny",
+        value_name = "IPv4[/PREFIX][:tcp|udp:PORT]"
+    )]
+    pub network_egress_deny: Vec<net_backend_resources::egress::EgressRule>,
 
     /// Select a preconfigured Linux TAP for a microVM NIC.
     ///
@@ -1757,6 +1780,8 @@ impl Options {
                     && self.network_profile.is_none()
                     && self.network_egress.is_none()
                     && self.network_ingress.is_none()
+                    && self.network_egress_allow.is_empty()
+                    && self.network_egress_deny.is_empty()
                     && self.allow_host.is_empty()
                     && self.block_host.is_empty()
                     && self.allow_endpoint.is_empty()
@@ -2097,6 +2122,22 @@ impl Options {
             "--network-ingress allow is unsupported by the portable microVM network profile"
         );
         anyhow::ensure!(
+            self.network_egress_allow.len() <= 256 && self.network_egress_deny.len() <= 256,
+            "microVM egress policy permits at most 256 allow rules and 256 deny rules"
+        );
+        anyhow::ensure!(
+            self.network_egress_allow.is_empty() && self.network_egress_deny.is_empty()
+                || self.network_egress.is_some(),
+            "--network-egress is required with --network-egress-allow or --network-egress-deny"
+        );
+        anyhow::ensure!(
+            (self.network_egress_allow.is_empty() && self.network_egress_deny.is_empty())
+                || (self.allow_host.is_empty()
+                    && self.block_host.is_empty()
+                    && self.allow_endpoint.is_empty()),
+            "L3/L4 egress rules cannot be combined with legacy --allow-host, --block-host, or --allow-endpoint policy"
+        );
+        anyhow::ensure!(
             !matches!(self.network_egress, Some(MicrovmNetworkActionCli::Allow))
                 || (self.allow_host.is_empty() && self.allow_endpoint.is_empty()),
             "--network-egress allow conflicts with default-deny egress allow rules"
@@ -2110,6 +2151,8 @@ impl Options {
             (self.allow_host.is_empty()
                 && self.block_host.is_empty()
                 && self.allow_endpoint.is_empty()
+                && self.network_egress_allow.is_empty()
+                && self.network_egress_deny.is_empty()
                 && self.network_egress.is_none()
                 && self.network_ingress.is_none())
                 || !self.net.is_empty()
@@ -2162,7 +2205,17 @@ impl Options {
     > {
         use net_backend_resources::egress::EgressPolicyMode;
 
-        let mode = if !self.allow_host.is_empty() {
+        let mode = if !self.network_egress_allow.is_empty() || !self.network_egress_deny.is_empty()
+        {
+            EgressPolicyMode::Rules {
+                default_action: self
+                    .network_egress
+                    .unwrap_or(MicrovmNetworkActionCli::Allow)
+                    .into(),
+                allow: self.network_egress_allow.clone(),
+                deny: self.network_egress_deny.clone(),
+            }
+        } else if !self.allow_host.is_empty() {
             EgressPolicyMode::AllowList(self.allow_host.clone())
         } else if !self.block_host.is_empty() {
             EgressPolicyMode::BlockList(self.block_host.clone())
@@ -6963,6 +7016,77 @@ mod tests {
                 ])
                 .is_err()
             );
+        }
+
+        #[test]
+        fn test_microvm_l3_l4_rules_are_explicit_and_composable() {
+            let options = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--net",
+                "10.0.0.2/24",
+                "--network-profile",
+                "portable",
+                "--network-egress",
+                "deny",
+                "--network-egress-allow",
+                "192.0.2.0/24:tcp:443",
+                "--network-egress-allow",
+                "192.0.2.7:udp:53",
+                "--network-egress-deny",
+                "192.0.2.9:tcp:443",
+            ])
+            .unwrap();
+            options.validate_microvm_options().unwrap();
+            let network: openvmm_defs::config::MicrovmNetworkConfig =
+                "10.0.0.2/24".parse().unwrap();
+            let policy = options.microvm_egress_policy(&network).unwrap();
+            let net_backend_resources::egress::EgressPolicyMode::Rules {
+                default_action,
+                allow,
+                deny,
+            } = policy.mode()
+            else {
+                panic!("expected rule-based egress policy")
+            };
+            assert_eq!(
+                *default_action,
+                net_backend_resources::egress::EgressAction::Deny
+            );
+            assert_eq!((allow.len(), deny.len()), (2, 1));
+
+            let missing_default = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--net",
+                "10.0.0.2/24",
+                "--network-profile",
+                "portable",
+                "--network-egress-allow",
+                "192.0.2.0/24",
+            ])
+            .unwrap();
+            assert!(missing_default.validate_microvm_options().is_err());
+
+            let mixed_legacy = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--net",
+                "10.0.0.2/24",
+                "--network-profile",
+                "portable",
+                "--network-egress",
+                "deny",
+                "--network-egress-allow",
+                "192.0.2.0/24",
+                "--allow-host",
+                "192.0.2.0/24",
+            ])
+            .unwrap();
+            assert!(mixed_legacy.validate_microvm_options().is_err());
         }
 
         let options = Options::try_parse_from([
