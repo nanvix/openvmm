@@ -169,6 +169,15 @@ pub enum MicrovmNetworkProfileCli {
     Portable,
 }
 
+/// Default action for one direction of microVM network traffic.
+#[derive(Debug, Copy, Clone, ValueEnum, PartialEq, Eq)]
+pub enum MicrovmNetworkActionCli {
+    /// Permit traffic in this direction.
+    Allow,
+    /// Deny traffic in this direction.
+    Deny,
+}
+
 /// Capture tier for a microVM sandbox snapshot.
 #[derive(Debug, Copy, Clone, ValueEnum, PartialEq, Eq)]
 pub enum SnapshotTierCli {
@@ -759,6 +768,17 @@ options:
     /// Required host-network implementation contract for microVM `--net`.
     #[clap(long, value_enum, value_name = "PROFILE")]
     pub network_profile: Option<MicrovmNetworkProfileCli>,
+
+    /// Default action for connections initiated by the microVM guest.
+    #[clap(long, value_enum, value_name = "ACTION")]
+    pub network_egress: Option<MicrovmNetworkActionCli>,
+
+    /// Default action for new connections initiated toward the microVM guest.
+    ///
+    /// The portable profile supports only `deny`: its NAT admits responses to
+    /// guest-initiated flows but exposes no listener for new inbound connections.
+    #[clap(long, value_enum, value_name = "ACTION")]
+    pub network_ingress: Option<MicrovmNetworkActionCli>,
 
     /// Select a preconfigured Linux TAP for a microVM NIC.
     ///
@@ -1667,6 +1687,8 @@ impl Options {
             anyhow::ensure!(
                 self.net_tap.is_none()
                     && self.network_profile.is_none()
+                    && self.network_egress.is_none()
+                    && self.network_ingress.is_none()
                     && self.allow_host.is_empty()
                     && self.block_host.is_empty()
                     && self.allow_endpoint.is_empty()
@@ -1675,7 +1697,7 @@ impl Options {
                     && self.restore_processors.is_none()
                     && self.restore_memory.is_none()
                     && self.memory_capacity.is_none(),
-                "--network-profile, --net-tap, --mount, --microvm-sandbox-block, --restore-processors, --restore-memory, --memory-capacity, and microVM egress policy require a microVM machine"
+                "--network-profile, --net-tap, --mount, --microvm-sandbox-block, --restore-processors, --restore-memory, --memory-capacity, and microVM network policy require a microVM machine"
             );
             return Ok(());
         }
@@ -1937,12 +1959,28 @@ impl Options {
             "--net-tap is incompatible with the portable microVM network profile"
         );
         anyhow::ensure!(
+            self.network_ingress != Some(MicrovmNetworkActionCli::Allow),
+            "--network-ingress allow is unsupported by the portable microVM network profile"
+        );
+        anyhow::ensure!(
+            !matches!(self.network_egress, Some(MicrovmNetworkActionCli::Allow))
+                || (self.allow_host.is_empty() && self.allow_endpoint.is_empty()),
+            "--network-egress allow conflicts with default-deny egress allow rules"
+        );
+        anyhow::ensure!(
+            self.network_egress != Some(MicrovmNetworkActionCli::Deny)
+                || self.block_host.is_empty(),
+            "--network-egress deny conflicts with default-allow egress block rules"
+        );
+        anyhow::ensure!(
             (self.allow_host.is_empty()
                 && self.block_host.is_empty()
-                && self.allow_endpoint.is_empty())
+                && self.allow_endpoint.is_empty()
+                && self.network_egress.is_none()
+                && self.network_ingress.is_none())
                 || !self.net.is_empty()
                 || self.restore_snapshot.is_some(),
-            "--allow-host, --block-host, and --allow-endpoint require --net or a networked snapshot restore"
+            "microVM network policy requires --net or a networked snapshot restore"
         );
         anyhow::ensure!(
             self.cxl_test.is_empty()
@@ -1984,6 +2022,8 @@ impl Options {
             EgressPolicyMode::BlockList(self.block_host.clone())
         } else if !self.allow_endpoint.is_empty() {
             EgressPolicyMode::TcpEndpoints(self.allow_endpoint.clone())
+        } else if self.network_egress == Some(MicrovmNetworkActionCli::Deny) {
+            EgressPolicyMode::DenyAll
         } else {
             EgressPolicyMode::AllowAll
         };
@@ -6600,6 +6640,74 @@ mod tests {
         let standard =
             Options::try_parse_from(["openvmm", "--allow-endpoint", "192.0.2.7:443"]).unwrap();
         assert!(standard.validate_microvm_options().is_err());
+    }
+
+    #[test]
+    fn test_microvm_directional_network_policy_is_independent_and_fail_closed() {
+        let network: openvmm_defs::config::MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
+        for (arguments, expected_mode) in [
+            (
+                ["--network-egress", "allow", "--network-ingress", "deny"].as_slice(),
+                "allow-all",
+            ),
+            (
+                ["--network-egress", "deny", "--network-ingress", "deny"].as_slice(),
+                "deny-all",
+            ),
+            (["--network-egress", "deny"].as_slice(), "deny-all"),
+            (["--network-ingress", "deny"].as_slice(), "allow-all"),
+            (
+                ["--network-egress", "allow", "--block-host", "192.0.2.1"].as_slice(),
+                "block-list",
+            ),
+            (
+                ["--network-egress", "deny", "--allow-host", "192.0.2.1"].as_slice(),
+                "allow-list",
+            ),
+        ] {
+            let options = Options::try_parse_from(
+                [
+                    "openvmm",
+                    "--machine",
+                    "microvm",
+                    "--net",
+                    "10.0.0.2/24",
+                    "--network-profile",
+                    "portable",
+                ]
+                .into_iter()
+                .chain(arguments.iter().copied()),
+            )
+            .unwrap();
+            options.validate_microvm_options().unwrap();
+            assert_eq!(
+                options.microvm_egress_policy(&network).unwrap().mode_name(),
+                expected_mode
+            );
+        }
+
+        for arguments in [
+            ["--network-ingress", "allow"].as_slice(),
+            ["--network-egress", "deny", "--network-ingress", "allow"].as_slice(),
+            ["--network-egress", "allow", "--allow-host", "192.0.2.1"].as_slice(),
+            ["--network-egress", "deny", "--block-host", "192.0.2.1"].as_slice(),
+        ] {
+            let options = Options::try_parse_from(
+                [
+                    "openvmm",
+                    "--machine",
+                    "microvm",
+                    "--net",
+                    "10.0.0.2/24",
+                    "--network-profile",
+                    "portable",
+                ]
+                .into_iter()
+                .chain(arguments.iter().copied()),
+            )
+            .unwrap();
+            assert!(options.validate_microvm_options().is_err());
+        }
     }
 
     #[test]
