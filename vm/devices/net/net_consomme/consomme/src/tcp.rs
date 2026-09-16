@@ -1123,7 +1123,9 @@ impl<T: Client> Access<'_, T> {
                     } else {
                         // Resolve virtual mapped addresses back to real host
                         // addresses before establishing the connection.
-                        let Some(resolved_dst) = sender.state.resolve_destination(&sender.ft.dst)
+                        let Some(resolved_dst) = sender
+                            .state
+                            .resolve_destination(&sender.ft.dst, IpProtocol::Tcp)
                         else {
                             return Err(DropReason::DestinationNotAllowed);
                         };
