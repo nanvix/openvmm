@@ -1047,7 +1047,12 @@ fn effective_microvm_network(
                 && opt.network_ingress.is_none()
                 && opt.allow_host.is_empty()
                 && opt.block_host.is_empty()
-                && opt.allow_endpoint.is_empty(),
+                && opt.allow_endpoint.is_empty()
+                && opt.network_egress_allow.is_empty()
+                && opt.network_egress_deny.is_empty()
+                && opt.host_loopback.is_none()
+                && opt.network_proxy.is_none()
+                && opt.host_loopback_forward.is_empty(),
             "restore-time network resources cannot be added to a snapshot without a NIC"
         );
         return Ok(None);
@@ -4165,7 +4170,11 @@ async fn vm_config_from_command_line(
     };
 
     if let Some(network) = &microvm_network {
-        let endpoint = microvm_network_endpoint(network, &mut resources)?;
+        let policy = microvm_egress_policy
+            .as_ref()
+            .context("microVM network is missing its bound policy")?;
+        let endpoint =
+            microvm_network_endpoint(network, policy, &opt.host_loopback_forward, &mut resources)?;
         add_virtio_device(
             VirtioBusCli::Mmio,
             virtio_resources::net::VirtioNetHandle {
@@ -4832,6 +4841,9 @@ fn parse_endpoint(
                 static_ipv4: None,
                 ports,
                 recv,
+                allow_host_local_access: None,
+                map_gateway_to_host_loopback: None,
+                gateway_loopback_proxy_port: None,
             }
             .into_resource()
         }
@@ -4899,8 +4911,30 @@ fn parse_endpoint(
 
 fn microvm_network_endpoint(
     network: &openvmm_defs::config::MicrovmNetworkConfig,
+    policy: &net_backend_resources::egress::EgressPolicy,
+    loopback_forwards: &[cli_args::MicrovmLoopbackForwardCli],
     _resources: &mut VmResources,
 ) -> anyhow::Result<Resource<NetEndpointHandleKind>> {
+    let ports = loopback_forwards
+        .iter()
+        .map(|forward| net_backend_resources::consomme::HostPortConfig {
+            protocol: match forward.protocol {
+                cli_args::MicrovmLoopbackForwardProtocol::Tcp => {
+                    net_backend_resources::consomme::HostPortProtocol::Tcp
+                }
+                cli_args::MicrovmLoopbackForwardProtocol::Udp => {
+                    net_backend_resources::consomme::HostPortProtocol::Udp
+                }
+            },
+            host_address: Some(net_backend_resources::consomme::HostIpAddress::Ipv4(
+                std::net::Ipv4Addr::LOCALHOST,
+            )),
+            host_port: net_backend_resources::consomme::HostPort::Fixed(forward.host_port),
+            guest_port: forward.guest_port,
+        })
+        .collect();
+    let allow_host_loopback =
+        policy.host_loopback_action() == net_backend_resources::egress::EgressAction::Allow;
     Ok(net_backend_resources::consomme::ConsommeHandle {
         cidr: None,
         static_ipv4: Some(net_backend_resources::consomme::StaticIpv4Config {
@@ -4909,8 +4943,11 @@ fn microvm_network_endpoint(
             gateway_ipv4: network.derived_gateway_ipv4,
             gateway_mac: network.gateway_mac,
         }),
-        ports: Vec::new(),
+        ports,
         recv: None,
+        allow_host_local_access: Some(allow_host_loopback),
+        map_gateway_to_host_loopback: Some(allow_host_loopback),
+        gateway_loopback_proxy_port: policy.proxy_endpoint().map(|endpoint| endpoint.port()),
     }
     .into_resource())
 }
