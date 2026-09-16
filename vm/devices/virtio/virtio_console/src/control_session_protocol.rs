@@ -8,10 +8,12 @@ use thiserror::Error;
 
 pub const HEADER_LEN: usize = 44;
 pub const MAX_DATA_LEN: usize = 65_536;
+pub const MIN_RECEIVE_CREDIT: u32 = MAX_DATA_LEN as u32;
+pub const MAX_RECEIVE_CREDIT: u32 = 4 * 1024 * 1024 + 10;
 const MAGIC: [u8; 4] = *b"NVXS";
 const VERSION: u16 = 1;
 
-/// A protocol-v1 record type.
+/// A control-session record type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum RecordType {
@@ -23,6 +25,7 @@ pub enum RecordType {
     Wait = 6,
     Ready = 7,
     Error = 8,
+    Credit = 9,
 }
 
 impl TryFrom<u8> for RecordType {
@@ -38,6 +41,7 @@ impl TryFrom<u8> for RecordType {
             6 => Ok(Self::Wait),
             7 => Ok(Self::Ready),
             8 => Ok(Self::Error),
+            9 => Ok(Self::Credit),
             _ => Err(ProtocolError::InvalidType(value)),
         }
     }
@@ -133,6 +137,8 @@ pub enum ProtocolError {
     },
     #[error("invalid control-session error code {0}")]
     InvalidErrorCode(u32),
+    #[error("invalid control-session receive credit {0}")]
+    InvalidReceiveCredit(u32),
     #[error("bootstrap record contains session identity")]
     InvalidBootstrapIdentity,
     #[error("invalid parser snapshot: {0}")]
@@ -283,7 +289,6 @@ impl Parser {
         }
     }
 
-    /// Validates a parser snapshot without allocating parser storage.
     pub fn validate_snapshot(snapshot: &ParserSnapshot) -> Result<(), ProtocolError> {
         if snapshot.header_bytes.len() != HEADER_LEN {
             return Err(ProtocolError::InvalidSnapshot(
@@ -460,16 +465,30 @@ fn validate_record(record: &Record) -> Result<(), ProtocolError> {
         })?;
         ErrorCode::try_from(u32::from_le_bytes(code_bytes))?;
     }
+    match record.record_type {
+        RecordType::Ack => {
+            let credit = decode_credit_payload(&record.payload)?;
+            if !(MIN_RECEIVE_CREDIT..=MAX_RECEIVE_CREDIT).contains(&credit) {
+                return Err(ProtocolError::InvalidReceiveCredit(credit));
+            }
+        }
+        RecordType::Credit => {
+            let credit = decode_credit_payload(&record.payload)?;
+            if !(1..=MAX_RECEIVE_CREDIT).contains(&credit) {
+                return Err(ProtocolError::InvalidReceiveCredit(credit));
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 
 fn validate_payload_length(record_type: RecordType, payload_len: u32) -> Result<(), ProtocolError> {
     let valid = match record_type {
-        RecordType::GuestAttach
-        | RecordType::Reset
-        | RecordType::Ack
-        | RecordType::Wait
-        | RecordType::Ready => payload_len == 0,
+        RecordType::Ack | RecordType::Credit => payload_len == 4,
+        RecordType::GuestAttach | RecordType::Reset | RecordType::Wait | RecordType::Ready => {
+            payload_len == 0
+        }
         RecordType::HostAttach => payload_len == 32,
         RecordType::Data => (1..=MAX_DATA_LEN as u32).contains(&payload_len),
         RecordType::Error => payload_len == 4,
@@ -482,6 +501,24 @@ fn validate_payload_length(record_type: RecordType, payload_len: u32) -> Result<
             length: payload_len,
         })
     }
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by broker tests and guest codec")
+)]
+pub fn credit_payload(credit: u32) -> Vec<u8> {
+    credit.to_le_bytes().to_vec()
+}
+
+pub fn decode_credit_payload(payload: &[u8]) -> Result<u32, ProtocolError> {
+    let bytes: [u8; 4] = payload
+        .try_into()
+        .map_err(|_| ProtocolError::InvalidPayloadLength {
+            record_type: RecordType::Credit,
+            length: u32::try_from(payload.len()).unwrap_or(u32::MAX),
+        })?;
+    Ok(u32::from_le_bytes(bytes))
 }
 
 #[cfg(test)]
@@ -515,7 +552,7 @@ mod tests {
 
     #[test]
     fn golden_vectors_round_trip() -> Result<(), Box<dyn std::error::Error>> {
-        let vectors = include_str!("../test_data/control_session_protocol_v1_vectors.txt");
+        let vectors = include_str!("../test_data/control_session_protocol_vectors.txt");
         let mut count = 0;
         for line in vectors.lines().filter(|line| !line.is_empty()) {
             let (name, hex) = line
@@ -527,7 +564,8 @@ mod tests {
                 "GUEST_ATTACH" => RecordType::GuestAttach,
                 "HOST_ATTACH" => RecordType::HostAttach,
                 "RESET" => RecordType::Reset,
-                "ACK" => RecordType::Ack,
+                "ACK_INITIAL_CREDIT" => RecordType::Ack,
+                "CREDIT" => RecordType::Credit,
                 "DATA_EMBEDDED_MAGIC" => RecordType::Data,
                 "WAIT" => RecordType::Wait,
                 "READY" => RecordType::Ready,
@@ -562,21 +600,35 @@ mod tests {
                 let code = u32::from_le_bytes(record.payload.as_slice().try_into()?);
                 assert_eq!(ErrorCode::try_from(code)?, ErrorCode::Authentication);
             }
+            if expected_type == RecordType::Ack {
+                assert_eq!(decode_credit_payload(&record.payload)?, MAX_RECEIVE_CREDIT);
+            }
+            if expected_type == RecordType::Credit {
+                assert_eq!(decode_credit_payload(&record.payload)?, MIN_RECEIVE_CREDIT);
+            }
             assert_eq!(encode(&record)?, bytes, "{name}");
             count += 1;
         }
-        assert_eq!(count, 8);
+        assert_eq!(count, 9);
         assert!(vectors.contains("4e5658534e565853"));
         Ok(())
     }
 
     #[test]
     fn language_neutral_boundary_and_invalid_cases() -> Result<(), Box<dyn std::error::Error>> {
-        const EXPECTED_CASE_NAMES: [&str; 29] = [
+        const EXPECTED_CASE_NAMES: [&str; 37] = [
             "VALID_MIN",
             "VALID_MAX",
             "INVALID_EMPTY",
             "INVALID_OVERSIZE",
+            "VALID_MIN",
+            "VALID_MAX",
+            "INVALID_BELOW_MIN",
+            "INVALID_ABOVE_MAX",
+            "VALID_MIN",
+            "VALID_MAX",
+            "INVALID_ZERO",
+            "INVALID_ABOVE_MAX",
             "INVALID_MAGIC",
             "INVALID_VERSION",
             "INVALID_TYPE",
@@ -604,7 +656,7 @@ mod tests {
             "INVALID_ERROR_CODE_MAX",
         ];
 
-        let cases = include_str!("../test_data/control_session_protocol_v1_cases.txt");
+        let cases = include_str!("../test_data/control_session_protocol_cases.txt");
         let instance_id = core::array::from_fn(|index| index as u8);
         let mut names = Vec::new();
         for line in cases.lines().filter(|line| !line.is_empty()) {
@@ -681,6 +733,30 @@ mod tests {
                     );
                     assert!(intended, "{name}: unexpected error {error:?}");
                 }
+                ["ACK_CREDIT", name, value] => {
+                    names.push(*name);
+                    let value = value.parse::<u32>()?;
+                    let result = encode(&Record::session(
+                        RecordType::Ack,
+                        instance_id,
+                        7,
+                        9,
+                        credit_payload(value),
+                    ));
+                    assert_eq!(result.is_ok(), name.starts_with("VALID_"), "{name}");
+                }
+                ["CREDIT_INCREMENT", name, value] => {
+                    names.push(*name);
+                    let value = value.parse::<u32>()?;
+                    let result = encode(&Record::session(
+                        RecordType::Credit,
+                        instance_id,
+                        7,
+                        9,
+                        credit_payload(value),
+                    ));
+                    assert_eq!(result.is_ok(), name.starts_with("VALID_"), "{name}");
+                }
                 _ => return Err(format!("invalid language-neutral case: {line}").into()),
             }
         }
@@ -690,8 +766,11 @@ mod tests {
 
     #[test]
     fn every_byte_fragmentation_preserves_state() -> Result<(), ProtocolError> {
-        for payload in [vec![0x55], vec![0x33; 257]] {
-            let record = sample(RecordType::Data, payload);
+        for record in [
+            sample(RecordType::Ack, credit_payload(MIN_RECEIVE_CREDIT)),
+            sample(RecordType::Credit, credit_payload(17)),
+            sample(RecordType::Data, vec![0x33; 257]),
+        ] {
             let encoded = encode(&record)?;
             for split in 0..encoded.len() {
                 let mut parser = Parser::new();
@@ -708,14 +787,14 @@ mod tests {
 
     #[test]
     fn coalesced_records_stop_at_exact_boundary() -> Result<(), ProtocolError> {
-        let first = sample(RecordType::Ready, Vec::new());
+        let first = sample(RecordType::Credit, credit_payload(17));
         let second = sample(RecordType::Data, b"xNVXSy".to_vec());
         let mut bytes = encode(&first)?;
         bytes.extend_from_slice(&encode(&second)?);
         let mut parser = Parser::new();
         let progress = parser.accept(&bytes)?;
         assert_eq!(progress.record, Some(first));
-        assert_eq!(progress.consumed, HEADER_LEN);
+        assert_eq!(progress.consumed, HEADER_LEN + 4);
         let progress = parser.accept(&bytes[progress.consumed..])?;
         assert_eq!(progress.record, Some(second));
         Ok(())
@@ -772,7 +851,8 @@ mod tests {
         assert!(encode(&sample(RecordType::GuestAttach, vec![1])).is_err());
         assert!(encode(&sample(RecordType::HostAttach, vec![0; 31])).is_err());
         assert!(encode(&sample(RecordType::Reset, vec![1])).is_err());
-        assert!(encode(&sample(RecordType::Ack, vec![1])).is_err());
+        assert!(encode(&sample(RecordType::Ack, Vec::new())).is_err());
+        assert!(encode(&sample(RecordType::Ack, credit_payload(MIN_RECEIVE_CREDIT))).is_ok());
         assert!(encode(&sample(RecordType::Wait, vec![1])).is_err());
         assert!(encode(&sample(RecordType::Ready, vec![1])).is_err());
         assert_eq!(
@@ -787,6 +867,8 @@ mod tests {
             );
             assert!(encode(&sample(RecordType::Error, code.to_le_bytes().to_vec())).is_err());
         }
+        assert!(encode(&sample(RecordType::Credit, credit_payload(1))).is_ok());
+        assert!(encode(&sample(RecordType::Credit, credit_payload(0))).is_err());
     }
 
     fn assert_capability_redacted(label: &str, debug: &str, capability: &[u8; 32]) {
