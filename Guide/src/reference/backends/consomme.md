@@ -47,6 +47,13 @@ and Windows/WHP. It provides gateway DNS over UDP and TCP, ICMP echo, and
 outbound TCP/UDP subject to the microVM egress policy. IPv4 fragments are
 rejected deterministically. `--net-tap` is incompatible.
 
+The portable profile accepts directional network defaults through
+`--network-egress <allow|deny>` and `--network-ingress <allow|deny>`. It
+supports both egress actions and ingress `deny`. Stateful replies to an
+allowed guest-initiated flow are not treated as new inbound connections.
+Ingress `allow` is rejected before VM resources are opened because portable
+NAT does not expose arbitrary guest listeners.
+
 Snapshot restore creates a fresh endpoint generation. Host sockets and NAT
 flow tables are not saved. Virtio-net capture drains descriptor ownership
 before state is saved, and restored guest software must establish new
