@@ -5760,6 +5760,13 @@ fn do_main(pidfile_guard: &mut Option<pidfile::Pidfile>) -> anyhow::Result<i32> 
     meshworker::run_vmm_mesh_host()?;
 
     let opt = cli_args::parse_options();
+    if let Err(error) = opt.validate_microvm_host_loopback() {
+        let result = Err(error);
+        if let Some(report) = microvm_report::MicrovmReportPlan::from_options(&opt)? {
+            report.write(&result)?;
+        }
+        return result;
+    }
     if let Some(path) = &opt.write_saved_state_proto {
         mesh::payload::protofile::DescriptorWriter::new(vmcore::save_restore::saved_state_roots())
             .write_to_path(path)

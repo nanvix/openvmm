@@ -552,12 +552,13 @@ impl ConsommeState {
     /// Resolve a destination address that the guest is sending to. If it is a
     /// virtual mapped address, return the real host address. Otherwise return
     /// the address unchanged.
-    fn resolve_destination(&self, addr: &SocketAddr) -> Option<SocketAddr> {
+    fn resolve_destination(&self, addr: &SocketAddr, protocol: IpProtocol) -> Option<SocketAddr> {
         if let SocketAddr::V4(address) = addr
             && *address.ip() == self.params.gateway_ip
         {
             return (self.params.map_gateway_to_host_loopback
-                || self.params.gateway_loopback_proxy_port == Some(address.port()))
+                || (protocol == IpProtocol::Tcp
+                    && self.params.gateway_loopback_proxy_port == Some(address.port())))
             .then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, address.port())));
         }
         let ip = addr.ip();

@@ -145,22 +145,29 @@ describes the source definitions.
   verifiable transport header. Parsing, canonicalization, and contradictory
   option checks complete before VM resources are opened.
 
-  `--host-loopback <allow|deny>` controls host-local connectivity in both
-  directions. The default is `allow`, preserving the portable profile's
-  existing guest-gateway-to-host-loopback mapping. `deny` blocks general
-  gateway and host-local destinations and rejects every
+  `--host-loopback <allow|deny>` controls host-local access. The portable
+  profile cannot provide generic bidirectional host-loopback connectivity:
+  explicit `allow` without `--host-loopback-forward` is rejected before VM
+  resources are opened. With deliberate forwards, `allow` preserves
+  guest-to-host access subject to egress policy and publishes only the named
+  host-to-guest ports. Omitting the option preserves the existing
+  guest-gateway-to-host-loopback mapping without publishing guest ports.
+  `deny` blocks general gateway and host-local destinations and rejects every
   `--host-loopback-forward`.
 
   `--network-proxy <IPv4:TCP-PORT>` preserves one exact proxy endpoint when
   host loopback is denied. The guest-visible address must equal the derived
-  gateway, and only that TCP port is translated to host loopback. The exception
-  is included in the snapshot policy digest.
+  gateway, and only that TCP port is translated to host loopback. UDP on the
+  same port is not exempt, even with ordinary egress allowed. The exception is
+  included in the snapshot policy digest.
 
   `--host-loopback-forward <tcp|udp:HOST-PORT:GUEST-PORT>` binds one localhost
   port and forwards it into the guest. It requires explicit
   `--host-loopback allow`; duplicate bindings and more than 64 forwards are
   rejected before resources are opened. Live forwards are process-local
   attachments and are rejected for snapshot capture or restore.
+  Explicit forwarding is port publishing, not support for a generic
+  bidirectional host-loopback allow policy.
 
   Networked snapshots record the `portable` profile, drain accepted TX and
   endpoint-ready RX at the capture boundary, rewind unused guest RX
