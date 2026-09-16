@@ -155,6 +155,8 @@ pub enum EgressPolicyMode {
     BlockList(Vec<Ipv4Cidr>),
     /// Permit only exact IPv4 TCP destinations.
     TcpEndpoints(Vec<TcpEndpoint>),
+    /// Deny every guest-originated frame.
+    DenyAll,
 }
 
 /// Reason an endpoint address cannot be used by exact endpoint policy.
@@ -298,11 +300,11 @@ impl EgressPolicy {
                 endpoints.sort_unstable();
                 endpoints.dedup();
             }
-            EgressPolicyMode::AllowAll => {}
+            EgressPolicyMode::AllowAll | EgressPolicyMode::DenyAll => {}
         }
 
         let next_hops = match &mode {
-            EgressPolicyMode::AllowAll => Vec::new(),
+            EgressPolicyMode::AllowAll | EgressPolicyMode::DenyAll => Vec::new(),
             EgressPolicyMode::AllowList(_) | EgressPolicyMode::BlockList(_) => {
                 vec![gateway_ipv4]
             }
@@ -377,6 +379,7 @@ impl EgressPolicy {
     pub fn mode_name(&self) -> &'static str {
         match self.mode {
             EgressPolicyMode::AllowAll => "allow-all",
+            EgressPolicyMode::DenyAll => "deny-all",
             EgressPolicyMode::AllowList(_) => "allow-list",
             EgressPolicyMode::BlockList(_) => "block-list",
             EgressPolicyMode::TcpEndpoints(_) => "endpoint",
@@ -397,6 +400,7 @@ impl EgressPolicy {
     pub fn allows_gateway_dns(&self) -> bool {
         match &self.mode {
             EgressPolicyMode::AllowAll => true,
+            EgressPolicyMode::DenyAll => false,
             EgressPolicyMode::AllowList(rules) => {
                 rules.iter().any(|rule| rule.contains(self.gateway_ipv4))
             }
@@ -454,6 +458,9 @@ impl EgressPolicy {
     ) -> Result<(), EgressDenied> {
         if !self.is_active() {
             return Ok(());
+        }
+        if matches!(self.mode, EgressPolicyMode::DenyAll) {
+            return Err(EgressDenied::AllTrafficDenied);
         }
         ensure_available(frame_prefix, frame_length, 14, "Ethernet header")?;
         if frame_prefix[6..12] != self.guest_mac.to_bytes() {
@@ -551,6 +558,7 @@ impl EgressPolicy {
         let fragments = read_u16(frame, offset + 6) & 0x3fff;
         match &self.mode {
             EgressPolicyMode::AllowAll => Ok(()),
+            EgressPolicyMode::DenyAll => Err(EgressDenied::AllTrafficDenied),
             EgressPolicyMode::AllowList(rules) => {
                 validate_transport(
                     frame,
@@ -610,6 +618,9 @@ impl EgressPolicy {
 /// Reason an active egress policy rejected a frame.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum EgressDenied {
+    /// The configured posture denies every guest-originated frame.
+    #[error("all egress traffic is denied")]
+    AllTrafficDenied,
     /// A required packet structure was truncated or internally inconsistent.
     #[error("malformed {0}")]
     Malformed(&'static str),
@@ -687,6 +698,7 @@ fn invalid_special_endpoint_address(
 fn append_policy_mode(bytes: &mut Vec<u8>, mode: &EgressPolicyMode) {
     match mode {
         EgressPolicyMode::AllowAll => bytes.push(0),
+        EgressPolicyMode::DenyAll => bytes.push(4),
         EgressPolicyMode::AllowList(rules) => {
             bytes.push(1);
             append_cidrs(bytes, rules);
@@ -1191,5 +1203,24 @@ mod tests {
     fn allow_all_does_not_parse_guest_frames() {
         let policy = bind(EgressPolicyMode::AllowAll);
         policy.authorize_frame(&[], 0).unwrap();
+    }
+
+    #[test]
+    fn deny_all_rejects_every_guest_frame_before_parsing() {
+        let policy = bind(EgressPolicyMode::DenyAll);
+        assert!(policy.is_active());
+        assert!(!policy.allows_gateway_dns());
+        assert!(policy.next_hops().is_empty());
+
+        for frame in [
+            tcp_frame(Ipv4Addr::new(192, 0, 2, 7), 443),
+            arp_request(GATEWAY_IPV4, ETHERNET_BROADCAST, ETHERNET_UNSPECIFIED),
+            Vec::new(),
+        ] {
+            assert_eq!(
+                policy.authorize_frame(&frame, frame.len()),
+                Err(EgressDenied::AllTrafficDenied)
+            );
+        }
     }
 }

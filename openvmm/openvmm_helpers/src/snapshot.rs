@@ -3675,7 +3675,7 @@ fn validate_machine_contract_shape(
         anyhow::ensure!(
             matches!(
                 network.egress_policy_mode.as_str(),
-                "allow-all" | "allow-list" | "block-list" | "endpoint"
+                "allow-all" | "deny-all" | "allow-list" | "block-list" | "endpoint"
             ) && network.egress_policy_required == (network.egress_policy_mode != "allow-all"),
             "snapshot egress policy requirement is invalid"
         );
@@ -4685,21 +4685,31 @@ mod tests {
     }
 
     fn generated_network_contract(source_hypervisor: &str) -> SnapshotMachineContract {
+        generated_network_contract_with_mode(
+            source_hypervisor,
+            net_backend_resources::egress::EgressPolicyMode::AllowList(vec![
+                "192.0.2.0/24".parse().unwrap(),
+            ]),
+        )
+    }
+
+    fn generated_network_contract_with_mode(
+        source_hypervisor: &str,
+        mode: net_backend_resources::egress::EgressPolicyMode,
+    ) -> SnapshotMachineContract {
         let network: openvmm_defs::config::MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
         let egress_policy = net_backend_resources::egress::EgressPolicy::bind(
             network.guest_ipv4,
             network.prefix_length,
             network.guest_mac,
             network.derived_gateway_ipv4,
-            net_backend_resources::egress::EgressPolicyMode::AllowList(vec![
-                "192.0.2.0/24".parse().unwrap(),
-            ]),
+            mode,
         )
         .unwrap();
         let irq = openvmm_defs::config::microvm_virtio_net_irq(Some(source_hypervisor)).unwrap();
         let command_line = format!(
             "earlycon=xe9 console=hvc0 reboot=t panic=-1 virtio_mmio.device=0x1000@0xd0000000:{irq} {}",
-            network.command_line_fragment_with_dns(true)
+            network.command_line_fragment_with_dns(egress_policy.allows_gateway_dns())
         );
         microvm_machine_contract(
             source_hypervisor,
@@ -5054,6 +5064,20 @@ mod tests {
                 net_backend_resources::egress::EGRESS_POLICY_ENCODING_VERSION
             );
         }
+    }
+
+    #[test]
+    fn generated_microvm_network_contract_accepts_deny_all_egress() {
+        let contract = generated_network_contract_with_mode(
+            "whp",
+            net_backend_resources::egress::EgressPolicyMode::DenyAll,
+        );
+
+        let network = contract.microvm_network.as_ref().unwrap();
+        assert_eq!(network.egress_policy_mode, "deny-all");
+        assert!(network.egress_policy_required);
+        assert!(!contract.effective_command_line.contains("virtnet_dns="));
+        validate_supported_microvm_contract(&contract).unwrap();
     }
 
     #[test]
