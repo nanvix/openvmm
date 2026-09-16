@@ -314,6 +314,13 @@ impl VirtioFsFile {
             if name.is_empty() || name.len() > MAX_DIRECTORY_ENTRY_NAME_BYTES {
                 return Err(lx::Error::EINVAL);
             }
+            if name != b"." && name != b".." {
+                match self.inode.child_path(&entry.name) {
+                    Ok(_) => {}
+                    Err(error) if error == lx::Error::EACCES => return Ok(true),
+                    Err(error) => return Err(error),
+                }
+            }
             total_bytes = total_bytes
                 .checked_add(name.len())
                 .ok_or(lx::Error::E2BIG)?;

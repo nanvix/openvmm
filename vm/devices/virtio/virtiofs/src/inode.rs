@@ -45,11 +45,13 @@ pub(crate) struct VirtioFsVolume {
     id: u32,
     readonly: bool,
     strict_paths: bool,
+    denied_paths: Vec<PathBuf>,
+    denied_identities: Vec<(u64, u64)>,
 }
 
 impl VirtioFsVolume {
     pub(crate) fn new(volume: LxVolume, id: u32, readonly: bool) -> Self {
-        Self::new_with_strict_paths(volume, id, readonly, false)
+        Self::new_with_strict_paths(volume, id, readonly, false, Vec::new(), Vec::new())
     }
 
     pub(crate) fn new_with_strict_paths(
@@ -57,12 +59,16 @@ impl VirtioFsVolume {
         id: u32,
         readonly: bool,
         strict_paths: bool,
+        denied_paths: Vec<PathBuf>,
+        denied_identities: Vec<(u64, u64)>,
     ) -> Self {
         Self {
             volume: Arc::new(volume),
             id,
             readonly,
             strict_paths,
+            denied_paths,
+            denied_identities,
         }
     }
 
@@ -76,6 +82,27 @@ impl VirtioFsVolume {
 
     pub(crate) fn strict_paths(&self) -> bool {
         self.strict_paths
+    }
+
+    pub(crate) fn ensure_path_allowed(&self, path: &Path) -> lx::Result<()> {
+        if self
+            .denied_paths
+            .iter()
+            .any(|denied| path.starts_with(denied))
+        {
+            return Err(lx::Error::EACCES);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_identity_allowed(&self, stat: &lx::Stat) -> lx::Result<()> {
+        if self
+            .denied_identities
+            .contains(&(stat.device_nr, stat.inode_nr))
+        {
+            return Err(lx::Error::EACCES);
+        }
+        Ok(())
     }
 
     pub(crate) fn map_inode(&self, raw: lx::ino_t) -> lx::ino_t {
@@ -123,6 +150,7 @@ impl VirtioFsInode {
     /// Create a new inode for the specified path.
     pub fn new(volume: Arc<VirtioFsVolume>, path: PathBuf) -> lx::Result<(Self, lx::Stat)> {
         let stat = volume.lstat(&path)?;
+        volume.ensure_identity_allowed(&stat)?;
         let inode = Self::with_attr(volume, path, &stat);
         Ok((inode, stat))
     }
@@ -156,6 +184,7 @@ impl VirtioFsInode {
         if lookup_count == 0 {
             return Err(lx::Error::EINVAL);
         }
+        volume.ensure_identity_allowed(stat)?;
         let mut inode = Self::with_attr(volume, path, stat);
         inode.lookup_count = AtomicU64::new(lookup_count);
         let aliases: BTreeSet<_> = aliases.into_iter().collect();
@@ -567,6 +596,7 @@ impl VirtioFsInode {
         {
             return Err(lx::Error::E2BIG);
         }
+        self.volume.ensure_path_allowed(&path)?;
         Ok(path)
     }
 
@@ -580,17 +610,19 @@ impl VirtioFsInode {
         if !self.volume.strict_paths() {
             return Ok(());
         }
-        let path = self.clone_path();
-        crate::validate_relative_path(&path, true)?;
-        let mut prefix = PathBuf::new();
-        for component in path.components() {
-            let Component::Normal(component) = component else {
-                return Err(lx::Error::EINVAL);
-            };
-            prefix.push(component);
-            let stat = self.volume.lstat(&prefix)?;
-            if stat.mode & lx::S_IFMT == lx::S_IFLNK {
-                return Err(lx::Error::ELOOP);
+        for path in self.aliases() {
+            crate::validate_relative_path(&path, true)?;
+            self.volume.ensure_path_allowed(&path)?;
+            let mut prefix = PathBuf::new();
+            for component in path.components() {
+                let Component::Normal(component) = component else {
+                    return Err(lx::Error::EINVAL);
+                };
+                prefix.push(component);
+                let stat = self.volume.lstat(&prefix)?;
+                if stat.mode & lx::S_IFMT == lx::S_IFLNK {
+                    return Err(lx::Error::ELOOP);
+                }
             }
         }
         Ok(())

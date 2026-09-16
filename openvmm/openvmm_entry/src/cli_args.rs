@@ -1118,6 +1118,14 @@ options:
     )]
     pub microvm_mount: Option<MicrovmMountCli>,
 
+    /// Hide an existing host path inside the microVM filesystem export.
+    #[clap(
+        long = "mount-deny",
+        value_name = "HOST_PATH",
+        requires = "microvm_mount"
+    )]
+    pub microvm_mount_deny: Vec<PathBuf>,
+
     /// virtio PMEM device
     ///
     /// Prefix with `pcie_port=<port_name>:` to expose the device over
@@ -1850,6 +1858,7 @@ impl Options {
                     && self.block_host.is_empty()
                     && self.allow_endpoint.is_empty()
                     && self.microvm_mount.is_none()
+                    && self.microvm_mount_deny.is_empty()
                     && self.microvm_sandbox_block.is_empty()
                     && self.microvm_workload_identity.is_none()
                     && self.microvm_lifecycle.is_none()
@@ -2085,6 +2094,10 @@ impl Options {
         anyhow::ensure!(
             self.microvm_sandbox_block.len() <= 4,
             "microVM permits at most three read-only layers and one writable scratch device"
+        );
+        anyhow::ensure!(
+            self.microvm_mount_deny.len() <= 128,
+            "microVM filesystem permits at most 128 denied paths"
         );
         for (index, block) in self.microvm_sandbox_block.iter().enumerate() {
             anyhow::ensure!(
