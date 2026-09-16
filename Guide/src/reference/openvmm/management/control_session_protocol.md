@@ -21,10 +21,22 @@ Every record has a 44-byte little-endian header:
 
 `GUEST_ATTACH` and `HOST_ATTACH` are bootstrap records and use zero instance,
 epoch, and sequence fields. Post-bootstrap records use the current instance
-and epoch. DATA payloads contain between 1 and 65,536 bytes.
+and epoch.
 
-The record types include type 9, `CREDIT`. ACK and CREDIT carry receive-credit
-values:
+| Value | Record | Payload |
+| ---: | --- | --- |
+| 1 | `GUEST_ATTACH` | empty |
+| 2 | `HOST_ATTACH` | exactly 32 capability bytes |
+| 3 | `RESET` | empty |
+| 4 | `ACK` | four-byte little-endian initial receive window |
+| 5 | `DATA` | 1 through 65,536 opaque bytes |
+| 6 | `WAIT` | empty |
+| 7 | `READY` | empty |
+| 8 | `ERROR` | four-byte little-endian error code |
+| 9 | `CREDIT` | four-byte little-endian receive-credit increment |
+
+The sole valid `ERROR` code is `1` (`Authentication`). ACK and CREDIT carry
+receive-credit values:
 
 * ACK contains one four-byte little-endian initial receive window.
 * CREDIT contains one four-byte little-endian increment.
