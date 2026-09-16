@@ -899,7 +899,10 @@ options:
     )]
     pub network_egress_deny: Vec<net_backend_resources::egress::EgressRule>,
 
-    /// Permit or deny host-loopback connectivity in both directions.
+    /// Deny host-loopback access, or allow it with explicit localhost forwards.
+    ///
+    /// Explicit `allow` without forwards is unsupported: portable NAT cannot
+    /// provide generic bidirectional host-loopback connectivity.
     #[clap(long, value_enum, value_name = "ACTION")]
     pub host_loopback: Option<MicrovmNetworkActionCli>,
 
@@ -1846,7 +1849,18 @@ impl Options {
     }
 
     /// Rejects unsupported microVM combinations before opening host resources.
+    pub(crate) fn validate_microvm_host_loopback(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.machine != MachineProfileCli::Microvm
+                || self.host_loopback != Some(MicrovmNetworkActionCli::Allow)
+                || !self.host_loopback_forward.is_empty(),
+            "the portable microVM network profile does not support generic host-loopback connectivity; explicit --host-loopback allow requires --host-loopback-forward for deliberate port publishing"
+        );
+        Ok(())
+    }
+
     pub(crate) fn validate_microvm_options(&self) -> anyhow::Result<()> {
+        self.validate_microvm_host_loopback()?;
         if self.machine != MachineProfileCli::Microvm {
             anyhow::ensure!(
                 self.net_tap.is_none()
@@ -7040,6 +7054,45 @@ mod tests {
     }
 
     #[test]
+    fn test_microvm_host_loopback_generic_allow_is_rejected() {
+        let common = [
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--network-profile",
+            "portable",
+            "--host-loopback",
+            "allow",
+        ];
+        for extra in [
+            vec!["--net", "10.0.0.2/24"],
+            vec!["--net", "10.0.0.2/24", "--snapshot-destination", "snapshot"],
+            vec!["--restore-snapshot", "snapshot"],
+        ] {
+            let options = Options::try_parse_from(common.into_iter().chain(extra)).unwrap();
+            let error = options.validate_microvm_options().unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("generic host-loopback connectivity"),
+                "{error}"
+            );
+        }
+        let forwarded = Options::try_parse_from(common.into_iter().chain([
+            "--net",
+            "10.0.0.2/24",
+            "--network-ingress",
+            "deny",
+            "--host-loopback-forward",
+            "tcp:3000:8080",
+            "--host-loopback-forward",
+            "udp:3000:8080",
+        ]))
+        .unwrap();
+        forwarded.validate_microvm_options().unwrap();
+    }
+
+    #[test]
     fn test_microvm_egress_policy_is_typed_and_canonical() {
         let options = Options::try_parse_from([
             "openvmm",
@@ -7209,8 +7262,7 @@ mod tests {
             assert!(mixed_legacy.validate_microvm_options().is_err());
         }
 
-        #[test]
-        fn test_microvm_host_loopback_policy_is_bidirectional_and_proxy_scoped() {
+        fn check_microvm_host_loopback_policy_and_explicit_forwards() {
             let network: openvmm_defs::config::MicrovmNetworkConfig =
                 "10.0.0.2/24".parse().unwrap();
             let denied = Options::try_parse_from([
@@ -7301,6 +7353,7 @@ mod tests {
             .unwrap();
             assert!(duplicate_forward.validate_microvm_options().is_err());
         }
+        check_microvm_host_loopback_policy_and_explicit_forwards();
 
         let options = Options::try_parse_from([
             "openvmm",
