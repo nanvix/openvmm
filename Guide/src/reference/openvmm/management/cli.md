@@ -596,10 +596,10 @@ Serial devices can be configured to appear as different devices inside the guest
 
   On Linux, the only live backend is `listen=PATH`, and PATH is always an
   AF_UNIX socket. TCP, client-connect, terminal, file, stdout/stderr, and
-  inherited console backends are rejected. A listener's parent must already be an owned,
-  non-symlink directory with mode `0700`; OpenVMM exclusively binds the socket,
-  sets and verifies mode `0600`, and never removes a pre-existing path.
-  OpenVMM verifies `SO_PEERCRED` before accepting the protocol attachment.
+  inherited console backends are rejected. A listener's parent must already be
+  an owned, non-symlink directory with mode `0700`; OpenVMM exclusively binds
+  the socket, sets and verifies mode `0600`, and never removes a pre-existing
+  path. OpenVMM verifies `SO_PEERCRED` before accepting the protocol attachment.
 
   A live endpoint also requires the hidden launcher option
   `--microvm-control-auth-stdin`. The launcher must attach a prepared readable

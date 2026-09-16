@@ -60,13 +60,6 @@ pub fn bind_serial_without_cleanup(path: &Path) -> io::Result<Resource<SerialBac
 }
 
 #[cfg(target_os = "linux")]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Control endpoints are not activated by this entrypoint."
-    )
-)]
 pub fn bind_control_serial(path: &Path) -> io::Result<Resource<SerialBackendHandle>> {
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::fs::MetadataExt;
@@ -132,13 +125,6 @@ pub fn bind_control_serial(_path: &Path) -> io::Result<Resource<SerialBackendHan
 
 /// Consumes a one-way pipe containing exactly one nonzero 32-byte control capability.
 #[cfg(unix)]
-#[cfg_attr(
-    not(all(test, target_os = "linux")),
-    expect(
-        dead_code,
-        reason = "Control capability intake is not enabled by this entrypoint."
-    )
-)]
 pub fn read_control_capability(mut file: File) -> io::Result<[u8; 32]> {
     use std::os::unix::fs::FileTypeExt;
 
