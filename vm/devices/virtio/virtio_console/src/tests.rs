@@ -7,10 +7,13 @@
 //! serial IO backend, and real virtio queues — then drive requests through the
 //! descriptor rings just as a guest driver would.
 
+use crate::HostTransportState;
 use crate::VirtioConsoleDevice;
 use crate::control_session_protocol;
 use crate::control_session_protocol::Record;
 use crate::control_session_protocol::RecordType;
+use crate::disconnect_host_transport;
+use crate::initial_host_transport_state;
 use chipset_device::io::IoResult;
 use chipset_device::mmio::MmioIntercept;
 use futures::AsyncRead;
@@ -23,6 +26,7 @@ use pal_event::Event;
 use parking_lot::Mutex;
 use serial_core::LocalPeerIdentity;
 use serial_core::SerialIo;
+use serial_core::disconnected::Disconnected;
 use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
@@ -358,6 +362,19 @@ fn new_mock_serial() -> (MockSerialIo, MockSerialHandle) {
         },
         MockSerialHandle { shared },
     )
+}
+
+#[test]
+fn disconnected_broker_transport_waits_for_connect() {
+    let mut io = Disconnected;
+    assert_eq!(
+        initial_host_transport_state(&io),
+        HostTransportState::WaitingForConnect
+    );
+    assert_eq!(
+        disconnect_host_transport(&mut io),
+        HostTransportState::WaitingForConnect
+    );
 }
 
 // --- Test Harness ---

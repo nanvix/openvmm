@@ -141,11 +141,7 @@ impl VirtioConsoleDevice {
         config: VirtioControlConsoleBrokerConfig,
     ) -> Self {
         let driver = driver_source.simple();
-        let transport_state = if host_io.is_connected() {
-            HostTransportState::Connected
-        } else {
-            HostTransportState::WaitingForDisconnect
-        };
+        let transport_state = initial_host_transport_state(&*host_io);
         let broker = control_session_broker::ControlSessionBroker::new(
             config.instance_id,
             config.capability,
@@ -282,11 +278,7 @@ impl VirtioDevice for VirtioConsoleDevice {
             mode.broker.reset_for_device();
             mode.host_input.clear();
             mode.auth_deadline = None;
-            mode.transport_state = if mode.host_io.disconnect_current().is_ok() {
-                HostTransportState::WaitingForConnect
-            } else {
-                HostTransportState::WaitingForDisconnect
-            };
+            mode.transport_state = disconnect_host_transport(&mut *mode.host_io);
         }
     }
 
@@ -457,6 +449,22 @@ enum HostTransportState {
     WaitingForConnect,
     Connected,
     Disabled,
+}
+
+fn initial_host_transport_state(host_io: &dyn SerialIo) -> HostTransportState {
+    if host_io.is_connected() {
+        HostTransportState::Connected
+    } else {
+        HostTransportState::WaitingForConnect
+    }
+}
+
+fn disconnect_host_transport(host_io: &mut dyn SerialIo) -> HostTransportState {
+    if !host_io.is_connected() || host_io.disconnect_current().is_ok() {
+        HostTransportState::WaitingForConnect
+    } else {
+        HostTransportState::WaitingForDisconnect
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1695,11 +1703,7 @@ impl BrokerWorker {
         let broker_result = self.broker.host_disconnected().map_err(WorkerError::Broker);
         self.host_input.clear();
         self.auth_deadline = None;
-        self.transport_state = if self.host_io.disconnect_current().is_ok() {
-            HostTransportState::WaitingForConnect
-        } else {
-            HostTransportState::WaitingForDisconnect
-        };
+        self.transport_state = disconnect_host_transport(&mut *self.host_io);
         broker_result
     }
 

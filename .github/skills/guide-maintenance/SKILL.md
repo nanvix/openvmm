@@ -149,6 +149,7 @@ Each row in the mapping table follows:
 | `openvmm/openvmm_build_info/` | `reference/openvmm/management/cli.md` |
 | `vm/devices/virtio/virtiofs/` | `reference/devices/virtio/virtio-fs.md` |
 | `vm/devices/virtio/virtio_resources/` | `reference/devices/virtio/virtio-fs.md` |
+| `vm/devices/virtio/virtio_console/` | `reference/openvmm/management/control_session_protocol.md` |
 | `vm/devices/support/fs/fuse/` | `reference/devices/virtio/virtio-fs.md` |
 
 ## What to Flag
@@ -161,3 +162,6 @@ Each row in the mapping table follows:
 - Changes to virtio-fs backends, queue/cache policy, save/restore, or microVM
   attachment semantics require an update to
   `reference/devices/virtio/virtio-fs.md`.
+- Changes to control-session framing, record types, payload rules, receive
+  credits, authentication, or reconnect behavior require an update to
+  `reference/openvmm/management/control_session_protocol.md`.
