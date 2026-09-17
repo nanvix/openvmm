@@ -1227,6 +1227,10 @@ impl VmService {
                 );
                 if let Some(filesystem) = devices.virtiofs_config.first() {
                     anyhow::ensure!(
+                        !filesystem.read_only,
+                        "microVM virtio-fs uses read_write rather than read_only"
+                    );
+                    anyhow::ensure!(
                         filesystem.tag == "microvm" && !filesystem.root_path.is_empty(),
                         "microVM virtio-fs requires tag 'microvm' and a host root path"
                     );
@@ -1411,7 +1415,7 @@ impl VmService {
                             enable_memory_protections: false,
                             enable_debugging: false,
                             disable_frontpage: false,
-                            enable_tpm: false,
+                            tpm_version: None,
                             enable_battery: false,
                             enable_vpci_boot: false,
                             default_boot_always_attempt: false,
@@ -1902,19 +1906,7 @@ impl VmService {
                     microvm_filesystem_attachment = Some(attachment);
                     config.virtio_devices.push((VirtioBus::Mmio, resource));
                 } else {
-                    anyhow::ensure!(
-                        virtiofs.guest_mount_target.is_empty() && !virtiofs.read_write,
-                        "guest_mount_target and read_write require the microVM profile"
-                    );
-                    let resource = virtio_resources::fs::VirtioFsHandle {
-                        tag: virtiofs.tag,
-                        fs: virtio_resources::fs::VirtioFsBackend::HostFs {
-                            root_path: virtiofs.root_path,
-                            mount_options: String::new(),
-                        },
-                        profile: virtio_resources::fs::VirtioFsProfile::Standard,
-                    }
-                    .into_resource();
+                    let resource = build_virtio_fs(virtiofs)?.into_resource();
                     // Use VPCI when possible (currently only on Windows and macOS due
                     // to KVM backend limitations).
                     if cfg!(windows) || cfg!(target_os = "macos") {
@@ -2224,7 +2216,7 @@ impl VmService {
             memory_capacity,
             processors,
             log_file: None,
-            crash_dump_path: None,
+            crash_dump_path: req_config.crash_dump_path.map(Into::into),
             snapshot_requests,
             snapshot_destination,
             snapshot_tier: None,
@@ -2714,6 +2706,7 @@ fn parse_port_config(port: vmservice::PortConfig) -> anyhow::Result<HostPortConf
         host_port,
         guest_port,
         protocol,
+        host_address,
     } = port;
     let protocol = if protocol == vmservice::IpProtocol::Tcp as i32 {
         HostPortProtocol::Tcp
@@ -2724,7 +2717,16 @@ fn parse_port_config(port: vmservice::PortConfig) -> anyhow::Result<HostPortConf
     };
     Ok(HostPortConfig {
         protocol,
-        host_address: None,
+        host_address: if host_address.is_empty() {
+            None
+        } else {
+            Some(
+                host_address
+                    .parse::<std::net::IpAddr>()
+                    .context("invalid host address")?
+                    .into(),
+            )
+        },
         host_port: HostPort::Fixed(host_port.try_into().context("host port out of range")?),
         guest_port: guest_port.try_into().context("guest port out of range")?,
     })
@@ -3247,44 +3249,53 @@ async fn build_virtio_device(
             .into_resource()
         }
         Kind::VhostUser(vhost_user) => build_vhost_user_device(vhost_user)?,
-        Kind::Fs(vmservice::VirtioFs {
-            tag,
+        Kind::Fs(config) => build_virtio_fs(config)?.into_resource(),
+    })
+}
+
+fn build_virtio_fs(
+    config: vmservice::VirtioFs,
+) -> anyhow::Result<virtio_resources::fs::VirtioFsHandle> {
+    let vmservice::VirtioFs {
+        tag,
+        root_path,
+        read_only,
+        guest_mount_target,
+        read_write,
+    } = config;
+    const VIRTIO_FS_TAG_LEN: usize = 36;
+    anyhow::ensure!(
+        guest_mount_target.is_empty() && !read_write,
+        "standard-machine virtio-fs does not accept microVM mount fields"
+    );
+    anyhow::ensure!(!tag.is_empty(), "virtio-fs tag must not be empty");
+    anyhow::ensure!(
+        !tag.contains('\0'),
+        "virtio-fs tag must not contain NUL bytes"
+    );
+    anyhow::ensure!(
+        tag.len() <= VIRTIO_FS_TAG_LEN,
+        "virtio-fs tag exceeds the {VIRTIO_FS_TAG_LEN}-byte protocol limit"
+    );
+    anyhow::ensure!(
+        !root_path.is_empty(),
+        "virtio-fs root path must not be empty"
+    );
+    anyhow::ensure!(
+        !root_path.contains('\0'),
+        "virtio-fs root path must not contain NUL bytes"
+    );
+    Ok(virtio_resources::fs::VirtioFsHandle {
+        tag,
+        fs: virtio_resources::fs::VirtioFsBackend::HostFs {
             root_path,
-            guest_mount_target,
-            read_write,
-        }) => {
-            const VIRTIO_FS_TAG_LEN: usize = 36;
-            anyhow::ensure!(
-                guest_mount_target.is_empty() && !read_write,
-                "dynamic standard-machine virtio-fs does not accept microVM mount fields"
-            );
-            anyhow::ensure!(!tag.is_empty(), "virtio-fs tag must not be empty");
-            anyhow::ensure!(
-                !tag.contains('\0'),
-                "virtio-fs tag must not contain NUL bytes"
-            );
-            anyhow::ensure!(
-                tag.len() <= VIRTIO_FS_TAG_LEN,
-                "virtio-fs tag exceeds the {VIRTIO_FS_TAG_LEN}-byte protocol limit"
-            );
-            anyhow::ensure!(
-                !root_path.is_empty(),
-                "virtio-fs root path must not be empty"
-            );
-            anyhow::ensure!(
-                !root_path.contains('\0'),
-                "virtio-fs root path must not contain NUL bytes"
-            );
-            virtio_resources::fs::VirtioFsHandle {
-                tag,
-                fs: virtio_resources::fs::VirtioFsBackend::HostFs {
-                    root_path,
-                    mount_options: String::new(),
-                },
-                profile: virtio_resources::fs::VirtioFsProfile::Standard,
-            }
-            .into_resource()
-        }
+            mount_options: if read_only {
+                "ro".to_string()
+            } else {
+                String::new()
+            },
+        },
+        profile: virtio_resources::fs::VirtioFsProfile::Standard,
     })
 }
 
@@ -3508,6 +3519,105 @@ mod microvm_exit_tests {
 mod machine_profile_tests {
     use super::*;
     use test_with_tracing::test;
+
+    #[test]
+    fn ttrpc_virtio_fs_preserves_microvm_wire_fields() {
+        let encoded = b"\x1a\x06/share\x20\x01";
+        let filesystem: vmservice::VirtioFs = mesh::payload::decode(encoded).unwrap();
+        assert_eq!(filesystem.guest_mount_target, "/share");
+        assert!(filesystem.read_write);
+        assert!(!filesystem.read_only);
+        assert_eq!(mesh::payload::encode(filesystem), encoded);
+    }
+
+    #[test]
+    fn ttrpc_virtio_fs_read_only_uses_a_distinct_wire_field() {
+        let filesystem = vmservice::VirtioFs {
+            read_only: true,
+            ..Default::default()
+        };
+        assert_eq!(mesh::payload::encode(filesystem), [0x28, 0x01]);
+        let decoded: vmservice::VirtioFs = mesh::payload::decode(&[0x28, 0x01]).unwrap();
+        assert!(decoded.read_only);
+        assert!(!decoded.read_write);
+        assert!(decoded.guest_mount_target.is_empty());
+        assert!(mesh::payload::decode::<vmservice::VirtioFs>(&[0x18, 0x01]).is_err());
+    }
+
+    #[test]
+    fn ttrpc_vm_config_preserves_microvm_wire_fields() {
+        let encoded = b"\x72\x00\x78\x02";
+        let config: vmservice::VmConfig = mesh::payload::decode(encoded).unwrap();
+        assert!(matches!(
+            config.boot_config,
+            Some(vmservice::vm_config::BootConfig::PvhBoot(_))
+        ));
+        assert_eq!(
+            config.machine_profile,
+            vmservice::vm_config::MachineProfile::Microvm as i32
+        );
+        assert!(config.crash_dump_path.is_none());
+        assert_eq!(mesh::payload::encode(config), encoded);
+    }
+
+    #[test]
+    fn ttrpc_crash_dump_uses_a_distinct_wire_field() {
+        let config = vmservice::VmConfig {
+            crash_dump_path: Some("dump".to_owned()),
+            ..Default::default()
+        };
+        let encoded = b"\x82\x01\x04dump";
+        assert_eq!(mesh::payload::encode(config), encoded);
+        let decoded: vmservice::VmConfig = mesh::payload::decode(encoded).unwrap();
+        assert_eq!(decoded.crash_dump_path.as_deref(), Some("dump"));
+        assert!(decoded.boot_config.is_none());
+    }
+
+    #[test]
+    fn ttrpc_standard_virtio_fs_preserves_access_mode() {
+        for read_only in [false, true] {
+            let handle = build_virtio_fs(vmservice::VirtioFs {
+                tag: "share".to_owned(),
+                root_path: "host-root".to_owned(),
+                read_only,
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(matches!(
+                handle.profile,
+                virtio_resources::fs::VirtioFsProfile::Standard
+            ));
+            let virtio_resources::fs::VirtioFsBackend::HostFs {
+                root_path,
+                mount_options,
+            } = handle.fs
+            else {
+                panic!("standard virtio-fs must use HostFs");
+            };
+            assert_eq!(root_path, "host-root");
+            assert_eq!(mount_options, if read_only { "ro" } else { "" });
+        }
+    }
+
+    #[test]
+    fn ttrpc_standard_virtio_fs_rejects_microvm_mount_fields() {
+        for (guest_mount_target, read_write) in [("/share", false), ("", true)] {
+            let error = build_virtio_fs(vmservice::VirtioFs {
+                tag: "share".to_owned(),
+                root_path: "host-root".to_owned(),
+                guest_mount_target: guest_mount_target.to_owned(),
+                read_write,
+                ..Default::default()
+            })
+            .err()
+            .expect("microVM mount fields must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("standard-machine virtio-fs does not accept microVM mount fields")
+            );
+        }
+    }
 
     #[test]
     fn management_restore_rejects_control_console_attachments_explicitly() {

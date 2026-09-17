@@ -3737,6 +3737,11 @@ async fn vm_config_from_command_line(
         .build()
         .context("failed to build chipset configuration")?;
 
+    let tpm_version = opt.tpm.map(|cli_ver| match cli_ver {
+        TpmVersionCli::V138 => TpmVersion::V138,
+        TpmVersionCli::V185 => TpmVersion::V185,
+    });
+
     if let Some(io) = microvm_portb_cfg {
         let (drain, output_drain) =
             microvm_output::MicrovmOutputDrain::new(microvm_output_completion.into_inner());
@@ -3903,7 +3908,7 @@ async fn vm_config_from_command_line(
             enable_debugging: opt.uefi_debug,
             enable_memory_protections: opt.uefi_enable_memory_protections,
             disable_frontpage: opt.disable_frontpage,
-            enable_tpm: opt.tpm.is_some(),
+            tpm_version,
             enable_battery: opt.battery,
             enable_serial: any_serial_configured,
             enable_vpci_boot: false,
@@ -4074,9 +4079,9 @@ async fn vm_config_from_command_line(
                         .vtl2_gfx
                         .then(|| SharedFramebufferHandle.into_resource()),
                     guest_request_recv,
-                    tpm_version: opt.tpm.map(|v| match v {
-                        TpmVersionCli::V138 => get_resources::ged::GedTpmVersion::V138,
-                        TpmVersionCli::V185 => get_resources::ged::GedTpmVersion::V185,
+                    tpm_version: tpm_version.map(|v| match v {
+                        TpmVersion::V138 => get_resources::ged::GedTpmVersion::V138,
+                        TpmVersion::V185 => get_resources::ged::GedTpmVersion::V185,
                     }),
                     firmware_event_send: None,
                     secure_boot_enabled: opt.secure_boot,
@@ -4111,7 +4116,7 @@ async fn vm_config_from_command_line(
         ]);
     }
 
-    if let Some(tpm_version) = opt.tpm
+    if let Some(tpm_version) = tpm_version
         && !opt.vtl2
     {
         let register_layout = if cfg!(guest_arch = "x86_64") {
@@ -4120,15 +4125,10 @@ async fn vm_config_from_command_line(
             TpmRegisterLayout::Mmio
         };
 
-        let tpm_version = match tpm_version {
-            TpmVersionCli::V138 => TpmVersion::V138,
-            TpmVersionCli::V185 => TpmVersion::V185,
-        };
-
         let (ppi_store, nvram_store) = if opt.vmgs.is_some() {
             (
                 VmgsFileHandle::new(vmgs_format::FileId::TPM_PPI, true).into_resource(),
-                VmgsFileHandle::new(tpm_version.to_nvram_vmgs_file_id(), true).into_resource(),
+                VmgsFileHandle::new(tpm_vmgs::tpm_nvram_file_id(tpm_version), true).into_resource(),
             )
         } else {
             (
@@ -4874,9 +4874,6 @@ fn validate_snp_config(cfg: &Config) -> anyhow::Result<()> {
         LoadMode::Linux { .. } | LoadMode::Igvm { .. }
     ) {
         anyhow::bail!("SNP isolation currently only supports Linux direct or IGVM boot");
-    }
-    if cfg.hypervisor.with_hv {
-        anyhow::bail!("SNP isolation currently does not support Hyper-V enlightenments");
     }
     if cfg.hypervisor.with_vtl2.is_some() {
         anyhow::bail!("SNP isolation currently does not support VTL2");

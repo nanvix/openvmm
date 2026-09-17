@@ -412,9 +412,9 @@ pub fn connect_tcp_serial(
 mod tests {
     use super::*;
     use std::io::Write as _;
-    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
     use test_with_tracing::test;
 
     fn read_capability_payload(payload: &[u8], keep_writer_open: bool) -> io::Result<[u8; 32]> {
@@ -542,23 +542,9 @@ mod tests {
 
     #[test]
     fn control_listener_has_private_permissions_and_exclusive_path() {
-        let mut nonce = [0u8; 8];
-        getrandom::fill(&mut nonce).unwrap();
-        let directory = std::env::current_dir().unwrap().join(format!(
-            ".control-endpoint-test-{:016x}",
-            u64::from_ne_bytes(nonce)
-        ));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&directory)
-            .unwrap();
-        let path = directory.join("control.sock");
-        let cleanup_path = path.clone();
-        let cleanup_directory = directory.clone();
-        let _cleanup = pal::ScopeExit::new(move || {
-            let _ = fs_err::remove_file(cleanup_path);
-            let _ = fs_err::remove_dir(cleanup_directory);
-        });
+        let directory = tempfile::tempdir().unwrap();
+        fs_err::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join("control.sock");
 
         let listener = bind_control_serial(&path).unwrap();
         let metadata = fs_err::symlink_metadata(&path).unwrap();

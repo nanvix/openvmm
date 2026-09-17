@@ -604,8 +604,11 @@ message VMConfig {
     // selected; note that PCAT boot honors only the system UUID and serial
     // number.
     SMBIOSConfig smbios_config = 13;
+
     // Machine selection is independent from hypervisor selection.
     MachineProfile machine_profile = 15;
+    // Tag 14 is retained for microVM PVH boot compatibility.
+    optional string crash_dump_path = 16;
 }
 
 // WindowsOptions contains virtual machine configurations that are only present on a Windows host.
@@ -841,6 +844,7 @@ message PortConfig {
     uint32 guest_port = 2;
     // The protocol to forward.
     IpProtocol protocol = 3;
+    string host_address = 4;
 }
 
 message ConsommeBackend {
@@ -866,6 +870,8 @@ message VirtioFs {
     // Enable the microVM common read-write contract. False selects read-only.
     // Must be false for a standard-machine virtio-fs device.
     bool read_write = 4;
+    // Standard-machine access flag. Tags 3 and 4 retain microVM wire compatibility.
+    bool read_only = 5;
 }
 
 message VirtioConsoleConfig {
