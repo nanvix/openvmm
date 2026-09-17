@@ -605,9 +605,10 @@ message VMConfig {
     // number.
     SMBIOSConfig smbios_config = 13;
 
-    optional string crash_dump_path = 14;
     // Machine selection is independent from hypervisor selection.
     MachineProfile machine_profile = 15;
+    // Tag 14 is retained for microVM PVH boot compatibility.
+    optional string crash_dump_path = 16;
 }
 
 // WindowsOptions contains virtual machine configurations that are only present on a Windows host.
