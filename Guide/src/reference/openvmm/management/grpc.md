@@ -179,6 +179,14 @@ omit the attachment or supply a new one; after `ResumeVM`, the guest explicitly
 mounts tag `microvm`. The fixed device uses MMIO `0xd0001000`, IRQ 6, one
 request queue, and no DAX window.
 
+The fork retains `VirtioFs.guest_mount_target` at protobuf field 3 and
+`read_write` at field 4 for existing microVM clients. Standard-machine
+`read_only` uses field 5, rather than upstream's conflicting field 3; clients
+using that flag must generate bindings from this fork's `vmservice.proto`.
+Standard-machine attachments reject the microVM mount fields, and microVM
+attachments reject `read_only=true` before opening device resources. Use
+`read_write` to select a microVM attachment's access mode.
+
 Capture and restore paths are mutually exclusive. A successful capture halts
 the managed source VM at the committed boundary and terminates the OpenVMM
 source process; clients observe the transport closing. Restore creates a private
@@ -189,11 +197,16 @@ attachment, or worker-start failure publishes none.
 
 `VMConfig.MICROVM` is numeric value 2 and accepts exactly 1, 2, 4, or 8
 processors. Numeric value 1 is reserved and rejected before host resources are
-opened. Existing clients that already send value 2 remain wire-compatible;
-clients that used the former `MICROVM_V2` source name must regenerate or update
-their bindings. RPC construction is currently blockless; role-bearing sandbox
-blocks remain CLI-only. Snapshot ABI and PVH layout values remain 2, while
-value 1 snapshots are unsupported.
+opened. Clients must regenerate bindings because `machine_profile` moved from
+field 15 to field 17 when upstream assigned field 15 to `iommufds`; the
+colliding legacy encoding is rejected. Clients that used the former
+`MICROVM_V2` source name must also update their bindings. RPC construction is
+currently blockless; role-bearing sandbox blocks remain CLI-only. Snapshot ABI
+and PVH layout values remain 2, while value 1 snapshots are unsupported.
+
+`VMConfig.pvh_boot` retains protobuf field 14, upstream `iommufds` retains field
+15, `crash_dump_path` uses field 16, and `machine_profile` uses field 17.
+Generate bindings from this fork for the combined schema.
 
 The API has the same KVM/MSHV/WHP backend, no-block device, artifact integrity,
 and security restrictions documented under [`--snapshot-destination`].

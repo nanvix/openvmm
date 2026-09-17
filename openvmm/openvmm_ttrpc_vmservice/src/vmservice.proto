@@ -646,7 +646,8 @@ message VMConfig {
     // number.
     SMBIOSConfig smbios_config = 13;
 
-    optional string crash_dump_path = 14;
+    // Tag 14 is retained for microVM PVH boot compatibility.
+    optional string crash_dump_path = 16;
     // Host iommufd contexts to create with the VM. Linux only; a non-empty
     // list on other hosts is an error. Contexts remain available until VM
     // teardown, including when unused or after their last device is removed,
