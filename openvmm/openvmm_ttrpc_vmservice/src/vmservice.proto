@@ -73,14 +73,6 @@ message DirectBoot {
     string kernel_cmdline = 3;
 }
 
-// Xen PVH direct boot for the microVM profile.
-message PvhBoot {
-    string kernel_path = 1;
-    string initrd_path = 2;
-    // Additional arguments only. The microVM profile owns console and discovery tokens.
-    string kernel_cmdline = 3;
-}
-
 message UEFI {
     // Variables used to initialize an empty UEFI variable store. These are
     // ignored when the store already contains any variables.
@@ -584,8 +576,9 @@ message VMConfig {
     oneof BootConfig {
         DirectBoot direct_boot = 5;
         UEFI uefi = 6;
-        PvhBoot pvh_boot = 14;
     }
+    reserved 14;
+    reserved "pvh_boot";
     WindowsOptions windows_options = 7;
     // Field 8 was previously map<string, string> extra_data.
     reserved 8;

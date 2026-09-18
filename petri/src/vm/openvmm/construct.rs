@@ -140,6 +140,7 @@ impl PetriVmConfigOpenVmm {
         } = petri_vm_config;
 
         let is_microvm = machine_profile == MachineProfile::Microvm;
+        let microvm_processor_count = proc_topology.vp_count;
         if is_microvm {
             anyhow::ensure!(
                 matches!(arch, MachineArch::X86_64),
@@ -147,7 +148,7 @@ impl PetriVmConfigOpenVmm {
             );
             anyhow::ensure!(
                 matches!(firmware, Firmware::LinuxDirect { .. }),
-                "microVM requires an uncompressed Xen PVH LinuxDirect artifact"
+                "microVM requires an uncompressed Linux direct artifact"
             );
         }
 
@@ -220,11 +221,27 @@ impl PetriVmConfigOpenVmm {
 
         if is_microvm {
             load_mode = match load_mode {
-                LoadMode::Linux { kernel, initrd, .. } => LoadMode::Pvh {
+                LoadMode::Linux {
                     kernel,
                     initrd,
-                    cmdline: build_microvm_command_line(&[], false)?,
-                },
+                    cmdline,
+                    ..
+                } => {
+                    let mut cmdline = build_microvm_command_line(&[cmdline], false)?;
+                    openvmm_defs::config::append_microvm_processor_limit(
+                        &mut cmdline,
+                        microvm_processor_count,
+                    )?;
+                    LoadMode::Linux {
+                        kernel,
+                        initrd,
+                        cmdline,
+                        enable_serial: false,
+                        isolation: openvmm_defs::config::LinuxIsolationConfig::None,
+                        boot_mode: openvmm_defs::config::LinuxDirectBootMode::MpTable,
+                        smbios: Box::default(),
+                    }
+                }
                 _ => unreachable!("microVM firmware was validated as LinuxDirect"),
             };
         }
@@ -1026,13 +1043,16 @@ impl PetriVmConfigSetupCore<'_> {
                     "/bin/sh"
                 };
 
-                let serial_args = if self.enable_serial {
-                    format!("{console} debug ")
+                let cmdline = if self.is_microvm {
+                    format!("rdinit={init} {vsock_blacklist}")
                 } else {
-                    String::new()
+                    let serial_args = if self.enable_serial {
+                        format!("{console} debug ")
+                    } else {
+                        String::new()
+                    };
+                    format!("{serial_args}panic=-1 rdinit={init} {vsock_blacklist}")
                 };
-
-                let cmdline = format!("{serial_args}panic=-1 rdinit={init} {vsock_blacklist}");
 
                 LoadMode::Linux {
                     kernel,
