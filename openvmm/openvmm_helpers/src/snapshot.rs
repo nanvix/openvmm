@@ -33,8 +33,8 @@ pub const SAVED_STATE_SCHEMA_VERSION: u32 = 1;
 pub const SAVED_STATE_ROOT_TYPE: &str = "openvmm.SavedState";
 /// Capability version for the always-present dormant microVM virtio-fs slot.
 pub const MICROVM_FILESYSTEM_SLOT_VERSION: u32 = 1;
-/// SMP-safe Xen PVH layout with shared interrupt status used by the microVM.
-pub const MICROVM_PVH_LAYOUT_VERSION: u32 = 2;
+/// Linux-direct MP-table boot layout with shared interrupt status.
+pub const MICROVM_BOOT_LAYOUT_VERSION: u32 = 2;
 /// Contract version for one-shot restore-time microVM memory expansion.
 pub const MICROVM_MEMORY_EXPANSION_VERSION: u32 = 1;
 /// Linux memory-block granularity used by the x86-64 microVM guest.
@@ -482,9 +482,9 @@ pub struct SnapshotMachineContract {
     /// SHA-256 of the canonical CPU contract.
     #[mesh(15)]
     pub cpu_contract_sha256: Vec<u8>,
-    /// Version of the fixed Xen PVH boot and memory layout.
+    /// Version of the fixed cold-boot and memory layout.
     #[mesh(16)]
-    pub pvh_layout_version: u32,
+    pub boot_layout_version: u32,
     /// Policy used to advance clocks and deadlines over host downtime.
     #[mesh(17)]
     pub clock_policy: String,
@@ -524,7 +524,7 @@ pub struct SnapshotMachineContract {
     /// Required alignment of every restore-time memory target and range.
     #[mesh(29)]
     pub memory_block_size_bytes: u64,
-    /// Canonical capacity ranges absent from the captured PVH memory map.
+    /// Canonical capacity ranges absent from the captured boot memory map.
     #[mesh(30)]
     pub memory_expansion_ranges: Vec<SnapshotMemoryExpansionRange>,
 }
@@ -729,6 +729,7 @@ fn memory_expansion_prefix(
 /// Builds the authoritative microVM machine contract.
 pub fn microvm_machine_contract(
     source_hypervisor: &str,
+    boot_layout_version: u32,
     effective_command_line: String,
     network: Option<(
         &openvmm_defs::config::MicrovmNetworkConfig,
@@ -1190,7 +1191,7 @@ pub fn microvm_machine_contract(
         tsc_tolerance_ppm: 0,
         cpu_contract: Vec::new(),
         cpu_contract_sha256: Vec::new(),
-        pvh_layout_version: MICROVM_PVH_LAYOUT_VERSION,
+        boot_layout_version,
         clock_policy: ADVANCE_BY_HOST_DOWNTIME.to_owned(),
         microvm_network,
         microvm_filesystem,
@@ -3357,10 +3358,10 @@ pub fn validate_supported_microvm_contract(
         openvmm_defs::config::MICROVM_ABI_VERSION_2,
     );
     anyhow::ensure!(
-        contract.pvh_layout_version == MICROVM_PVH_LAYOUT_VERSION,
-        "snapshot PVH layout version {} is unsupported; this OpenVMM supports version {}",
-        contract.pvh_layout_version,
-        MICROVM_PVH_LAYOUT_VERSION,
+        contract.boot_layout_version == MICROVM_BOOT_LAYOUT_VERSION,
+        "snapshot boot layout version {} is unsupported; this OpenVMM supports version {}",
+        contract.boot_layout_version,
+        MICROVM_BOOT_LAYOUT_VERSION,
     );
     Ok(())
 }
@@ -3402,8 +3403,8 @@ pub fn validate_microvm_machine_contract(
         expected.source_hypervisor,
     );
     anyhow::ensure!(
-        contract.pvh_layout_version == expected.pvh_layout_version,
-        "snapshot PVH layout version doesn't match the requested machine"
+        contract.boot_layout_version == expected.boot_layout_version,
+        "snapshot boot layout version doesn't match the requested machine"
     );
     anyhow::ensure!(
         contract.virtio_interrupt_mode == expected.virtio_interrupt_mode
@@ -4137,6 +4138,22 @@ fn validate_snapshot_tier(manifest: &SnapshotManifest) -> anyhow::Result<()> {
                 "platform snapshot command line LAPIC frequency does not match its machine contract"
             );
         }
+        let processor_limit_tokens = contract
+            .effective_command_line
+            .split_ascii_whitespace()
+            .filter(|token| token.starts_with("nr_cpus="))
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            processor_limit_tokens.len() <= 1,
+            "platform snapshot command line contains duplicate processor capacity"
+        );
+        if let Some(processor_limit) = processor_limit_tokens.first() {
+            let expected = format!("nr_cpus={}", contract.topology.apic_ids.len());
+            anyhow::ensure!(
+                **processor_limit == expected,
+                "platform snapshot command line processor capacity does not match its machine contract"
+            );
+        }
         anyhow::ensure!(
             contract
                 .effective_command_line
@@ -4160,6 +4177,7 @@ fn platform_command_line_token_is_invariant(token: &str) -> bool {
             | "nvx_config=0xd0010000,65536"
             | "nvx_snapshot_tier=platform"
     ) || token.starts_with("tsc_early_khz=")
+        || token.starts_with("nr_cpus=")
         || token == openvmm_defs::config::MICROVM_CONTROL_TTY_COMMAND_LINE
         || token.starts_with("lapic_timer_hz=")
         || [
@@ -4283,7 +4301,7 @@ mod tests {
             tsc_tolerance_ppm: 0,
             cpu_contract: Vec::new(),
             cpu_contract_sha256: Vec::new(),
-            pvh_layout_version: MICROVM_PVH_LAYOUT_VERSION,
+            boot_layout_version: MICROVM_BOOT_LAYOUT_VERSION,
             clock_policy: ADVANCE_BY_HOST_DOWNTIME.to_owned(),
             microvm_network: None,
             microvm_filesystem: None,
@@ -4338,7 +4356,10 @@ mod tests {
         manifest
     }
 
-    fn canonical_worker_platform_command_line(tsc_frequency_hz: u64) -> String {
+    fn canonical_worker_platform_command_line(
+        tsc_frequency_hz: u64,
+        processor_count: u32,
+    ) -> String {
         let mut command_line = openvmm_defs::config::build_microvm_control_command_line(
             &[
                 "nvx_sandbox=1".to_owned(),
@@ -4347,6 +4368,8 @@ mod tests {
             true,
         )
         .unwrap();
+        openvmm_defs::config::append_microvm_processor_limit(&mut command_line, processor_count)
+            .unwrap();
         command_line.push_str(&format!(
             " nvx_snapshot_tier=platform tsc_early_khz={}",
             tsc_frequency_hz / 1000
@@ -4390,8 +4413,10 @@ mod tests {
         scratch.identity_kind = "fresh".to_owned();
         scratch.identity.clear();
         scratch.artifact.clear();
+        let processor_count = u32::try_from(contract.topology.apic_ids.len()).unwrap();
         contract.set_effective_command_line(canonical_worker_platform_command_line(
             contract.tsc_frequency_hz,
+            processor_count,
         ));
     }
 
@@ -4498,6 +4523,26 @@ mod tests {
     }
 
     #[test]
+    fn platform_snapshot_rejects_mismatched_processor_limit() {
+        let scratch = vec![0x5a; 512];
+        let mut manifest = paired_scratch_manifest(&scratch);
+        make_platform_snapshot(&mut manifest);
+        let contract = manifest.machine_contract.as_mut().unwrap();
+        contract.set_effective_command_line(
+            contract
+                .effective_command_line
+                .replace("nr_cpus=2", "nr_cpus=1"),
+        );
+
+        assert!(
+            validate_manifest_version(&manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("processor capacity")
+        );
+    }
+
+    #[test]
     fn platform_snapshot_rejects_invalid_tsc_frequency_tokens() {
         let scratch = vec![0x5a; 512];
         for invalid in [
@@ -4536,7 +4581,8 @@ mod tests {
                 .unwrap()
                 .effective_command_line,
             "earlycon=xe9 console=hvc1 reboot=t panic=-1 \
-                 nvx_sandbox=1 nvx_config=0xd0010000,65536 nvx_snapshot_tier=platform \
+                  nvx_sandbox=1 nvx_config=0xd0010000,65536 nr_cpus=2 \
+                 nvx_snapshot_tier=platform \
                  tsc_early_khz=1000000 \
                  virtio_mmio.device=0x1000@0xd0002000:7 \
                  virtio_mmio.device=0x1000@0xd0003000:4 \
@@ -4721,6 +4767,7 @@ mod tests {
         );
         microvm_machine_contract(
             source_hypervisor,
+            MICROVM_BOOT_LAYOUT_VERSION,
             command_line,
             Some((
                 &network,
@@ -4760,6 +4807,7 @@ mod tests {
     fn generated_console_contract() -> SnapshotMachineContract {
         microvm_machine_contract(
             "whp",
+            MICROVM_BOOT_LAYOUT_VERSION,
             "earlycon=xe9 console=hvc1 reboot=t panic=-1 virtio_mmio.device=0x1000@0xd0002000:7"
                 .to_owned(),
             None,
@@ -4820,6 +4868,7 @@ mod tests {
         );
         microvm_machine_contract(
             "whp",
+            MICROVM_BOOT_LAYOUT_VERSION,
             command_line,
             None,
             false,
@@ -4903,6 +4952,7 @@ mod tests {
         );
         microvm_machine_contract(
             source_hypervisor,
+            MICROVM_BOOT_LAYOUT_VERSION,
             command_line,
             None,
             true,
@@ -4946,6 +4996,7 @@ mod tests {
     fn generated_dormant_filesystem_contract() -> SnapshotMachineContract {
         microvm_machine_contract(
             "whp",
+            MICROVM_BOOT_LAYOUT_VERSION,
             "earlycon=xe9 console=hvc0 reboot=t panic=-1 virtio_mmio.device=0x1000@0xd0001000:6"
                 .to_owned(),
             None,
@@ -5425,16 +5476,16 @@ mod tests {
     }
 
     #[test]
-    fn validate_microvm_machine_contract_rejects_pvh_layout() {
+    fn validate_microvm_machine_contract_rejects_unsupported_boot_layout() {
         let mut manifest = test_manifest();
         let expected = test_machine_contract();
         let mut contract = expected.clone();
-        contract.pvh_layout_version = 1;
+        contract.boot_layout_version = 1;
         manifest.machine_contract = Some(contract);
         let err = validate_microvm_machine_contract(&manifest, &expected).unwrap_err();
         assert!(
             err.to_string()
-                .contains("PVH layout version 1 is unsupported")
+                .contains("boot layout version 1 is unsupported")
         );
     }
 
@@ -5447,7 +5498,7 @@ mod tests {
             assert_eq!(topology.cores_per_die, processor_count);
             assert_eq!(topology.threads_per_core, 1);
             assert_eq!(topology.apic_ids, (0..processor_count).collect::<Vec<_>>());
-            assert_eq!(MICROVM_PVH_LAYOUT_VERSION, 2);
+            assert_eq!(MICROVM_BOOT_LAYOUT_VERSION, 2);
         }
 
         for processor_count in [0, 3, 5, 16] {
@@ -5688,6 +5739,7 @@ mod tests {
         assert!(
             microvm_machine_contract(
                 "whp",
+                MICROVM_BOOT_LAYOUT_VERSION,
                 "console=hvc0".to_owned(),
                 None,
                 false,

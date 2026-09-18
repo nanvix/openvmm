@@ -8,12 +8,13 @@ use crate::common::ImportFileRegion;
 use crate::common::ImportFileRegionError;
 use crate::common::ReadSeek;
 use crate::common::import_default_gdt;
-use crate::elf::load_static_elf;
+use crate::elf::load_static_elf_with_buffer;
 use crate::importer::Aarch64Register;
 use crate::importer::BootPageAcceptance;
 use crate::importer::GuestArch;
 use crate::importer::ImageLoad;
 use crate::importer::X86Register;
+use crate::mptable;
 use aarch64defs::Cpsr64;
 use aarch64defs::IntermPhysAddrSize;
 use aarch64defs::SctlrEl1;
@@ -28,10 +29,10 @@ use memory_range::MemoryRange;
 use page_table::IdentityMapSize;
 use page_table::x64::IdentityMapBuilder;
 use page_table::x64::PAGE_TABLE_MAX_BYTES;
-use page_table::x64::PAGE_TABLE_MAX_COUNT;
 use page_table::x64::PageTable;
 use page_table::x64::align_up_to_large_page_size;
 use page_table::x64::align_up_to_page_size;
+use page_table::x64::identity_map_page_table_count;
 use std::ffi::CString;
 use std::io::Read;
 use std::io::Seek;
@@ -51,6 +52,38 @@ struct ZeroPageBuildResult {
     additional_pages: Option<MemoryRange>,
 }
 
+fn build_setup_header(
+    cmdline_base: u64,
+    cmdline: &CString,
+    initrd_base: u32,
+    initrd_size: u32,
+    bzimage_header: Option<&defs::setup_header>,
+) -> defs::setup_header {
+    // Loader type 0xff = unregistered bootloader, used for both ELF and
+    // bzImage paths since OpenVMM does not have a registered Linux
+    // bootloader ID.
+    const LOADER_TYPE_UNREGISTERED: u8 = 0xff;
+
+    let mut hdr = match bzimage_header {
+        Some(orig) => *orig,
+        None => defs::setup_header {
+            boot_flag: 0xaa55.into(),
+            header: 0x53726448.into(),
+            kernel_alignment: 0x100000.into(),
+            ..FromZeros::new_zeroed()
+        },
+    };
+
+    hdr.type_of_loader = LOADER_TYPE_UNREGISTERED;
+    hdr.cmd_line_ptr = cmdline_base.try_into().expect("must fit in u32");
+    hdr.cmdline_size = (cmdline.as_bytes().len() as u64)
+        .try_into()
+        .expect("must fit in u32");
+    hdr.ramdisk_image = initrd_base.into();
+    hdr.ramdisk_size = initrd_size.into();
+    hdr
+}
+
 /// Construct a zero page from the following parameters.
 fn build_zero_page(
     mem_layout: &MemoryLayout,
@@ -62,31 +95,13 @@ fn build_zero_page(
     initrd_size: u32,
     bzimage_header: Option<&defs::setup_header>,
 ) -> Result<ZeroPageBuildResult, Error> {
-    // Loader type 0xff = unregistered bootloader, used for both ELF and
-    // bzImage paths since OpenVMM does not have a registered Linux
-    // bootloader ID.
-    const LOADER_TYPE_UNREGISTERED: u8 = 0xff;
-
-    // Start with the bzImage setup header if available, otherwise build
-    // a minimal default header.
-    let mut hdr = match bzimage_header {
-        Some(orig) => *orig,
-        None => defs::setup_header {
-            boot_flag: 0xaa55.into(),
-            header: 0x53726448.into(),
-            kernel_alignment: 0x100000.into(),
-            ..FromZeros::new_zeroed()
-        },
-    };
-
-    // Set bootloader-owned fields regardless of kernel format.
-    hdr.type_of_loader = LOADER_TYPE_UNREGISTERED;
-    hdr.cmd_line_ptr = CMDLINE_BASE.try_into().expect("must fit in u32");
-    hdr.cmdline_size = (cmdline.as_bytes().len() as u64)
-        .try_into()
-        .expect("must fit in u32");
-    hdr.ramdisk_image = initrd_base.into();
-    hdr.ramdisk_size = initrd_size.into();
+    let hdr = build_setup_header(
+        CMDLINE_BASE,
+        cmdline,
+        initrd_base,
+        initrd_size,
+        bzimage_header,
+    );
 
     let mut p = defs::boot_params {
         hdr,
@@ -221,6 +236,16 @@ pub enum Error {
     TooManyMemoryRanges(usize),
     #[error("acpi tables are empty")]
     EmptyAcpiTables,
+    #[error("MP-table Linux direct boot requires an uncompressed ELF kernel")]
+    MpTableRequiresElf,
+    #[error("failed to construct MP tables")]
+    MpTable(#[from] mptable::Error),
+    #[error("MP table ending at {table_end:#x} overlaps the GDT at {gdt_addr:#x}")]
+    MpTableOverlap { table_end: usize, gdt_addr: u64 },
+    #[error("invalid MP-table reserved memory range {start:#x}..{end:#x}")]
+    InvalidReservedMemoryRange { start: u64, end: u64 },
+    #[error("the memory layout cannot represent the fixed MP-table platform ranges")]
+    InvalidMpTableMemoryLayout,
 }
 
 /// ACPI tables to place in guest memory: a one-page RSDP plus the tables it
@@ -251,6 +276,14 @@ const GDT_BASE: u64 = 0x1000;
 pub const ZERO_PAGE_BASE: u64 = 0x2000;
 const CMDLINE_BASE: u64 = 0x3000;
 const CR3_BASE: u64 = 0x4000;
+const MPTABLE_CMDLINE_BASE: u64 = 0x2_0000;
+const MPTABLE_CMDLINE_END: u64 = 0x3_0000;
+const MPTABLE_ISA_HOLE_BASE: u64 = 0xa_0000;
+const MPTABLE_ISA_HOLE_END: u64 = 0x10_0000;
+const MPTABLE_MMIO_GAP_BASE: u64 = 0xc000_0000;
+const MPTABLE_MMIO_GAP_END: u64 = 0x1_0000_0000;
+// Amortize guest-memory imports while retaining one buffer for the kernel and initrd.
+const MPTABLE_LOAD_CHUNK_SIZE: usize = 1024 * 1024;
 /// The identity-map page tables occupy `[CR3_BASE, CR3_BASE + PAGE_TABLE_MAX_BYTES)`;
 /// the boot metadata ends there.
 const LOW_METADATA_END: u64 = CR3_BASE + PAGE_TABLE_MAX_BYTES as u64;
@@ -456,6 +489,16 @@ fn import_initrd<R: GuestArch>(
     next_addr: u64,
     importer: &mut dyn ImageLoad<R>,
 ) -> Result<Option<InitrdInfo>, Error> {
+    let mut buffer = ChunkBuf::new();
+    import_initrd_with_buffer(initrd, next_addr, importer, &mut buffer)
+}
+
+fn import_initrd_with_buffer<R: GuestArch>(
+    initrd: Option<InitrdConfig<'_>>,
+    next_addr: u64,
+    importer: &mut dyn ImageLoad<R>,
+    buffer: &mut ChunkBuf,
+) -> Result<Option<InitrdInfo>, Error> {
     let initrd_info = match initrd {
         Some(cfg) => {
             let initrd_address = match cfg.initrd_address {
@@ -466,7 +509,7 @@ fn import_initrd<R: GuestArch>(
             tracing::trace!(initrd_address, "loading initrd");
             check_address_alignment(initrd_address)?;
 
-            ChunkBuf::new()
+            buffer
                 .import_file_region(
                     importer,
                     ImportFileRegion {
@@ -522,7 +565,44 @@ where
         return load_bzimage(importer, kernel_image, kernel_minimum_start_address, initrd);
     }
 
-    let elf_load_info = load_static_elf(
+    load_uncompressed_kernel_and_initrd_x64(
+        importer,
+        kernel_image,
+        kernel_minimum_start_address,
+        initrd,
+    )
+}
+
+fn load_uncompressed_kernel_and_initrd_x64<F>(
+    importer: &mut dyn ImageLoad<X86Register>,
+    kernel_image: &mut F,
+    kernel_minimum_start_address: u64,
+    initrd: Option<InitrdConfig<'_>>,
+) -> Result<LoadInfo, Error>
+where
+    F: Read + Seek,
+{
+    let mut buffer = ChunkBuf::new();
+    load_uncompressed_kernel_and_initrd_x64_with_buffer(
+        importer,
+        kernel_image,
+        kernel_minimum_start_address,
+        initrd,
+        &mut buffer,
+    )
+}
+
+fn load_uncompressed_kernel_and_initrd_x64_with_buffer<F>(
+    importer: &mut dyn ImageLoad<X86Register>,
+    kernel_image: &mut F,
+    kernel_minimum_start_address: u64,
+    initrd: Option<InitrdConfig<'_>>,
+    buffer: &mut ChunkBuf,
+) -> Result<LoadInfo, Error>
+where
+    F: Read + Seek,
+{
+    let elf_load_info = load_static_elf_with_buffer(
         importer,
         kernel_image,
         kernel_minimum_start_address,
@@ -530,6 +610,7 @@ where
         false,
         BootPageAcceptance::Exclusive,
         "linux-kernel",
+        buffer,
     )
     .map_err(Error::ElfLoader)?;
 
@@ -540,7 +621,7 @@ where
     } = elf_load_info;
     tracing::trace!(min_addr, next_addr, entrypoint, "loaded kernel");
 
-    let initrd_info = import_initrd(initrd, next_addr, importer)?;
+    let initrd_info = import_initrd_with_buffer(initrd, next_addr, importer, buffer)?;
 
     Ok(LoadInfo {
         kernel: KernelInfo {
@@ -552,6 +633,234 @@ where
         dtb: None,
         bzimage_setup_header: None,
     })
+}
+
+fn import_command_line(
+    importer: &mut impl ImageLoad<X86Register>,
+    cmdline: &CString,
+    base: u64,
+    end: u64,
+) -> Result<(), Error> {
+    let raw_cmdline = cmdline.as_bytes_with_nul();
+    let slot_size = end
+        .checked_sub(base)
+        .ok_or(Error::InvalidMpTableMemoryLayout)?;
+    if raw_cmdline.len() as u64 > slot_size {
+        return Err(Error::CommandLineTooLong(raw_cmdline.len(), slot_size));
+    }
+    if raw_cmdline.len() > 1 {
+        let cmdline_size_pages = align_up_to_page_size(raw_cmdline.len() as u64) / HV_PAGE_SIZE;
+        importer
+            .import_pages(
+                base / HV_PAGE_SIZE,
+                cmdline_size_pages,
+                "linux-commandline",
+                BootPageAcceptance::Exclusive,
+                raw_cmdline,
+            )
+            .map_err(Error::Importer)?;
+    }
+    Ok(())
+}
+
+fn import_x86_boot_pages(
+    importer: &mut impl ImageLoad<X86Register>,
+    snp_boot: Option<SnpBootConfig>,
+) -> Result<(), Error> {
+    import_default_gdt(importer, GDT_BASE / HV_PAGE_SIZE).map_err(Error::Importer)?;
+    let identity_map_size = IdentityMapSize::Size4Gb;
+    let page_table_count = identity_map_page_table_count(identity_map_size, 0);
+    let mut page_table_work_buffer: Vec<PageTable> =
+        vec![PageTable::new_zeroed(); page_table_count];
+    let mut page_table: Vec<u8> = vec![0; page_table_count * HV_PAGE_SIZE as usize];
+    let mut page_table_builder = IdentityMapBuilder::new(
+        CR3_BASE,
+        identity_map_size,
+        page_table_work_buffer.as_mut_slice(),
+        page_table.as_mut_slice(),
+    )?;
+    if let Some(snp_boot) = snp_boot {
+        page_table_builder = page_table_builder.with_confidential_bit(snp_boot.c_bit.into());
+    }
+    let page_table = page_table_builder.build();
+    assert!((page_table.len() as u64).is_multiple_of(HV_PAGE_SIZE));
+    importer
+        .import_pages(
+            CR3_BASE / HV_PAGE_SIZE,
+            page_table.len() as u64 / HV_PAGE_SIZE,
+            "linux-pagetables",
+            BootPageAcceptance::Exclusive,
+            page_table,
+        )
+        .map_err(Error::Importer)?;
+    Ok(())
+}
+
+fn import_x86_registers(
+    importer: &mut impl ImageLoad<X86Register>,
+    load_info: &LoadInfo,
+    initialize_firmware_msrs: bool,
+) -> Result<(), Error> {
+    let mut import_reg = |register| {
+        importer
+            .import_vp_register(register)
+            .map_err(Error::Importer)
+    };
+
+    import_reg(X86Register::Cr0(x86defs::X64_CR0_PG | x86defs::X64_CR0_PE))?;
+    import_reg(X86Register::Cr3(CR3_BASE))?;
+    import_reg(X86Register::Cr4(x86defs::X64_CR4_PAE))?;
+    import_reg(X86Register::Efer(
+        x86defs::X64_EFER_SCE
+            | x86defs::X64_EFER_LME
+            | x86defs::X64_EFER_LMA
+            | x86defs::X64_EFER_NXE,
+    ))?;
+    import_reg(X86Register::Rip(load_info.kernel.entrypoint))?;
+    import_reg(X86Register::Rsi(ZERO_PAGE_BASE))?;
+    if initialize_firmware_msrs {
+        import_reg(X86Register::Pat(x86defs::X86X_MSR_DEFAULT_PAT))?;
+        import_reg(X86Register::MtrrDefType(0xc00))?;
+        import_reg(X86Register::MtrrFix64k00000(0x0606060606060606))?;
+        import_reg(X86Register::MtrrFix16k80000(0x0606060606060606))?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct E820Range {
+    start: u64,
+    end: u64,
+    entry_type: u32,
+}
+
+fn range_is_in_ram(mem_layout: &MemoryLayout, range: MemoryRange) -> bool {
+    mem_layout
+        .ram()
+        .iter()
+        .any(|ram| range.start() >= ram.range.start() && range.end() <= ram.range.end())
+}
+
+fn build_mptable_e820(
+    mem_layout: &MemoryLayout,
+    reserved_memory_ranges: &[MemoryRange],
+) -> Result<Vec<E820Range>, Error> {
+    let mut previous_end = 0;
+    for range in reserved_memory_ranges {
+        let valid = !range.is_empty()
+            && range.start().is_multiple_of(HV_PAGE_SIZE)
+            && range.end().is_multiple_of(HV_PAGE_SIZE)
+            && range.start() >= previous_end
+            && range_is_in_ram(mem_layout, *range);
+        if !valid {
+            return Err(Error::InvalidReservedMemoryRange {
+                start: range.start(),
+                end: range.end(),
+            });
+        }
+        previous_end = range.end();
+    }
+
+    let isa_hole = MemoryRange::new(MPTABLE_ISA_HOLE_BASE..MPTABLE_ISA_HOLE_END);
+    let mmio_gap = MemoryRange::new(MPTABLE_MMIO_GAP_BASE..MPTABLE_MMIO_GAP_END);
+    if !range_is_in_ram(mem_layout, isa_hole)
+        || mem_layout
+            .ram()
+            .iter()
+            .any(|ram| ram.range.overlaps(&mmio_gap))
+        || reserved_memory_ranges
+            .iter()
+            .any(|range| range.overlaps(&isa_hole))
+    {
+        return Err(Error::InvalidMpTableMemoryLayout);
+    }
+
+    let mut reservations = reserved_memory_ranges.to_vec();
+    reservations.push(isa_hole);
+    reservations.sort();
+
+    let mut entries = Vec::with_capacity(mem_layout.ram().len() + reservations.len() * 2 + 1);
+    for ram in mem_layout.ram() {
+        let mut next = ram.range.start();
+        for reserved in reservations.iter().filter(|reserved| {
+            reserved.start() >= ram.range.start() && reserved.end() <= ram.range.end()
+        }) {
+            if next < reserved.start() {
+                entries.push(E820Range {
+                    start: next,
+                    end: reserved.start(),
+                    entry_type: defs::E820_RAM,
+                });
+            }
+            entries.push(E820Range {
+                start: reserved.start(),
+                end: reserved.end(),
+                entry_type: defs::E820_RESERVED,
+            });
+            next = reserved.end();
+        }
+        if next < ram.range.end() {
+            entries.push(E820Range {
+                start: next,
+                end: ram.range.end(),
+                entry_type: defs::E820_RAM,
+            });
+        }
+    }
+    entries.sort_by_key(|entry| (entry.start, entry.end));
+
+    let mut merged: Vec<E820Range> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.start >= entry.end {
+            return Err(Error::InvalidMpTableMemoryLayout);
+        }
+        if let Some(previous) = merged.last_mut() {
+            if entry.start < previous.end {
+                return Err(Error::InvalidMpTableMemoryLayout);
+            }
+            if entry.start == previous.end && entry.entry_type == previous.entry_type {
+                previous.end = entry.end;
+                continue;
+            }
+        }
+        merged.push(entry);
+    }
+    Ok(merged)
+}
+
+fn build_mptable_zero_page(
+    mem_layout: &MemoryLayout,
+    reserved_memory_ranges: &[MemoryRange],
+    cmdline: &CString,
+    initrd_base: u32,
+    initrd_size: u32,
+) -> Result<defs::boot_params, Error> {
+    let hdr = build_setup_header(
+        MPTABLE_CMDLINE_BASE,
+        cmdline,
+        initrd_base,
+        initrd_size,
+        None,
+    );
+    let mut boot_params = defs::boot_params {
+        hdr,
+        ..FromZeros::new_zeroed()
+    };
+    let entries = build_mptable_e820(mem_layout, reserved_memory_ranges)?;
+    let capacity = boot_params.e820_map.len();
+    if entries.len() > capacity {
+        return Err(Error::TooManyMemoryRanges(capacity));
+    }
+    for (output, entry) in boot_params.e820_map.iter_mut().zip(&entries) {
+        *output = defs::e820entry {
+            addr: entry.start.into(),
+            size: (entry.end - entry.start).into(),
+            typ: entry.entry_type.into(),
+        };
+    }
+    boot_params.e820_entries =
+        u8::try_from(entries.len()).map_err(|_| Error::TooManyMemoryRanges(capacity))?;
+    Ok(boot_params)
 }
 
 /// Load a bzImage by placing its payload directly into guest memory at the
@@ -632,52 +941,8 @@ fn import_config(
     smbios: Option<&crate::smbios::BuiltSmbios>,
     snp_boot: Option<SnpBootConfig>,
 ) -> Result<(), Error> {
-    // Only import the cmdline if it actually contains something.
-    // TODO: This should use the IGVM parameter instead?
-    let raw_cmdline = cmdline.as_bytes_with_nul();
-    if raw_cmdline.len() as u64 > CR3_BASE - CMDLINE_BASE {
-        return Err(Error::CommandLineTooLong(
-            raw_cmdline.len(),
-            CR3_BASE - CMDLINE_BASE,
-        ));
-    }
-    if raw_cmdline.len() > 1 {
-        let cmdline_size_pages = align_up_to_page_size(raw_cmdline.len() as u64) / HV_PAGE_SIZE;
-        importer
-            .import_pages(
-                CMDLINE_BASE / HV_PAGE_SIZE,
-                cmdline_size_pages,
-                "linux-commandline",
-                BootPageAcceptance::Exclusive,
-                raw_cmdline,
-            )
-            .map_err(Error::Importer)?;
-    }
-
-    import_default_gdt(importer, GDT_BASE / HV_PAGE_SIZE).map_err(Error::Importer)?;
-    let mut page_table_work_buffer: Vec<PageTable> =
-        vec![PageTable::new_zeroed(); PAGE_TABLE_MAX_COUNT];
-    let mut page_table: Vec<u8> = vec![0; PAGE_TABLE_MAX_BYTES];
-    let mut page_table_builder = IdentityMapBuilder::new(
-        CR3_BASE,
-        IdentityMapSize::Size4Gb,
-        page_table_work_buffer.as_mut_slice(),
-        page_table.as_mut_slice(),
-    )?;
-    if let Some(snp_boot) = snp_boot {
-        page_table_builder = page_table_builder.with_confidential_bit(snp_boot.c_bit.into());
-    }
-    let page_table = page_table_builder.build();
-    assert!((page_table.len() as u64).is_multiple_of(HV_PAGE_SIZE));
-    importer
-        .import_pages(
-            CR3_BASE / HV_PAGE_SIZE,
-            page_table.len() as u64 / HV_PAGE_SIZE,
-            "linux-pagetables",
-            BootPageAcceptance::Exclusive,
-            page_table,
-        )
-        .map_err(Error::Importer)?;
+    import_command_line(importer, cmdline, CMDLINE_BASE, CR3_BASE)?;
+    import_x86_boot_pages(importer, snp_boot)?;
 
     if acpi.tables.is_empty() {
         return Err(Error::EmptyAcpiTables);
@@ -729,33 +994,7 @@ fn import_config(
         )
         .map_err(Error::Importer)?;
 
-    // Set common X64 registers. Segments already set by default gdt.
-    let mut import_reg = |register| {
-        importer
-            .import_vp_register(register)
-            .map_err(Error::Importer)
-    };
-
-    import_reg(X86Register::Cr0(x86defs::X64_CR0_PG | x86defs::X64_CR0_PE))?;
-    import_reg(X86Register::Cr3(CR3_BASE))?;
-    import_reg(X86Register::Cr4(x86defs::X64_CR4_PAE))?;
-    import_reg(X86Register::Efer(
-        x86defs::X64_EFER_SCE
-            | x86defs::X64_EFER_LME
-            | x86defs::X64_EFER_LMA
-            | x86defs::X64_EFER_NXE,
-    ))?;
-    import_reg(X86Register::Pat(x86defs::X86X_MSR_DEFAULT_PAT))?;
-
-    // Set rip to entry point and rsi to zero page.
-    import_reg(X86Register::Rip(load_info.kernel.entrypoint))?;
-    import_reg(X86Register::Rsi(ZERO_PAGE_BASE))?;
-
-    // No firmware will set MTRR values for the BSP.  Replicate what UEFI does here.
-    // (enable MTRRs, default MTRR is uncached, and set lowest 640KB as WB)
-    import_reg(X86Register::MtrrDefType(0xc00))?;
-    import_reg(X86Register::MtrrFix64k00000(0x0606060606060606))?;
-    import_reg(X86Register::MtrrFix16k80000(0x0606060606060606))?;
+    import_x86_registers(importer, load_info, true)?;
 
     if let Some(smbios) = smbios {
         // The `_SM3_` entry point (anchor) goes in the F-segment for the
@@ -785,6 +1024,67 @@ fn import_config(
             .map_err(Error::Importer)?;
     }
 
+    Ok(())
+}
+
+fn import_mptable_config(
+    importer: &mut impl ImageLoad<X86Register>,
+    load_info: &LoadInfo,
+    cmdline: &CString,
+    mem_layout: &MemoryLayout,
+    config: &mptable::MpTableConfig<'_>,
+    reserved_memory_ranges: &[MemoryRange],
+) -> Result<(), Error> {
+    let raw_cmdline = cmdline.as_bytes_with_nul();
+    let slot_size = MPTABLE_CMDLINE_END - MPTABLE_CMDLINE_BASE;
+    if raw_cmdline.len() as u64 > slot_size {
+        return Err(Error::CommandLineTooLong(raw_cmdline.len(), slot_size));
+    }
+    let tables = mptable::build(config)?;
+    let table_end = mptable::MP_CONFIG_TABLE_ADDR
+        .checked_add(tables.configuration_table.len())
+        .ok_or(Error::InvalidMpTableMemoryLayout)?;
+    if table_end > GDT_BASE as usize {
+        return Err(Error::MpTableOverlap {
+            table_end,
+            gdt_addr: GDT_BASE,
+        });
+    }
+    let boot_params = build_mptable_zero_page(
+        mem_layout,
+        reserved_memory_ranges,
+        cmdline,
+        load_info.initrd.as_ref().map(|info| info.gpa).unwrap_or(0) as u32,
+        load_info.initrd.as_ref().map(|info| info.size).unwrap_or(0) as u32,
+    )?;
+
+    let mut mp_page = [0u8; HV_PAGE_SIZE as usize];
+    mp_page[mptable::MP_FLOATING_POINTER_ADDR
+        ..mptable::MP_FLOATING_POINTER_ADDR + tables.floating_pointer.len()]
+        .copy_from_slice(&tables.floating_pointer);
+    mp_page[mptable::MP_CONFIG_TABLE_ADDR..table_end].copy_from_slice(&tables.configuration_table);
+    importer
+        .import_pages(
+            0,
+            1,
+            "linux-mptable",
+            BootPageAcceptance::Exclusive,
+            &mp_page,
+        )
+        .map_err(Error::Importer)?;
+
+    import_command_line(importer, cmdline, MPTABLE_CMDLINE_BASE, MPTABLE_CMDLINE_END)?;
+    import_x86_boot_pages(importer, None)?;
+    importer
+        .import_pages(
+            ZERO_PAGE_BASE / HV_PAGE_SIZE,
+            1,
+            "linux-zeropage",
+            BootPageAcceptance::Exclusive,
+            boot_params.as_bytes(),
+        )
+        .map_err(Error::Importer)?;
+    import_x86_registers(importer, load_info, false)?;
     Ok(())
 }
 
@@ -858,6 +1158,42 @@ where
     let load_info = load_kernel_and_initrd_x64(importer, kernel_image, KERNEL_BASE, initrd)?;
     load_config_x86(
         importer, &load_info, cmdline, mem_layout, build_acpi, smbios, snp_boot,
+    )?;
+    Ok(load_info)
+}
+
+/// Loads an uncompressed x86-64 ELF kernel through Linux direct boot with
+/// Intel MP tables and no ACPI, SMBIOS, or firmware tables.
+pub fn load_x86_mptable<F>(
+    importer: &mut impl ImageLoad<X86Register>,
+    kernel_image: &mut F,
+    initrd: Option<InitrdConfig<'_>>,
+    cmdline: &CString,
+    mem_layout: &MemoryLayout,
+    config: &mptable::MpTableConfig<'_>,
+    reserved_memory_ranges: &[MemoryRange],
+) -> Result<LoadInfo, Error>
+where
+    F: Read + Seek,
+{
+    if crate::bzimage::is_bzimage(kernel_image).map_err(Error::BzImage)? {
+        return Err(Error::MpTableRequiresElf);
+    }
+    let mut buffer = ChunkBuf::with_size(MPTABLE_LOAD_CHUNK_SIZE);
+    let load_info = load_uncompressed_kernel_and_initrd_x64_with_buffer(
+        importer,
+        kernel_image,
+        KERNEL_BASE,
+        initrd,
+        &mut buffer,
+    )?;
+    import_mptable_config(
+        importer,
+        &load_info,
+        cmdline,
+        mem_layout,
+        config,
+        reserved_memory_ranges,
     )?;
     Ok(load_info)
 }
@@ -1164,6 +1500,17 @@ mod tests {
         .unwrap()
     }
 
+    fn make_mptable_layout(ram_size: u64) -> MemoryLayout {
+        MemoryLayout::new(
+            ram_size,
+            &[MemoryRange::new(3 * GB..4 * GB)],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap()
+    }
+
     /// Asserts that `map[..entries]` exactly covers `[0, first_ram_end)` with no
     /// gaps or overlaps and strictly ascending addresses, and that no entry is
     /// empty. The first entry must start at 0 and the last must end precisely at
@@ -1189,7 +1536,7 @@ mod tests {
         let acpi_len = 0x1800; // aligns up to 0x2000
         let smbios_len = 0x100; // aligns up to 0x1000
         let p = build_zero_page(
-            &make_layout(256 * MB),
+            &make_mptable_layout(256 * MB),
             acpi_len,
             smbios_len,
             0,
@@ -1226,7 +1573,7 @@ mod tests {
         // With no SMBIOS structure table, the reserved SMBIOS region collapses
         // to zero length and must not appear as an empty e820 entry.
         let p = build_zero_page(
-            &make_layout(256 * MB),
+            &make_mptable_layout(256 * MB),
             0x1800,
             0,
             0,
@@ -1290,7 +1637,7 @@ mod tests {
     fn zero_page_tables_too_large() {
         // ACPI tables large enough to run past the RSDP reserved region.
         let result = build_zero_page(
-            &make_layout(256 * MB),
+            &make_mptable_layout(256 * MB),
             (RSDP_BASE - ACPI_TABLES_BASE) as usize + 0x1000,
             0,
             0,
@@ -1313,6 +1660,7 @@ mod tests {
         /// `(debug_tag, page_base, page_count)` for each imported region.
         pages: Vec<(String, u64, u64)>,
         imports: Vec<ImportRecord>,
+        registers: Vec<X86Register>,
         vp_context_page: Option<u64>,
     }
 
@@ -1391,7 +1739,8 @@ mod tests {
             Ok(())
         }
 
-        fn import_vp_register(&mut self, _register: X86Register) -> anyhow::Result<()> {
+        fn import_vp_register(&mut self, register: X86Register) -> anyhow::Result<()> {
+            self.registers.push(register);
             Ok(())
         }
 
@@ -1449,6 +1798,238 @@ mod tests {
             dtb: None,
             bzimage_setup_header: None,
         }
+    }
+
+    fn mptable_config(apic_ids: &[u32]) -> mptable::MpTableConfig<'_> {
+        mptable::MpTableConfig {
+            apic_ids,
+            level_triggered_irqs: &[4, 5, 6, 7],
+        }
+    }
+
+    fn imported_zero_page(importer: &RecordingImporter) -> defs::boot_params {
+        let data = &importer
+            .imports
+            .iter()
+            .find(|import| import.tag == "linux-zeropage")
+            .unwrap()
+            .data;
+        defs::boot_params::read_from_bytes(data).unwrap()
+    }
+
+    #[test]
+    fn mptable_config_places_boot_data_without_firmware_tables() {
+        let apic_ids = [0, 1, 2, 3];
+        let mut importer = RecordingImporter::default();
+        import_mptable_config(
+            &mut importer,
+            &test_load_info(),
+            &CString::new("console=hvc0").unwrap(),
+            &make_layout(256 * MB),
+            &mptable_config(&apic_ids),
+            &[MemoryRange::new(0x3_0000..0x3_1000)],
+        )
+        .unwrap();
+
+        let mp = importer
+            .imports
+            .iter()
+            .find(|import| import.tag == "linux-mptable")
+            .unwrap();
+        assert_eq!(mp.page_base, 0);
+        assert_eq!(mp.page_count, 1);
+        assert_eq!(
+            &mp.data[mptable::MP_FLOATING_POINTER_ADDR..mptable::MP_FLOATING_POINTER_ADDR + 4],
+            b"_MP_"
+        );
+        let table_length = u16::from_le_bytes(
+            mp.data[mptable::MP_CONFIG_TABLE_ADDR + 4..mptable::MP_CONFIG_TABLE_ADDR + 6]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        assert!(mptable::MP_CONFIG_TABLE_ADDR + table_length <= GDT_BASE as usize);
+        assert_eq!(
+            mp.data[mptable::MP_CONFIG_TABLE_ADDR..mptable::MP_CONFIG_TABLE_ADDR + table_length]
+                .iter()
+                .copied()
+                .fold(0u8, |sum, byte| sum.wrapping_add(byte)),
+            0
+        );
+        assert_eq!(
+            importer.page_base("linux-commandline"),
+            Some(MPTABLE_CMDLINE_BASE / HV_PAGE_SIZE)
+        );
+        assert!(importer.imports.iter().all(|import| {
+            !import.tag.contains("acpi")
+                && !import.tag.contains("rsdp")
+                && !import.tag.contains("smbios")
+        }));
+
+        let boot_params = imported_zero_page(&importer);
+        assert_eq!(boot_params.acpi_rsdp_addr, 0);
+        assert_eq!(
+            u32::from(boot_params.hdr.cmd_line_ptr),
+            MPTABLE_CMDLINE_BASE as u32
+        );
+        assert_eq!(u32::from(boot_params.hdr.cmdline_size), 12);
+        assert!(
+            importer
+                .registers
+                .contains(&X86Register::Rsi(ZERO_PAGE_BASE))
+        );
+        assert!(importer.registers.contains(&X86Register::Cr3(CR3_BASE)));
+        assert!(
+            importer
+                .registers
+                .contains(&X86Register::Cr0(x86defs::X64_CR0_PG | x86defs::X64_CR0_PE))
+        );
+        assert!(
+            importer
+                .registers
+                .contains(&X86Register::Cr4(x86defs::X64_CR4_PAE))
+        );
+        assert!(importer.registers.contains(&X86Register::Rip(KERNEL_BASE)));
+        assert!(
+            !importer
+                .registers
+                .contains(&X86Register::Pat(x86defs::X86X_MSR_DEFAULT_PAT))
+        );
+        assert!(
+            !importer
+                .registers
+                .contains(&X86Register::MtrrDefType(0xc00))
+        );
+    }
+
+    #[test]
+    fn mptable_config_supports_full_command_line_region() {
+        let cmdline = CString::new(vec![b'a'; 65_535]).unwrap();
+        let mut importer = RecordingImporter::default();
+        import_mptable_config(
+            &mut importer,
+            &test_load_info(),
+            &cmdline,
+            &make_layout(256 * MB),
+            &mptable_config(&[0]),
+            &[MemoryRange::new(0x3_0000..0x3_1000)],
+        )
+        .unwrap();
+        let imported = importer
+            .imports
+            .iter()
+            .find(|import| import.tag == "linux-commandline")
+            .unwrap();
+        assert_eq!(imported.page_base, MPTABLE_CMDLINE_BASE / HV_PAGE_SIZE);
+        assert_eq!(imported.page_count, 16);
+        assert_eq!(imported.data.len(), 65_536);
+        assert_eq!(imported.data[65_535], 0);
+
+        let mut importer = RecordingImporter::default();
+        let cmdline = CString::new(vec![b'a'; 65_536]).unwrap();
+        let error = import_mptable_config(
+            &mut importer,
+            &test_load_info(),
+            &cmdline,
+            &make_layout(256 * MB),
+            &mptable_config(&[0]),
+            &[MemoryRange::new(0x3_0000..0x3_1000)],
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::CommandLineTooLong(65_537, 65_536)));
+        assert!(importer.imports.is_empty());
+    }
+
+    #[test]
+    fn mptable_e820_reserves_status_and_isa_hole_and_leaves_mmio_gap() {
+        let entries = build_mptable_e820(
+            &make_mptable_layout(8 * GB),
+            &[MemoryRange::new(0x3_0000..0x3_1000)],
+        )
+        .unwrap();
+        assert_eq!(
+            entries.as_slice(),
+            &[
+                E820Range {
+                    start: 0,
+                    end: 0x3_0000,
+                    entry_type: defs::E820_RAM,
+                },
+                E820Range {
+                    start: 0x3_0000,
+                    end: 0x3_1000,
+                    entry_type: defs::E820_RESERVED,
+                },
+                E820Range {
+                    start: 0x3_1000,
+                    end: MPTABLE_ISA_HOLE_BASE,
+                    entry_type: defs::E820_RAM,
+                },
+                E820Range {
+                    start: MPTABLE_ISA_HOLE_BASE,
+                    end: MPTABLE_ISA_HOLE_END,
+                    entry_type: defs::E820_RESERVED,
+                },
+                E820Range {
+                    start: MPTABLE_ISA_HOLE_END,
+                    end: MPTABLE_MMIO_GAP_BASE,
+                    entry_type: defs::E820_RAM,
+                },
+                E820Range {
+                    start: MPTABLE_MMIO_GAP_END,
+                    end: 9 * GB,
+                    entry_type: defs::E820_RAM,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn mptable_e820_rejects_invalid_reservations_and_capacity() {
+        let layout = make_mptable_layout(256 * MB);
+        for ranges in [
+            vec![MemoryRange::new(256 * MB..256 * MB + HV_PAGE_SIZE)],
+            vec![
+                MemoryRange::new(0x4_0000..0x4_2000),
+                MemoryRange::new(0x4_1000..0x4_3000),
+            ],
+            vec![
+                MemoryRange::new(0x5_0000..0x5_1000),
+                MemoryRange::new(0x4_0000..0x4_1000),
+            ],
+        ] {
+            assert!(matches!(
+                build_mptable_e820(&layout, &ranges),
+                Err(Error::InvalidReservedMemoryRange { .. })
+            ));
+        }
+
+        let reservations = (0..70)
+            .map(|index| {
+                let start = 0x1_0000 + index * 0x2000;
+                MemoryRange::new(start..start + HV_PAGE_SIZE)
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            build_mptable_zero_page(&layout, &reservations, &CString::new("").unwrap(), 0, 0,),
+            Err(Error::TooManyMemoryRanges(128))
+        ));
+    }
+
+    #[test]
+    fn mptable_config_rejects_table_overlap_before_import() {
+        let apic_ids = (0..200).collect::<Vec<_>>();
+        let mut importer = RecordingImporter::default();
+        let error = import_mptable_config(
+            &mut importer,
+            &test_load_info(),
+            &CString::new("").unwrap(),
+            &make_mptable_layout(256 * MB),
+            &mptable_config(&apic_ids),
+            &[MemoryRange::new(0x3_0000..0x3_1000)],
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::MpTableOverlap { .. }));
+        assert!(importer.imports.is_empty());
     }
 
     #[test]

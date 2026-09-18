@@ -1969,7 +1969,7 @@ impl Options {
         }
         anyhow::ensure!(
             !self.uefi && !self.pcat && self.igvm.is_none() && !self.device_tree,
-            "microVM requires Xen PVH direct boot"
+            "microVM requires Linux direct boot"
         );
         anyhow::ensure!(
             !self.uefi_debug
@@ -6783,6 +6783,7 @@ mod tests {
             "virtnet_mask=255.255.255.0",
             "virtnet_gw=10.0.0.1",
             "virtnet_dns=10.0.0.1",
+            "nr_cpus=1",
             "virtfs_dir=/other",
             "virtfs_tag=other",
             "virtfs_mode=rw",
