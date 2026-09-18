@@ -460,12 +460,6 @@ impl IntoPipeline for CheckinGatesCli {
             ));
         }
 
-        let (pub_guest_test_pvh, use_guest_test_pvh) =
-            pipeline.new_typed_artifact("x64-guest_test_pvh");
-        vmm_tests_artifacts_linux_x86.use_guest_test_pvh = Some(use_guest_test_pvh.clone());
-        vmm_tests_artifacts_linux_musl_x86.use_guest_test_pvh = Some(use_guest_test_pvh.clone());
-        vmm_tests_artifacts_windows_x86.use_guest_test_pvh = Some(use_guest_test_pvh);
-
         // Create incubator artifact handle (for TCG tests).
         // Must be created before the shared_linux_job builder to avoid
         // borrowing `pipeline` while the job builder holds a mutable borrow.
@@ -533,13 +527,6 @@ impl IntoPipeline for CheckinGatesCli {
                     }
                 });
         }
-
-        shared_linux_job = shared_linux_job.publish(pub_guest_test_pvh, |guest_test_pvh| {
-            flowey_lib_hvlite::build_guest_test_pvh::Request {
-                profile: CommonProfile::from_release(release),
-                guest_test_pvh,
-            }
-        });
 
         // Build incubator binary (x86_64 Linux, for running TCG tests on CI hosts)
         shared_linux_job = shared_linux_job.publish(pub_incubator, |incubator| {

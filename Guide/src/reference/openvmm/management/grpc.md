@@ -123,12 +123,12 @@ SMMUv3](../../emulated/iommu/smmuv3.md) for platform requirements.
 restore flow over both transports:
 
 * `destination_path` configures guest-requested capture. Supply a microVM
-  configuration, including PVH boot files, memory, and the
+  configuration, including `DirectBoot` kernel/initrd files, memory, and the
   processor count. The path must not exist. `quiesce_timeout_ms` defaults to
   five seconds when zero.
   `memory_capacity_bytes` optionally reserves an immutable, 128-MiB-aligned
   RAM capacity while keeping the configured base memory as the exact
-  `memory.bin` payload and initial PVH RAM map.
+  `memory.bin` payload and initial Linux direct e820 map.
 * `restore_path` selects manifest-authoritative restore. `config` may be
   absent, or may contain only the matching microVM profile, an optional exact
   processor-count assertion, serial port 0 host
@@ -202,11 +202,12 @@ field 15 to field 17 when upstream assigned field 15 to `iommufds`; the
 colliding legacy encoding is rejected. Clients that used the former
 `MICROVM_V2` source name must also update their bindings. RPC construction is
 currently blockless; role-bearing sandbox blocks remain CLI-only. Snapshot ABI
-and PVH layout values remain 2, while value 1 snapshots are unsupported.
+and boot layout remain value 2, which identifies the Linux-direct MP-table
+layout. Value 1 snapshots are unsupported.
 
-`VMConfig.pvh_boot` retains protobuf field 14, upstream `iommufds` retains field
-15, `crash_dump_path` uses field 16, and `machine_profile` uses field 17.
-Generate bindings from this fork for the combined schema.
+`VMConfig.pvh_boot` and protobuf field 14 are reserved, upstream `iommufds`
+retains field 15, `crash_dump_path` uses field 16, and `machine_profile` uses
+field 17. Generate bindings from this fork for the combined schema.
 
 The API has the same KVM/MSHV/WHP backend, no-block device, artifact integrity,
 and security restrictions documented under [`--snapshot-destination`].
