@@ -3,7 +3,6 @@
 
 //! Integration tests for x86_64 guests.
 
-mod microvm;
 mod openhcl_linux_direct;
 mod openhcl_uefi;
 mod storage;

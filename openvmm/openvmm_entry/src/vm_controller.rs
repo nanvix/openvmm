@@ -725,7 +725,7 @@ impl VmController {
             }
             anyhow::ensure!(
                 self.effective_command_line.is_some(),
-                "microVM snapshot capture requires an effective PVH command line"
+                "microVM snapshot capture requires an effective command line"
             );
             Ok(())
         })();
@@ -795,6 +795,7 @@ impl VmController {
             }
             let machine_contract = openvmm_helpers::snapshot::microvm_machine_contract(
                 &self.source_hypervisor,
+                openvmm_helpers::snapshot::MICROVM_BOOT_LAYOUT_VERSION,
                 command_line,
                 network,
                 self.microvm_filesystem_slot,

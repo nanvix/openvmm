@@ -1258,7 +1258,6 @@ fn load_igvm_x86(
                         | X86Register::Efer(_)
                         | X86Register::Pat(_)
                         | X86Register::Rbp(_)
-                        | X86Register::Rbx(_)
                         | X86Register::Rsi(_)
                         | X86Register::Rsp(_)
                         | X86Register::R8(_)

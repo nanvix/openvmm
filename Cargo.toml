@@ -47,7 +47,6 @@ members = [
   "vm/vmcore/guestmem/fuzz",
   "vm/x86/x86emu/fuzz",
   # in-guest test bins
-  "guest_test_pvh",
   "guest_test_uefi",
   "petri/pipette",
   # tools
@@ -691,6 +690,11 @@ sysinfo = "0.39"
 panic = 'abort'
 debug = true
 lto = 'thin'
+
+[profile.microvm-release]
+inherits = 'release'
+codegen-units = 1
+lto = 'fat'
 
 [profile.underhill-ship]
 inherits = 'release'

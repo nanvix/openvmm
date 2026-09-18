@@ -20,7 +20,8 @@ describes the source definitions.
   product version as `MAJOR.MINOR.PATCH.0`.
 * `--processors <COUNT>`: The number of processors. Defaults to 1.
 * `--machine <PROFILE>`: Select the guest-visible machine contract. The
-  default is `standard`. `microvm` selects the x86-64 Xen PVH microVM, which
+  default is `standard`. `microvm` selects the ACPI-free x86-64 Linux direct
+  microVM, which
   runs on KVM, MSHV, or WHP with exactly 1, 2, 4, or 8 vCPUs. On
   Linux, auto-detection prefers MSHV when `/dev/mshv` is available and falls
   back to KVM:
@@ -36,10 +37,10 @@ describes the source definitions.
     --kernel vmlinux --initrd initramfs.cpio.gz
   ```
 
-  The kernel must be an uncompressed ELF64 image containing
-  `XEN_ELFNOTE_PHYS32_ENTRY`. The profile owns the base command line
+  The kernel must be an uncompressed ELF64 image. The profile owns the base command line
   (`earlycon=xe9 console=hvc0 reboot=t panic=-1`) and switches the primary
-  console to `hvc1` when `--virtio-console` is present. It reserves a 1-GiB
+  console to `hvc1` when `--virtio-console` is present. It appends
+  `nr_cpus=<capacity>` from the validated processor topology. It reserves a 1-GiB
   MMIO gap from 3 to 4 GiB and exposes only PIC/IOAPIC, PIT, a CMOS RTC
   anchored to UTC,
   the microVM portb console, lifecycle ports, and the optional fixed virtio
@@ -58,8 +59,10 @@ describes the source definitions.
   remain virtio-console devices from the guest's perspective. Ordinary
   `--virtio-blk` is rejected. All use split rings. Firmware, ACPI, SMBIOS, PCI,
   VMBus, UARTs, graphics, isolation, nested virtualization, and other devices
-  are rejected. Host-driven save/restore, pulse-save/restore, and worker
-  restart remain unavailable.
+  are rejected. Linux discovers contiguous APIC IDs and the IOAPIC from Intel
+  MP 1.4 tables at `0x0` and `0x400`; `boot_params` is at `0x2000`, the command
+  line starts at `0x20000`, and no ACPI or SMBIOS data is exposed. Host-driven
+  save/restore, pulse-save/restore, and worker restart remain unavailable.
 
   `microvm` may also expose a dedicated control virtio-console at MMIO
   `0xd0007000`, IRQ 3. It requires the boot virtio-console, preserves
@@ -75,9 +78,10 @@ describes the source definitions.
   ```admonish warning title="microVM migration"
   The canonical `microvm` spelling now selects the contract formerly exposed
   as `microvm-v2`; the `microvm-v2` selector and the former ABI-v1 behavior are
-  removed. Snapshot ABI and PVH layout fields remain numeric value 2. ABI or
-  layout value 1 snapshots are rejected and must be run with OpenVMM commit
-  `1b70365613517a10718e00284a62bdffbd80e41c` or an earlier compatible build.
+  removed. Snapshot ABI remains numeric value 2 and the Linux-direct boot
+  layout is value 3. Boot-layout value 2 snapshots used the removed entry
+  protocol and are rejected before restore resources or virtual processors are
+  started.
   ```
 * `--net <IPv4/PREFIX>`: With `--machine microvm`, attach one virtio-net NIC
   at MMIO `0xd0000000`. KVM and MSHV use IRQ 10; WHP uses IRQ 5. Prefixes
@@ -238,7 +242,7 @@ describes the source definitions.
   `--memory-capacity <SIZE>` opts the snapshot into restore-time memory
   expansion. `SIZE` is an immutable 128-MiB-aligned upper bound, must be at
   least the base `--memory` size, and reserves the complete canonical GPA
-  aperture without adding it to the initial PVH usable-RAM map or
+  aperture without adding it to the initial Linux direct e820 RAM map or
   `memory.bin`.
 
   ```bash

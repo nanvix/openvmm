@@ -45,6 +45,18 @@ pub const X64_1GB_PAGE_SIZE: u64 = 0x40000000;
 /// sufficient for all of the current use cases of the identity map builder
 pub const PAGE_TABLE_MAX_COUNT: usize = 20;
 
+/// Returns the exact number of page-table pages required by an x64 identity map.
+pub const fn identity_map_page_table_count(
+    identity_map_size: IdentityMapSize,
+    address_bias: u64,
+) -> usize {
+    let leaf_page_table_count = match identity_map_size {
+        IdentityMapSize::Size4Gb => 4,
+        IdentityMapSize::Size8Gb => 8,
+    };
+    leaf_page_table_count + if address_bias == 0 { 2 } else { 1 }
+}
+
 static_assertions::const_assert_eq!(
     PAGE_TABLE_ENTRY_SIZE * PAGE_TABLE_ENTRY_COUNT,
     X64_PAGE_SIZE as usize
@@ -670,11 +682,8 @@ impl<'a> IdentityMapBuilder<'a> {
         //      1 PDPTE (Level 3)
         //      4 or 8 PDE tables (Level 2)
         // Note that there are no level 1 page tables, as 2MB pages are used.
-        let leaf_page_table_count = match params.identity_map_size {
-            IdentityMapSize::Size4Gb => 4,
-            IdentityMapSize::Size8Gb => 8,
-        };
-        let page_table_count = leaf_page_table_count + if params.address_bias == 0 { 2 } else { 1 };
+        let page_table_count =
+            identity_map_page_table_count(params.identity_map_size, params.address_bias);
         let mut page_table_allocator = page_table.iter_mut().enumerate();
 
         // Allocate single PDPTE table.

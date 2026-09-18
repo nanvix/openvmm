@@ -59,12 +59,12 @@ hotplug semantics or a non-VPCI host backend is required.
 restore flow over both transports:
 
 * `destination_path` configures guest-requested capture. Supply a microVM
-  configuration, including PVH boot files, memory, and the
+  configuration, including `DirectBoot` kernel/initrd files, memory, and the
   processor count. The path must not exist. `quiesce_timeout_ms` defaults to
   five seconds when zero.
   `memory_capacity_bytes` optionally reserves an immutable, 128-MiB-aligned
   RAM capacity while keeping the configured base memory as the exact
-  `memory.bin` payload and initial PVH RAM map.
+  `memory.bin` payload and initial Linux direct e820 map.
 * `restore_path` selects manifest-authoritative restore. `config` may be
   absent, or may contain only the matching microVM profile, an optional exact
   processor-count assertion, serial port 0 host
@@ -128,8 +128,9 @@ processors. Numeric value 1 is reserved and rejected before host resources are
 opened. Existing clients that already send value 2 remain wire-compatible;
 clients that used the former `MICROVM_V2` source name must regenerate or update
 their bindings. RPC construction is currently blockless; role-bearing sandbox
-blocks remain CLI-only. Snapshot ABI and PVH layout values remain 2, while
-value 1 snapshots are unsupported.
+blocks remain CLI-only. Snapshot ABI remains value 2 and boot-layout value 3
+identifies the Linux-direct MP-table layout. Removed boot-layout value 2
+snapshots are unsupported.
 
 The API has the same KVM/MSHV/WHP backend, no-block device, artifact integrity,
 and security restrictions documented under [`--snapshot-destination`].

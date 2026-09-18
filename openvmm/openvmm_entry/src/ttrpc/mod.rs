@@ -1188,9 +1188,9 @@ impl VmService {
                 anyhow::ensure!(
                     matches!(
                         req_config.boot_config.as_ref(),
-                        Some(vmservice::vm_config::BootConfig::PvhBoot(_))
+                        Some(vmservice::vm_config::BootConfig::DirectBoot(_))
                     ),
-                    "the microVM profile requires pvh_boot"
+                    "the microVM profile requires direct_boot"
                 );
             }
             anyhow::ensure!(
@@ -1289,11 +1289,15 @@ impl VmService {
             &authoritative_restore
         {
             (
-                LoadMode::Pvh {
+                LoadMode::Linux {
                     kernel: tempfile::tempfile()
                         .context("failed to create inert restore kernel handle")?,
                     initrd: None,
                     cmdline: restore.machine_contract.effective_command_line.clone(),
+                    enable_serial: false,
+                    isolation: openvmm_defs::config::LinuxIsolationConfig::None,
+                    boot_mode: openvmm_defs::config::LinuxDirectBootMode::MpTable,
+                    smbios: Box::default(),
                 },
                 vm_manifest_builder::BaseChipsetType::Microvm,
                 None,
@@ -1305,56 +1309,54 @@ impl VmService {
                 .context("missing boot configuration")?
             {
                 vmservice::vm_config::BootConfig::DirectBoot(boot) => {
-                    if machine_profile == OpenvmmMachineProfile::Microvm {
-                        bail!("the microVM profile requires pvh_boot");
-                    }
                     let kernel = File::open(boot.kernel_path).context("failed to open kernel")?;
                     let initrd = if boot.initrd_path.is_empty() {
                         None
                     } else {
                         Some(File::open(boot.initrd_path).context("failed to open initrd")?)
                     };
+                    let cmdline = if machine_profile == OpenvmmMachineProfile::Microvm {
+                        let mut cmdline = build_microvm_command_line(
+                            &[boot.kernel_cmdline],
+                            has_requested_microvm_console,
+                        )?;
+                        openvmm_defs::config::append_microvm_processor_limit(
+                            &mut cmdline,
+                            effective_processor_count,
+                        )?;
+                        cmdline
+                    } else {
+                        boot.kernel_cmdline
+                    };
                     (
                         LoadMode::Linux {
                             kernel,
                             initrd,
-                            cmdline: boot.kernel_cmdline,
-                            enable_serial: true,
+                            cmdline,
+                            enable_serial: machine_profile != OpenvmmMachineProfile::Microvm,
                             isolation: openvmm_defs::config::LinuxIsolationConfig::None,
-                            boot_mode: openvmm_defs::config::LinuxDirectBootMode::Acpi,
-                            smbios,
+                            boot_mode: if machine_profile == OpenvmmMachineProfile::Microvm {
+                                openvmm_defs::config::LinuxDirectBootMode::MpTable
+                            } else {
+                                openvmm_defs::config::LinuxDirectBootMode::Acpi
+                            },
+                            smbios: if machine_profile == OpenvmmMachineProfile::Microvm {
+                                Box::default()
+                            } else {
+                                smbios
+                            },
                         },
-                        vm_manifest_builder::BaseChipsetType::HyperVGen2LinuxDirect,
-                        None,
-                    )
-                }
-                vmservice::vm_config::BootConfig::PvhBoot(boot) => {
-                    if machine_profile != OpenvmmMachineProfile::Microvm {
-                        bail!("pvh_boot requires the microVM profile");
-                    }
-                    let kernel =
-                        File::open(boot.kernel_path).context("failed to open PVH kernel")?;
-                    let initrd = if boot.initrd_path.is_empty() {
-                        None
-                    } else {
-                        Some(File::open(boot.initrd_path).context("failed to open PVH initrd")?)
-                    };
-                    (
-                        LoadMode::Pvh {
-                            kernel,
-                            initrd,
-                            cmdline: build_microvm_command_line(
-                                &[boot.kernel_cmdline],
-                                has_requested_microvm_console,
-                            )?,
+                        if machine_profile == OpenvmmMachineProfile::Microvm {
+                            vm_manifest_builder::BaseChipsetType::Microvm
+                        } else {
+                            vm_manifest_builder::BaseChipsetType::HyperVGen2LinuxDirect
                         },
-                        vm_manifest_builder::BaseChipsetType::Microvm,
                         None,
                     )
                 }
                 vmservice::vm_config::BootConfig::Uefi(uefi) => {
                     if machine_profile == OpenvmmMachineProfile::Microvm {
-                        bail!("the microVM profile requires pvh_boot");
+                        bail!("the microVM profile requires direct_boot");
                     }
                     let firmware = File::open(&uefi.firmware_path).with_context(|| {
                         format!("failed to open uefi firmware {}", uefi.firmware_path)
@@ -2043,8 +2045,13 @@ impl VmService {
                 .virtio_devices
                 .iter()
                 .any(|(_, device)| device.id() == "virtio-console");
-            let LoadMode::Pvh { cmdline, .. } = &mut config.load_mode else {
-                unreachable!("microVM was validated with pvh_boot");
+            let LoadMode::Linux {
+                cmdline,
+                boot_mode: openvmm_defs::config::LinuxDirectBootMode::MpTable,
+                ..
+            } = &mut config.load_mode
+            else {
+                unreachable!("microVM was validated with direct_boot");
             };
             openvmm_defs::config::append_microvm_virtio_discovery(
                 cmdline,
@@ -2073,7 +2080,11 @@ impl VmService {
         openvmm_defs::config::validate_machine_config(&config, None)?;
 
         let effective_command_line = match &config.load_mode {
-            LoadMode::Pvh { cmdline, .. } => Some(cmdline.clone()),
+            LoadMode::Linux {
+                cmdline,
+                boot_mode: openvmm_defs::config::LinuxDirectBootMode::MpTable,
+                ..
+            } => Some(cmdline.clone()),
             _ => None,
         };
         let microvm_filesystem = config.microvm_filesystem.clone();

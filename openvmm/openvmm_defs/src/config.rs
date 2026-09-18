@@ -197,7 +197,7 @@ pub const fn microvm_virtio_status_gpa(mmio_base: u64) -> Option<u64> {
     };
     Some(MICROVM_SHARED_STATUS_PAGE_GPA + offset)
 }
-/// The microVM publishes no level-triggered virtio IRQs in the MADT or PVH MP table.
+/// The microVM publishes no level-triggered virtio IRQs in its MP table.
 pub const MICROVM_LEVEL_TRIGGERED_IRQS: [u32; 0] = [];
 
 /// The stable role of a microVM sandbox block device.
@@ -742,8 +742,13 @@ fn validate_microvm_command_line(
     let MachineProfile::Microvm = config.machine_profile else {
         unreachable!("microVM command-line validation requires the microVM profile");
     };
-    let LoadMode::Pvh { cmdline, .. } = &config.load_mode else {
-        anyhow::bail!("microVM requires PVH load mode");
+    let cmdline = match &config.load_mode {
+        LoadMode::Linux {
+            cmdline,
+            boot_mode: LinuxDirectBootMode::MpTable,
+            ..
+        } => cmdline,
+        _ => anyhow::bail!("microVM requires Linux MP-table load mode"),
     };
     anyhow::ensure!(
         !cmdline.contains('\0'),
@@ -943,6 +948,23 @@ pub fn build_microvm_control_command_line(
     build_microvm_command_line_inner(user_args, has_console, true)
 }
 
+/// Appends the host-owned processor capacity to a microVM command line.
+pub fn append_microvm_processor_limit(
+    cmdline: &mut String,
+    processor_count: u32,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        microvm_processor_count_supported(processor_count),
+        "microVM does not support {processor_count} vCPUs"
+    );
+    write!(cmdline, " nr_cpus={processor_count}")?;
+    anyhow::ensure!(
+        cmdline.len() < MICROVM_COMMAND_LINE_MAX_SIZE,
+        "microVM kernel command line exceeds the 64-KiB ABI limit"
+    );
+    Ok(())
+}
+
 /// Appends the host-owned fixed workload identity to a microVM command line.
 pub fn append_microvm_workload_identity(
     cmdline: &mut String,
@@ -1038,6 +1060,7 @@ fn build_microvm_command_line_inner(
                 "virtfs_tag=",
                 "virtfs_mode=",
                 "nvx_snapshot_tier=",
+                "nr_cpus=",
                 "nvx_workload_uid=",
                 "nvx_workload_gid=",
                 "nvx_lifecycle=",
@@ -1081,13 +1104,84 @@ pub enum MachineProfile {
     Microvm,
 }
 
+fn validate_machine_load_mode(
+    machine_profile: MachineProfile,
+    load_mode: &LoadMode,
+) -> anyhow::Result<()> {
+    if machine_profile == MachineProfile::Standard {
+        anyhow::ensure!(
+            !matches!(
+                load_mode,
+                LoadMode::Linux {
+                    boot_mode: LinuxDirectBootMode::MpTable,
+                    ..
+                }
+            ),
+            "Linux MP-table boot mode requires the microVM profile"
+        );
+        return Ok(());
+    }
+
+    match load_mode {
+        LoadMode::Linux {
+            enable_serial,
+            isolation,
+            boot_mode,
+            smbios,
+            ..
+        } => {
+            anyhow::ensure!(
+                *boot_mode == LinuxDirectBootMode::MpTable,
+                "microVM Linux direct boot requires MP tables"
+            );
+            anyhow::ensure!(
+                *isolation == LinuxIsolationConfig::None,
+                "microVM MP-table boot does not support isolation"
+            );
+            anyhow::ensure!(
+                !enable_serial,
+                "microVM MP-table boot does not support emulated serial"
+            );
+            let SmbiosConfig { bios, system } = &**smbios;
+            let SmbiosBiosOverrides {
+                vendor,
+                version: bios_version,
+                release_date,
+                release,
+            } = bios;
+            let SmbiosSystemOverrides {
+                manufacturer,
+                product_name,
+                version: system_version,
+                serial_number,
+                sku_number,
+                family,
+                uuid,
+            } = system;
+            anyhow::ensure!(
+                vendor.is_none()
+                    && bios_version.is_none()
+                    && release_date.is_none()
+                    && release.is_none()
+                    && manufacturer.is_none()
+                    && product_name.is_none()
+                    && system_version.is_none()
+                    && serial_number.is_none()
+                    && sku_number.is_none()
+                    && family.is_none()
+                    && *uuid == Guid::ZERO,
+                "microVM MP-table boot does not expose SMBIOS overrides"
+            );
+            Ok(())
+        }
+        _ => anyhow::bail!("microVM requires Linux MP-table load mode"),
+    }
+}
+
 /// Validates the microVM machine contract. Standard-machine configurations are unchanged.
 pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> anyhow::Result<()> {
     let MachineProfile::Microvm = config.machine_profile else {
-        anyhow::ensure!(
-            !matches!(config.load_mode, LoadMode::Pvh { .. }),
-            "PVH load mode requires the microVM profile"
-        );
+        validate_machine_load_mode(config.machine_profile, &config.load_mode)?;
         anyhow::ensure!(
             config.microvm_network.is_none(),
             "static microVM network identity requires the microVM profile"
@@ -1111,10 +1205,7 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
 
     validate_microvm_virtio_reservations()?;
     validate_microvm_command_line(config, hypervisor_id)?;
-    anyhow::ensure!(
-        matches!(config.load_mode, LoadMode::Pvh { .. }),
-        "microVM requires PVH load mode"
-    );
+    validate_machine_load_mode(config.machine_profile, &config.load_mode)?;
     if let Some(hypervisor_id) = hypervisor_id {
         anyhow::ensure!(
             matches!(hypervisor_id, "kvm" | "mshv" | "whp"),
@@ -1365,6 +1456,8 @@ pub enum LinuxDirectBootMode {
     /// an EFI system table so the kernel enters its ACPI code path. On x86,
     /// ACPI tables are always provided via the zero page.
     Acpi,
+    /// Intel MP 1.4 tables for ACPI-free x86-64 microVM discovery.
+    MpTable,
 }
 
 /// Isolation-specific settings for Linux direct boot.
@@ -1429,11 +1522,6 @@ pub enum LoadMode {
         com_serial: Option<SerialInformation>,
     },
     None,
-    Pvh {
-        kernel: File,
-        initrd: Option<File>,
-        cmdline: String,
-    },
 }
 
 #[derive(Debug, Clone, Copy, MeshPayload)]
@@ -1693,6 +1781,114 @@ pub enum GicConfig {
 mod tests {
     use super::*;
 
+    fn linux_load_mode(
+        boot_mode: LinuxDirectBootMode,
+        isolation: LinuxIsolationConfig,
+        enable_serial: bool,
+        smbios: SmbiosConfig,
+    ) -> LoadMode {
+        LoadMode::Linux {
+            kernel: File::open(std::env::current_exe().unwrap()).unwrap(),
+            initrd: None,
+            cmdline: MICROVM_BASE_COMMAND_LINE.to_owned(),
+            enable_serial,
+            isolation,
+            boot_mode,
+            smbios: Box::new(smbios),
+        }
+    }
+
+    #[test]
+    fn validates_linux_direct_boot_mode_matrix() {
+        validate_machine_load_mode(
+            MachineProfile::Microvm,
+            &linux_load_mode(
+                LinuxDirectBootMode::MpTable,
+                LinuxIsolationConfig::None,
+                false,
+                SmbiosConfig::default(),
+            ),
+        )
+        .unwrap();
+        validate_machine_load_mode(
+            MachineProfile::Standard,
+            &linux_load_mode(
+                LinuxDirectBootMode::Acpi,
+                LinuxIsolationConfig::None,
+                true,
+                SmbiosConfig::default(),
+            ),
+        )
+        .unwrap();
+
+        for boot_mode in [LinuxDirectBootMode::Acpi, LinuxDirectBootMode::DeviceTree] {
+            assert!(
+                validate_machine_load_mode(
+                    MachineProfile::Microvm,
+                    &linux_load_mode(
+                        boot_mode,
+                        LinuxIsolationConfig::None,
+                        false,
+                        SmbiosConfig::default(),
+                    ),
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            validate_machine_load_mode(
+                MachineProfile::Standard,
+                &linux_load_mode(
+                    LinuxDirectBootMode::MpTable,
+                    LinuxIsolationConfig::None,
+                    false,
+                    SmbiosConfig::default(),
+                ),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_machine_load_mode(
+                MachineProfile::Microvm,
+                &linux_load_mode(
+                    LinuxDirectBootMode::MpTable,
+                    LinuxIsolationConfig::Snp {
+                        restricted_injection: false,
+                    },
+                    false,
+                    SmbiosConfig::default(),
+                ),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_machine_load_mode(
+                MachineProfile::Microvm,
+                &linux_load_mode(
+                    LinuxDirectBootMode::MpTable,
+                    LinuxIsolationConfig::None,
+                    true,
+                    SmbiosConfig::default(),
+                ),
+            )
+            .is_err()
+        );
+        let mut smbios = SmbiosConfig::default();
+        smbios.system.product_name = Some("override".to_owned());
+        assert!(
+            validate_machine_load_mode(
+                MachineProfile::Microvm,
+                &linux_load_mode(
+                    LinuxDirectBootMode::MpTable,
+                    LinuxIsolationConfig::None,
+                    false,
+                    smbios,
+                ),
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn control_console_restrictions_preserve_existing_command_lines() {
         let user_args = [
@@ -1738,6 +1934,15 @@ mod tests {
         assert!(
             build_microvm_command_line(&["nvx_snapshot_tier=platform".to_owned()], false).is_err()
         );
+    }
+
+    #[test]
+    fn microvm_processor_limit_is_host_owned() {
+        let mut cmdline = build_microvm_command_line(&[], false).unwrap();
+        append_microvm_processor_limit(&mut cmdline, 8).unwrap();
+        assert_eq!(cmdline, format!("{MICROVM_BASE_COMMAND_LINE} nr_cpus=8"));
+        assert!(append_microvm_processor_limit(&mut cmdline, 3).is_err());
+        assert!(build_microvm_command_line(&["nr_cpus=1".to_owned()], false).is_err());
     }
 
     #[test]

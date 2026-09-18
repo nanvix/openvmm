@@ -939,6 +939,7 @@ fn microvm_control_broker_config(
 
 fn build_effective_microvm_command_line(
     user_args: &[String],
+    processor_count: u32,
     has_console: bool,
     has_control_console: bool,
     workload_identity: Option<cli_args::MicrovmWorkloadIdentityCli>,
@@ -949,6 +950,7 @@ fn build_effective_microvm_command_line(
     } else {
         build_microvm_command_line(user_args, has_console)
     }?;
+    openvmm_defs::config::append_microvm_processor_limit(&mut cmdline, processor_count)?;
     if let Some(identity) = workload_identity {
         openvmm_defs::config::append_microvm_workload_identity(
             &mut cmdline,
@@ -1868,8 +1870,12 @@ mod microvm_console_attachment_tests {
             "nvx_control_tty=hvc9".to_owned(),
             "virtio-mmio.device=0x1000@0xc0000000:1".to_owned(),
         ];
-        assert!(build_effective_microvm_command_line(&user_args, true, false, None, None).is_ok());
-        assert!(build_effective_microvm_command_line(&user_args, true, true, None, None).is_err());
+        assert!(
+            build_effective_microvm_command_line(&user_args, 1, true, false, None, None).is_ok()
+        );
+        assert!(
+            build_effective_microvm_command_line(&user_args, 1, true, true, None, None).is_err()
+        );
     }
 
     #[test]
@@ -1879,12 +1885,14 @@ mod microvm_console_attachment_tests {
             gid: 65_534,
         };
         let command_line =
-            build_effective_microvm_command_line(&[], false, false, Some(identity), None).unwrap();
+            build_effective_microvm_command_line(&[], 1, false, false, Some(identity), None)
+                .unwrap();
         assert!(command_line.contains("nvx_workload_uid=65534"));
         assert!(command_line.contains("nvx_workload_gid=65534"));
         assert!(
             build_effective_microvm_command_line(
                 &["nvx_workload_uid=1".to_owned()],
+                1,
                 false,
                 false,
                 Some(identity),
@@ -1898,6 +1906,7 @@ mod microvm_console_attachment_tests {
     fn workload_lifecycle_is_host_owned() {
         let command_line = build_effective_microvm_command_line(
             &[],
+            1,
             true,
             true,
             Some(cli_args::MicrovmWorkloadIdentityCli {
@@ -1911,6 +1920,7 @@ mod microvm_console_attachment_tests {
         assert!(
             build_effective_microvm_command_line(
                 &["nvx_lifecycle=one-shot".to_owned()],
+                1,
                 true,
                 true,
                 None,
@@ -1983,6 +1993,7 @@ mod microvm_console_attachment_tests {
         .unwrap();
         openvmm_helpers::snapshot::microvm_machine_contract(
             source_hypervisor,
+            openvmm_helpers::snapshot::MICROVM_BOOT_LAYOUT_VERSION,
             command_line,
             Some((&network, &policy, microvm_network_attachment())),
             false,
@@ -2126,6 +2137,7 @@ mod microvm_console_attachment_tests {
         .unwrap();
         openvmm_helpers::snapshot::microvm_machine_contract(
             if cfg!(windows) { "whp" } else { "kvm" },
+            openvmm_helpers::snapshot::MICROVM_BOOT_LAYOUT_VERSION,
             command_line,
             None,
             true,
@@ -2172,6 +2184,7 @@ mod microvm_console_attachment_tests {
         .unwrap();
         openvmm_helpers::snapshot::microvm_machine_contract(
             if cfg!(windows) { "whp" } else { "kvm" },
+            openvmm_helpers::snapshot::MICROVM_BOOT_LAYOUT_VERSION,
             command_line,
             None,
             true,
@@ -3784,7 +3797,7 @@ async fn vm_config_from_command_line(
             bail!("the microVM profile requires an x86-64 guest");
         }
         if opt.igvm.is_some() || opt.pcat || opt.uefi {
-            bail!("the microVM profile requires Xen PVH direct boot");
+            bail!("the microVM profile requires Linux direct boot");
         }
 
         let (kernel, initrd, cmdline) = if let Some(contract) = restore_machine_contract {
@@ -3797,19 +3810,20 @@ async fn vm_config_from_command_line(
             let kernel = fs_err::File::open(
                 (opt.kernel.0)
                     .as_ref()
-                    .context("must provide a PVH kernel when using --machine microvm")?,
+                    .context("must provide a Linux kernel when using --machine microvm")?,
             )
-            .context("failed to open PVH kernel")?;
+            .context("failed to open Linux kernel")?;
             let initrd = (opt.initrd.0)
                 .as_ref()
                 .map(fs_err::File::open)
                 .transpose()
-                .context("failed to open PVH initrd")?;
+                .context("failed to open Linux initrd")?;
             (
                 kernel.into(),
                 initrd.map(Into::into),
                 build_effective_microvm_command_line(
                     &opt.cmdline,
+                    opt.processors,
                     microvm_console.is_some(),
                     microvm_control_console.is_some(),
                     opt.microvm_workload_identity,
@@ -3818,10 +3832,14 @@ async fn vm_config_from_command_line(
             )
         };
 
-        load_mode = LoadMode::Pvh {
+        load_mode = LoadMode::Linux {
             kernel,
             initrd,
             cmdline,
+            enable_serial: false,
+            isolation: openvmm_defs::config::LinuxIsolationConfig::None,
+            boot_mode: openvmm_defs::config::LinuxDirectBootMode::MpTable,
+            smbios: Box::default(),
         };
         with_hv = false;
     } else if opt.restore_snapshot.is_some() {
@@ -4815,8 +4833,13 @@ async fn vm_config_from_command_line(
         .as_deref()
         .and_then(|spec| spec.split(':').next());
     if cfg.machine_profile == MachineProfile::Microvm && restore_machine_contract.is_none() {
-        let LoadMode::Pvh { cmdline, .. } = &mut cfg.load_mode else {
-            unreachable!("microVM configuration was constructed with PVH load mode");
+        let cmdline = match &mut cfg.load_mode {
+            LoadMode::Linux {
+                cmdline,
+                boot_mode: openvmm_defs::config::LinuxDirectBootMode::MpTable,
+                ..
+            } => cmdline,
+            _ => unreachable!("microVM configuration was constructed with a supported load mode"),
         };
         let has_console = cfg
             .virtio_devices
@@ -5394,8 +5417,7 @@ fn prepare_snapshot_restore(
             storage_builder::snapshot_block_contract(sandbox_block_sources, scratch_policy)?;
         Some((
             expected_hypervisor,
-            effective_command_line
-                .context("microVM restore requires an effective PVH command line")?,
+            effective_command_line.context("microVM restore requires an effective command line")?,
             network,
             filesystem,
             console_attachment,
@@ -5658,6 +5680,7 @@ pub(crate) fn prepare_snapshot_restore_for_config(
             .map(|(config, root_path, attachment)| (config, root_path, attachment.clone()));
         let mut expected_contract = openvmm_helpers::snapshot::microvm_machine_contract(
             expected_hypervisor,
+            openvmm_helpers::snapshot::MICROVM_BOOT_LAYOUT_VERSION,
             effective_command_line.to_owned(),
             network,
             filesystem_slot,
@@ -6059,7 +6082,11 @@ async fn run_control_inner(
     )
     .await?;
     let effective_command_line = match &vm_config.load_mode {
-        LoadMode::Pvh { cmdline, .. } => Some(cmdline.clone()),
+        LoadMode::Linux {
+            cmdline,
+            boot_mode: openvmm_defs::config::LinuxDirectBootMode::MpTable,
+            ..
+        } => Some(cmdline.clone()),
         _ => None,
     };
     let microvm_sandbox_block_sources =
