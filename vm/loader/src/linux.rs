@@ -1866,7 +1866,7 @@ mod tests {
         }));
 
         let boot_params = imported_zero_page(&importer);
-        assert_eq!(u64::from(boot_params.acpi_rsdp_addr), 0);
+        assert_eq!(boot_params.acpi_rsdp_addr, 0);
         assert_eq!(
             u32::from(boot_params.hdr.cmd_line_ptr),
             MPTABLE_CMDLINE_BASE as u32
