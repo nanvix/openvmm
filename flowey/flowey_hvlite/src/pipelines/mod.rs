@@ -5,6 +5,7 @@ use crate::pipelines::vmm_tests_run_target::VmmTestsRunTargetCli;
 use cca_tests::CcaTestsCli;
 use flowey::pipeline::prelude::*;
 use restore_packages::RestorePackagesCli;
+use unit_tests_run::UnitTestsRunCli;
 use vmm_perf::VmmPerfCli;
 use vmm_tests_run::VmmTestsRunCli;
 
@@ -18,6 +19,7 @@ pub mod checkin_gates;
 pub mod custom_vmfirmwareigvm_dll;
 pub mod openvmm_source_release;
 pub mod restore_packages;
+pub mod unit_tests_run;
 pub mod vmm_perf;
 pub mod vmm_tests_run;
 pub mod vmm_tests_run_target;
@@ -44,6 +46,9 @@ pub enum OpenvmmPipelines {
 
     /// Install tools needed to build OpenVMM
     RestorePackages(RestorePackagesCli),
+
+    /// Build and run x64 Linux GNU unit tests and doctests
+    UnitTestsRun(UnitTestsRunCli),
 
     /// Build and run VMM tests with automatic artifact discovery
     VmmTestsRun(VmmTestsRunCli),
@@ -97,6 +102,7 @@ impl IntoPipeline for OpenvmmPipelines {
                 OpenvmmPipelinesCi::BurnIn(cmd) => cmd.into_pipeline(pipeline_hint),
             },
             OpenvmmPipelines::RestorePackages(cmd) => cmd.into_pipeline(pipeline_hint),
+            OpenvmmPipelines::UnitTestsRun(cmd) => cmd.into_pipeline(pipeline_hint),
             OpenvmmPipelines::VmmTestsRun(cmd) => cmd.into_pipeline(pipeline_hint),
             OpenvmmPipelines::VmmPerf(cmd) => cmd.into_pipeline(pipeline_hint),
             OpenvmmPipelines::VmmTestsRunTarget(cmd) => cmd.into_pipeline(pipeline_hint),
