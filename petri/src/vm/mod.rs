@@ -2874,15 +2874,6 @@ impl BootDeviceType {
 }
 
 impl Firmware {
-    /// Constructs the source-built, kernel-only Xen PVH test guest.
-    pub fn microvm_test_pvh(resolver: &ArtifactResolver<'_>) -> Self {
-        use petri_artifacts_vmm_test::artifacts::loadable::*;
-        Firmware::LinuxDirect {
-            kernel: resolver.require(GUEST_TEST_PVH_X64).erase(),
-            initrd: None,
-        }
-    }
-
     /// Constructs a standard [`Firmware::LinuxDirect`] configuration.
     pub fn linux_direct(resolver: &ArtifactResolver<'_>, arch: MachineArch) -> Self {
         use petri_artifacts_vmm_test::artifacts::loadable::*;

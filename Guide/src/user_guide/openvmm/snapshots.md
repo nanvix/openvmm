@@ -220,7 +220,7 @@ validation error and refuse to start.
 For standard-machine snapshots, device flags must still be supplied on restore
 and must reproduce the saved machine. For microVM snapshots, the manifest is
 authoritative for RAM, topology, ABI, fixed devices, placement,
-features, interrupts, and the effective PVH command line. Restore-time
+features, interrupts, and the effective Linux direct command line. Restore-time
 guest-visible overrides are rejected.
 
 The CPU contract records the effective CPUID/XSTATE surface and TSC frequency.
@@ -228,12 +228,12 @@ Restore recreates and validates that rate before any vCPU runs. KVM snapshots
 likewise require the destination to reproduce their saved backend CPU and
 clock contract.
 
-For a PVH microVM boot configured with `--snapshot-destination`, OpenVMM adds
+For a microVM boot configured with `--snapshot-destination`, OpenVMM adds
 the backend TSC frequency to the effective kernel command line so the captured
 guest clock matches this contract. Ordinary boots that cannot publish a
 snapshot retain the guest's normal TSC discovery path.
 
-All cold PVH microVM boots also receive `lapic_timer_hz=<Hz>` when the backend
+All cold microVM boots also receive `lapic_timer_hz=<Hz>` when the backend
 reports its LAPIC clock frequency. The NVX kernel uses this authoritative rate
 instead of verifying a counting LAPIC against scheduling-sensitive emulated
 PIT interrupts. TSC-deadline timers are unchanged. The parameter is canonicalized
@@ -374,5 +374,5 @@ immediately with a clear error if any active device does not support it.
 - VMs using PCAT firmware do not support save/restore
 - Standard-machine restore still requires matching `--memory` and
   `--processors`. MicroVM restore reads them authoritatively from the manifest
-  and rejects overrides. Only persisted microVM ABI and PVH layout value 2 are
-  supported; value 1 snapshots require an earlier compatible OpenVMM build.
+  and rejects overrides. Persisted microVM ABI and boot-layout value 2 are
+  supported.

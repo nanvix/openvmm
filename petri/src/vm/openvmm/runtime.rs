@@ -468,12 +468,13 @@ impl PetriVmInner {
             .context("microVM portb output is not configured")?;
         let mut buffered = Vec::new();
         loop {
-            buffered.extend_from_slice(
-                &output
-                    .recv()
-                    .await
-                    .context("microVM portb output disconnected")?,
-            );
+            let chunk = output.recv().await.map_err(|error| {
+                anyhow::anyhow!(
+                    "microVM portb output disconnected ({error}) after bytes {:?}",
+                    String::from_utf8_lossy(&buffered[..buffered.len().min(256)])
+                )
+            })?;
+            buffered.extend_from_slice(&chunk);
             if buffered
                 .windows(marker.len())
                 .any(|window| window == marker)
