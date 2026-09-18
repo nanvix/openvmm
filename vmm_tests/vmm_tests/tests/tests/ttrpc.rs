@@ -143,7 +143,11 @@ impl RestoreReadyListener {
     }
 
     async fn read_event(self, driver: &DefaultDriver) -> anyhow::Result<Vec<u8>> {
-        let connection = self.listener.await?;
+        let connection = CancelContext::new()
+            .with_timeout(Duration::from_secs(15))
+            .until_cancelled(self.listener)
+            .await
+            .context("timed out accepting restore readiness pipe")??;
         read_restore_ready_event(PolledPipe::new(driver, connection)?).await
     }
 }
@@ -368,16 +372,9 @@ write_port() {{
     octal=$(printf '%03o' "$2")
     printf "\\$octal" | dd of=/dev/port bs=1 seek="$1" count=1 conv=notrunc 2>/dev/null
 }}
+stty -F /dev/hvc0 raw -echo
 next_byte() {{
-    while :; do
-        status=$(read_port 234)
-        [ -n "$status" ] || status=0
-        if [ $((status & 1)) -ne 0 ]; then
-            read_port 233
-            return
-        fi
-        sleep 0.01
-    done
+    dd if=/dev/hvc0 bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d ' '
 }}
 generation=0
 {}
@@ -603,16 +600,19 @@ done
             })?;
         let portb = PolledSocket::new(&driver, UnixStream::connect(&portb_path)?)?;
         let (mut portb_read, mut portb_write) = portb.split();
+        let mut resume_cancel = CancelContext::new().with_timeout(Duration::from_secs(15));
         let (resume, readiness) = futures::join!(
-            client.call().start(vmservice::Vm::ResumeVm, ()),
+            resume_cancel.until_cancelled(client.call().start(vmservice::Vm::ResumeVm, ())),
             restore_ready.read_event(&driver)
         );
-        resume.map_err(|status| {
-            anyhow::anyhow!(
-                "Linux direct restore {restore_index} ResumeVM failed: {}",
-                status.message
-            )
-        })?;
+        resume
+            .with_context(|| format!("timed out resuming Linux direct restore {restore_index}"))?
+            .map_err(|status| {
+                anyhow::anyhow!(
+                    "Linux direct restore {restore_index} ResumeVM failed: {}",
+                    status.message
+                )
+            })?;
         anyhow::ensure!(
             readiness? == openvmm_defs::worker::RESTORE_READY_EVENT_V1,
             "Linux direct restore {restore_index} did not publish readiness"
@@ -642,9 +642,26 @@ done
             })?;
         portb_write.write_all(&[COMMAND_SHUTDOWN, 0]).await?;
         portb_write.flush().await?;
-        drain_until_closed(&mut portb_read, &mut restore_output).await?;
+        CancelContext::new()
+            .with_timeout(Duration::from_secs(15))
+            .until_cancelled(drain_until_closed(&mut portb_read, &mut restore_output))
+            .await
+            .with_context(|| {
+                let tail = restore_output.len().saturating_sub(256);
+                format!(
+                    "timed out draining Linux direct restore {restore_index} after output {:?}",
+                    String::from_utf8_lossy(&restore_output[tail..])
+                )
+            })??;
+        let status = CancelContext::new()
+            .with_timeout(Duration::from_secs(15))
+            .until_cancelled(child.wait())
+            .await
+            .with_context(|| {
+                format!("timed out waiting for Linux direct restore {restore_index} server")
+            })??;
         anyhow::ensure!(
-            child.wait().await?.success(),
+            status.success(),
             "Linux direct restore {restore_index} server failed"
         );
         anyhow::ensure!(
