@@ -5,16 +5,16 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-version="$(cat "$repo_root/verification/verus-version")"
-install_root="$repo_root/.tools/verus/$version"
-archive="verus-$version-x86-linux.zip"
-url="https://github.com/verus-lang/verus/releases/download/release/$version/$archive"
-expected_sha256="463a304316888288d9226e7c232c355cc1dce829ef846a79f80373311dfe4d8a"
+version="$(tr -d '[:space:]' < "$repo_root/verification/verus-version")"
+source_root="$repo_root/toolchain/verus-src"
+install_root="$source_root/source/target-verus/release"
 
 if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
     echo "error: automatic installation supports Linux x86_64 only" >&2
     exit 1
 fi
+
+"$repo_root/verification/tools/install-verus-source.sh"
 
 if [[ -x "$install_root/verus" ]]; then
     VERUS="$install_root/verus" "$repo_root/verification/tools/find-verus.sh" >/dev/null
@@ -22,17 +22,11 @@ if [[ -x "$install_root/verus" ]]; then
     exit 0
 fi
 
-tmp_dir="$(mktemp -d)"
-trap 'rm -rf "$tmp_dir"' EXIT
-curl --fail --location --silent --show-error "$url" --output "$tmp_dir/$archive"
-printf '%s  %s\n' "$expected_sha256" "$tmp_dir/$archive" | sha256sum --check
-unzip -q "$tmp_dir/$archive" -d "$tmp_dir/unpacked"
-distribution="$(find "$tmp_dir/unpacked" -mindepth 1 -maxdepth 1 -type d -print -quit)"
-if [[ -z "$distribution" || ! -x "$distribution/verus" ]]; then
-    echo "error: downloaded archive has no Verus executable" >&2
-    exit 1
-fi
-mkdir -p "$(dirname "$install_root")"
-mv "$distribution" "$install_root"
+(
+    cd "$source_root/source"
+    ./tools/get-z3.sh
+    cargo build --release
+    cargo run --release -p cargo-verus -- build --release --manifest-path vstd/Cargo.toml
+)
 VERUS="$install_root/verus" "$repo_root/verification/tools/find-verus.sh" >/dev/null
-echo "Installed Verus $version at $install_root"
+echo "Built Verus $version at $install_root"

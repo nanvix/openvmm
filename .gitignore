@@ -4,6 +4,8 @@ toolchain/verus-src/
 .verus_onboarding/
 .verus_limitation/
 .verus_agent/
+.verus-ra-cache/
+daemon.log
 .argus/
 .argus-limitation-home/
 **/*.rs.bk

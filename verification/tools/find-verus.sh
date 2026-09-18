@@ -9,6 +9,8 @@ version="$(cat "$repo_root/verification/verus-version")"
 
 if [[ -n "${VERUS:-}" ]]; then
     candidate="$VERUS"
+elif [[ -x "$repo_root/toolchain/verus-src/source/target-verus/release/verus" ]]; then
+    candidate="$repo_root/toolchain/verus-src/source/target-verus/release/verus"
 elif [[ -x "$repo_root/.tools/verus/$version/verus" ]]; then
     candidate="$repo_root/.tools/verus/$version/verus"
 elif command -v verus >/dev/null 2>&1; then

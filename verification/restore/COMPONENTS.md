@@ -13,6 +13,30 @@
 | RAM backing | manifest memory ranges | Prepared upstream input | Every declared GPA maps to the correct memory-file offset; holes remain unmapped | `openvmm/openvmm_helpers/src/snapshot.rs` |
 | VMGS/disks/attachments | manifest/config logical identity | External contract | Reopened resource has the approved content and attachment identity; FD equality is irrelevant | snapshot preparation and resource resolver call sites |
 
+## Saved-state blob interpretation
+
+The generic saved-state container does not define one universal device-state schema. Each entry is interpreted through this chain:
+
+```text
+SavedState.inventory
+    -> stable StateUnits registration names
+SavedStateUnit.name
+    -> one registered StateUnit
+SavedStateUnit.state
+    -> component-specific SavedStateBlob
+component restore implementation
+    -> component SnapshotVmStateView refinement
+```
+
+| Generic field | Meaning | Required proof |
+| --- | --- | --- |
+| `SavedState.inventory` | Complete ordered inventory, including stateless units | It agrees with the validated manifest machine contract and exactly matches the destination registration inventory when non-empty. |
+| `SavedState.units` | Units carrying mutable serialized state | Names are unique, known, consumed exactly once, and form a subset of the complete inventory. |
+| `SavedStateUnit.name` | Stable dispatch identity | It resolves to the intended production `StateUnit`, not merely to a blob with a compatible schema. |
+| `SavedStateUnit.state` | Opaque `SavedStateBlob` at the generic layer | Successful component parsing yields the concrete component saved-state View used by its restore contract. |
+
+Protobuf encoding/decoding may be trusted narrowly, but the repository-owned mapping from stable unit name to component semantics and the component restore behavior must be proved.
+
 ## Time and APIC details
 
 - `VmTime` is a `u64` count of 100ns units. `wrapping_add(Duration)` adds `duration.as_nanos() / 100`, truncating sub-100ns duration and narrowing modulo `2^64`.
@@ -22,11 +46,11 @@
 
 ## Explicitly unclosed production bridges
 
-1. Snapshot opening, manifest validation, saved-state decoding, and memory-file mapping establish the preconditions supplied to `InitializedVm::load`; they are outside this TOP theorem.
+1. Snapshot opening, manifest validation, saved-state decoding, memory-file mapping, destination construction, and VP instantiation establish the pre-state supplied to `LoadedVm::restore_snapshot_state`; they form the separate upstream theorem documented in `PREPARATION.md`.
 2. Resource resolver outputs satisfy recorded disk, VMGS, and attachment identities.
 3. State-unit inventory validation and asynchronous restore imply the per-component relations above.
 4. Hypervisor save/restore implementations preserve the opaque architecture fields required by the selected capability contract.
-5. Component Views for processor topology, partition/VP state, state units, memory, compatibility, and resources establish the fields composed by the standard `InitializedVm@` and `LoadedVm@` Views.
+5. Component Views for partition/VP state, state units, memory, compatibility, resources, and host-operational state establish the fields composed by the standard `LoadedVm@` View.
 6. The `LoadedVm` View and stop-guard representation establish the `PreExecutionRestored` boundary. The two callers, `VmWorker::new` and `VmWorker::restart`, must separately establish that a failed `load` returns before `LOADED_VM.store`, readiness publication, or `resume`.
 
 These are required proof obligations. The production View bridges are temporarily represented by the narrowly scoped `uninterp spec fn` declarations recorded in `UNINTERP.json`; no `assume`, `admit`, `external_body`, copied executable, or uninterpreted predicate that directly asserts the final theorem is used.

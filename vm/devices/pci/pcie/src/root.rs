@@ -298,7 +298,7 @@ impl<'a> GenericPcieRootComplexBuilder<'a> {
 impl GenericPcieRootComplex {
     /// Returns a builder for constructing a new `GenericPcieRootComplex`.
     pub fn builder<'a>(
-        register_mmio: &'a mut impl RegisterMmioIntercept,
+        register_mmio: &'a mut dyn RegisterMmioIntercept,
         bus_range: RangeInclusive<u8>,
         ecam_range: MemoryRange,
     ) -> GenericPcieRootComplexBuilder<'a> {

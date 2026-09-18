@@ -1,4 +1,4 @@
-# `InitializedVm::load` snapshot-restore verification scope
+# `LoadedVm::restore_snapshot_state` verification scope
 
 ## Purpose
 
@@ -6,9 +6,9 @@ This document defines the proof scope required by the snapshot-restore specifica
 
 `VM_LOAD_CALL_GRAPH.md` remains useful discovery evidence. Its 1,426-function ordinary-call closure is not itself the verification scope: it includes inactive configuration branches and generic infrastructure, while missing some semantic edges carried by trait dispatch, state-unit messages, callbacks, and spawned tasks.
 
-## Exact target count
+## Scope inventory, not a completion count
 
-The current verification scope contains exactly **68 function-level proof targets**:
+The earlier review identified **68 restore-semantic function-level targets** for one frozen x86-64 microVM profile:
 
 | Scope | Functions |
 | --- | ---: |
@@ -19,26 +19,26 @@ The current verification scope contains exactly **68 function-level proof target
 | VM time and backend-clock refinement | 6 |
 | Core microVM chipset restore and RTC time refinement | 13 |
 | Virtio MMIO/PCI restore and deferred-application lifecycle | 13 |
-| **Total** | **68** |
+| **Restore-semantic inventory** | **68** |
 
-This count freezes the target profile as x86-64 core microVM restore, the generic and KVM snapshot-clock refinements, and the virtio MMIO/PCI restore paths. Conditional VMBus/VTL2 VMBus profiles are excluded and require a separately counted extension.
+This is not the complete production verification closure and must not be used as a completion counter. It omits destination setup/build/wiring functions that execute before the snapshot branch, frontend type/trait/async dependencies, and any caller/preparation functions whose bodies have not yet been replaced by independently proved contracts. Conditional VMBus/VTL2 VMBus profiles also require an extension.
 
-The count is of distinct production function bodies or trait implementations that require a proof or a reviewed narrow contract. Overloaded functions with the same displayed name are counted separately. Semantic dispatch is counted at the real dispatch functions (`StateRequest::apply`, `PartitionUnitRunner::run`, and `RunnerInner::state_event`), not as additional fictional functions for enum variants. Standard-library, executor, codec, OS, and hypervisor primitives beyond the named repository-owned adapters are trusted leaves and are not included.
+The final closure is established edge by edge: every reachable call must target a verified body, an independently verified contract, a proved irrelevant/unreachable path, or an explicitly reviewed narrow trusted boundary. Its final size is determined by that closure, not by the number 68.
 
 ## Primary theorem
 
-The sole restore-correctness TOP is the `saved_state.is_some()` success path of:
+The focused restore-correctness TOP is:
 
 ```text
 openvmm/openvmm_core/src/worker/dispatch.rs
-InitializedVm::load
+LoadedVm::restore_snapshot_state
 ```
 
-The theorem boundary ends when `load` successfully returns `LoadedVm`, before `LoadedVm::resume` releases the restore stop guard or allows guest execution.
+The theorem pre-state begins after destination construction, memory/resource preparation, and VP instantiation. It ends when the helper successfully returns with the restore stop guard held, before `LoadedVm::resume` allows guest execution.
 
 Given valid decoded saved state and correctly prepared destination resources, the returned `LoadedVm` must:
 
-- have abstract state equal to `restore_projection(initial, saved, policy)`;
+- have snapshot state equal to `restore_snapshot_projection(initial_snapshot_state, request, active_vp_count)`;
 - preserve the prepared memory, compatibility class, destination capacity, and external resources;
 - restore partition state;
 - restore VP state by stable `VpIndex`, preserving initial/default state for VP identities not restored from the saved state;
@@ -55,19 +55,20 @@ flowchart TD
     A[Snapshot artifact validation and decoding] --> B[Prepared memory and resources]
     B --> C[InitializedVm::new / new_with_hypervisor]
     C --> D[VmWorker::new establishes load preconditions]
-    D --> E[InitializedVm::load TOP]
-    E --> F[LoadedVm::restore]
-    F --> G[StateUnits inventory validation]
-    F --> H[StateUnits restore protocol]
+    D --> E[InitializedVm::load constructs LoadedVm]
+    E --> F[LoadedVm::restore_snapshot_state TOP]
+    F --> G0[LoadedVm::restore]
+    G0 --> G[StateUnits inventory validation]
+    G0 --> H[StateUnits restore protocol]
     H --> I[Partition restore]
     I --> J[VP restore by stable VpIndex]
     H --> K[Immediate component restore]
     H --> L[Deferred state staging]
-    E --> M[StateUnits time advance]
+    F --> M[StateUnits time advance]
     M --> N[VM time and device timers]
-    E --> O[VP TSC/APIC advance]
-    E --> P[Backend snapshot-clock advance]
-    E --> Q[Restore stop guard]
+    F --> O[VP TSC/APIC advance]
+    F --> P[Backend snapshot-clock advance]
+    F --> Q[Restore stop guard]
     Q --> R[PreExecutionRestored]
 
     R -. later theorem .-> S[LoadedVm::resume]
@@ -81,14 +82,13 @@ flowchart TD
 
 | Symbol | Obligation |
 | --- | --- |
-| `InitializedVm::load` | Establish the conditional snapshot-success postcondition on the real returned `LoadedVm`; preserve the non-snapshot path. |
-| VP capacity/count checks in `load` | Establish the actual backend-specific instantiated-VP policy and reject invalid requests. |
-| `LoadedVm` construction in `load` | Establish ownership and the initial stopped lifecycle state used by the returned View. |
-| Snapshot branch in `load` | Establish ordering: restore state, advance time, acquire the restore stop guard, then return. |
+| `LoadedVm::restore_snapshot_state` | Establish ordering: validate clock compatibility, restore state, advance time, acquire the restore stop guard, then return. |
+
+`InitializedVm::load` retains its wrapper-level conditional restore contract, but it is not the focused verification target. Both contracts adapt their different pre-state Views to the shared `snapshot_restore_result` predicate, so snapshot equality, destination-frame preservation, active VP count, and lifecycle semantics have one definition.
 
 ### B. Caller-side precondition producers
 
-These functions are not additional TOPs. Their contracts must establish the assumptions consumed by `InitializedVm::load`.
+These functions are not additional TOPs. Future contracts must establish the `LoadedVm` pre-state and request validity consumed by `LoadedVm::restore_snapshot_state`.
 
 | Symbol | Obligation |
 | --- | --- |
@@ -96,9 +96,10 @@ These functions are not additional TOPs. Their contracts must establish the assu
 | `OpenedSnapshot::validate_memory_generation` | Preserve the identity and expected length of the opened memory artifact. |
 | `OpenedSnapshot::duplicate_memory_file_for_mapping` | Ensure the mapped handle denotes the same validated memory generation. |
 | `OpenedSnapshot::into_parts` | Preserve the association among manifest, state bytes, and lifetime guards. |
-| Saved-state decode at `VmWorker::new` | Successful decoding produces the `SavedVmStateView` consumed by the load contract. |
-| `VmWorker::new` | Validate the machine/CPU contract, establish the prepared-memory and resource preconditions, and call `load` with the matching decoded state and policy. |
-| `InitializedVm::new` / `InitializedVm::new_with_hypervisor` | Install the supplied backing, topology, compatibility information, and external resources into the `InitializedVm` View. |
+| `prepare_snapshot_restore_for_config` | Establish validated manifest, exact memory generation, decoded state bytes, restore-time contract, and attachment identities. |
+| Saved-state decode at `VmWorker::new` | Establish that the `SavedState` argument corresponds to the prepared snapshot generation. |
+| `VmWorker::new` | Preserve preparation facts while constructing and loading the VM. |
+| `InitializedVm::new` / `InitializedVm::new_with_hypervisor` / `InitializedVm::load` | Install the prepared backing/resources, enforce VP-selection rules, and establish the `LoadedVm` TOP pre-state. |
 
 Filesystem reads, OS file identity, and memory mapping syscalls may use narrow trusted contracts. Repository-owned manifest validation, generation checks, offset/range validation, and construction logic must be specified rather than replaced by one unconstrained function.
 
@@ -177,7 +178,7 @@ These functions are required for end-to-end restore readiness but are deliberate
 | `DeviceTask::apply_pending_restore` | Apply the exact pending payload before device operations that depend on it. |
 | `DeviceTask::enable`, `start`, config access, and kick paths | Establish that they call `apply_pending_restore` before dependent device behavior. |
 
-These are separate theorems composed after the `PreExecutionRestored` result; they must not be folded into `InitializedVm::load` by exposing implementation fields in its open spec.
+These are separate theorems composed after the `PreExecutionRestored` result; they must not be folded into the helper's open TOP specification.
 
 ## Explicitly excluded from the restore proof body
 
@@ -203,34 +204,24 @@ Trust must be narrow and explicit:
 - supported hypervisor operations whose implementations are outside the verified Rust closure;
 - task-runtime scheduling primitives, while preserving message ownership and ordering contracts.
 
-No trusted boundary may directly assert `snapshot_restore_success`, `restore_projection`, or equality of the final `LoadedVm` View.
+No trusted boundary may directly assert `snapshot_restore_success`, `restore_snapshot_projection`, or equality of the final snapshot-state projection.
 
 ## Verification order
 
-1. Freeze the open `SavedVmStateView`, `VmStateView`, restore-policy, compatibility, and projection semantics.
-2. Replace `decoded_restore_request_view` with smaller SavedState, restore-time, and VP-policy Views.
-3. Define memory, topology, component, partition, and VP Views at their production owners.
-4. Prove `StateUnits::validate_inventory`, restore dispatch, and stopped-state preservation.
-5. Prove partition and stable-identity VP restoration.
-6. Prove immediate component restore and deferred-state staging for the supported profile.
-7. Prove VM-time, VP TSC/APIC, RTC, and backend-clock refinement.
-8. Compose those contracts in `LoadedVm::restore` and `InitializedVm::load`.
-9. Prove caller failure non-publication in `VmWorker::new` and `VmWorker::restart`.
-10. Separately prove `resume` and gated-release lifecycle ordering.
+1. Freeze the TOP-level full-state, snapshot projection, restore request, lifecycle, and success semantics.
+2. Attach that contract to `LoadedVm::restore_snapshot_state`.
+3. In later proof work, replace representation bridges with component Views and prove the helper body.
+4. Separately prove preparation/destination construction before the TOP and caller/lifecycle behavior after the TOP.
 
 ## Acceptance criteria
 
-The restore verification scope is complete only when:
+This TOP-level specification task is complete when:
 
-- the production `InitializedVm::load` body verifies against its conditional snapshot contract;
-- `InitializedVm@`, decoded `SavedState`, and `LoadedVm@` are defined from real fields/component Views rather than whole-object uninterpreted mappings;
-- every TOP field has a production owner and a proved refinement path;
-- every call leaving the verified closure has a narrow reviewed contract;
-- stable VP identity and actual backend instantiation rules are proved;
-- complete inventory and mutable-state domains are distinguished;
-- deferred state is preserved at load return and applied before dependent operations;
-- virtual-time refinement covers VM time and the supported TSC/APIC/RTC/backend behavior;
-- caller failure paths cannot publish or resume a failed VM;
-- no proof relies on `assume`, `admit`, broad `external_body`, a copied implementation, or an uninterpreted predicate asserting the final theorem.
+- the production helper carries the reviewable open precondition and postcondition;
+- full runtime state is distinct from the snapshot-state projection;
+- the specification identifies stable VP identity, component inventory, active/pending state, time adjustment, preserved destination frame, and the pre-execution lifecycle boundary;
+- preparation, proof, caller failure, resume, and deferred activation remain explicit separate obligations rather than being claimed by this TOP.
+
+Proof completion criteria are intentionally not part of this task.
 
 The earlier Pedro-change and name-filtered counts are retained only in `VM_LOAD_CALL_GRAPH.md` as historical discovery data. They are not acceptance criteria and do not define proof completeness.

@@ -211,7 +211,7 @@ impl VirtioPciDevice {
         guest_memory: GuestMemory,
         interrupt_model: PciInterruptModel<'_>,
         doorbell_registration: Option<Arc<dyn DoorbellRegistration>>,
-        mmio_registration: &mut (impl RegisterMmioIntercept + ?Sized),
+        mmio_registration: &mut dyn RegisterMmioIntercept,
         shared_mem_mapper: Option<&dyn MemoryMapper>,
     ) -> io::Result<Self> {
         let traits = device.traits();

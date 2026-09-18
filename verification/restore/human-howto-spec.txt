@@ -1,46 +1,41 @@
-I want to specify the functional correctness of snapshot restoration in the following production function:
+I want to specify the functional correctness of snapshot restoration in:
 
-In openvmm/openvmm_core/src/worker/dispatch.rs:
-
-InitializedVm::load(
-    self,
-    saved_state: Option<SavedState>,
-    client_notify_send: mesh::Sender<HaltReason>,
+LoadedVm::restore_snapshot_state(
+    &mut self,
+    saved_state: SavedState,
     restore_time: Option<(Duration, u64, Option<u64>)>,
-    restore_vp_count: Option<u32>,
-) -> Result<LoadedVm, anyhow::Error>
+) -> anyhow::Result<()>
 
-Focus on the snapshot-restoration branch, where saved_state is Some. The boundary is successful return before guest execution, not subsequent guest repair or external readiness.
+This function is the only TOP. Its pre-state is a destination LoadedVm whose
+snapshot memory and approved resources are already installed and whose selected
+VPs are already instantiated.
 
-The specification has two main parts:
+Model the complete runtime VM state, including host-operational state that may
+change concurrently. Define snapshot_state as a separate projection containing
+only persisted guest-relevant state. Do not require host tasks, sockets,
+signaling objects, wakers, or transient host queues to equal snapshot data.
 
-1. How to abstract the snapshot inputs and the actual VM resources.
-2. What preconditions and postconditions this production function should have.
+Interpret SavedState as the named component blobs and complete state-unit
+inventory. SavedState does not contain RAM, destination compatibility,
+external-resource identity, or snapshot-generation provenance.
 
-HOW TO ABSTRACT THE KEY DATA STRUCTURES
+On success:
 
-Define a common logical VM state describing guest memory contents, per-virtual-processor state, and device state relevant to restoration. Include the machine configuration and component identities needed to interpret that state. Hide host addresses, file-descriptor numbers, and task-management details, but do not omit information merely because it is difficult to model.
+- snapshot_state(final VM) equals the restore projection derived from
+  snapshot_state(initial VM), SavedState, the selected VP count already present
+  in the initial LoadedVm, and the optional restore-time adjustment;
+- memory, compatibility, destination VP capacity, external resources, and
+  active VP count remain those of the initial LoadedVm;
+- VP restoration uses stable VP identity and preserves initial/default state
+  for destination VPs not restored from SavedState;
+- active and pending component state remain distinct;
+- the VM is PreExecutionRestored and guest execution has not begun.
 
-Define a snapshot view that interprets the saved artifacts as this logical state. This requires interpreting the serialized component states and mapping memory-file offsets to guest physical addresses. Use smaller helper spec functions rather than one gigantic function.
+Define these result clauses once in a shared restore-result predicate. Adapt
+the LoadedVm helper pre-state and InitializedVm load pre-state to that predicate
+rather than maintaining two independent copies of the restore guarantee.
 
-The production load function receives prepared inputs rather than a snapshot directory. Connect its actual SavedState and the prepared memory backing in self to the snapshot view through explicit input contracts. SavedState alone does not contain the entire snapshot.
-
-Define a view or representation relation for the actual returned LoadedVm and its underlying resources. For example, its logical RAM must describe the bytes in its real guest-memory backing, and its logical CPU and device states must correspond to the actual resources. Do not substitute an independently populated record of "observed state" for this connection.
-
-For externally implemented OS or hypervisor resources, explicit abstract resource views and API contracts may be necessary. However, the interpretation logic implemented within this repository should be defined, not hidden behind an unconstrained uninterpreted function.
-
-HOW TO SPECIFY THE PRECONDITIONS AND POSTCONDITIONS
-
-Once these views are defined, the main success property is straightforward:
-
-Given valid, compatible snapshot inputs and correctly prepared resources, if load returns successfully, the returned VM must represent the state described by the snapshot, subject only to explicitly specified restore adjustments.
-
-Define validity and compatibility from the actual callers and supported configurations. Do not strengthen the preconditions merely to exclude difficult cases.
-
-Specify CPU selection by stable VP identity and the actual instantiation rules. For deferred device restoration, require preservation of the correct pending content and application before operations that depend on it. Deferred state must not disappear from the abstraction.
-
-Specify permitted time adjustments and other differences explicitly, preserving unaffected state. If external timing or nondeterminism affects the result, use a constrained restore relation with clearly identified environment inputs rather than forcing literal equality or allowing arbitrary differences.
-
-Specify that partial restoration does not permit premature guest execution. On failure, state the required non-publication and cleanup obligations without assuming transactional rollback.
-
-These contracts must apply to the real production load function and its actual inputs and returned resources. Helper specifications may live elsewhere, but a separate model whose own records agree is not a substitute. Defining this specification and proving that the implementation satisfies it are separate tasks.
+Do not specify or prove snapshot opening, prepare_snapshot_restore_for_config,
+protobuf decoding, destination construction, caller failure publication,
+resume, deferred-state activation, or readiness publication as part of this
+TOP. Record them only as separate upstream or downstream obligations.

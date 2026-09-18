@@ -1,80 +1,89 @@
-# Snapshot Restore Specification
+# Snapshot Restore TOP-Level Specification
 
 ## Target boundary
 
-The sole TOP function is the successful `saved_state.is_some()` branch of `InitializedVm::load` in `openvmm/openvmm_core/src/worker/dispatch.rs`, ending when `load` returns and before `LoadedVm::resume` can release the restore stop guard. Snapshot file opening, manifest validation, saved-state decoding, memory-backing preparation, later guest repair, deferred device activation, and externally-ready publication are caller or later-phase protocols.
+The focused verification TOP is `LoadedVm::restore_snapshot_state` in `openvmm/openvmm_core/src/worker/dispatch.rs`.
 
-The specification therefore describes `PreExecutionRestored`, not a fully resumed VM. `LoadedVmView` records this as a lifecycle phase rather than independent `restored`, `running`, and `externally_ready` booleans. Failure does not promise rollback; failure-side non-publication is a caller obligation because publication state is not observable from `anyhow::Error` or from a failed `load` result.
+Its pre-state is a destination `LoadedVm` after `InitializedVm::load` has completed platform/device construction, installed the prepared memory and external resources, and instantiated the selected VPs. Its successful post-state is the point after state-unit restore, permitted time adjustment, backend-clock adjustment, and acquisition of the restore stop guard, but before `LoadedVm::resume` can permit guest execution.
 
-## Inputs and shared logical state
+`InitializedVm::load` retains its conditional snapshot wrapper contract. That contract states the externally visible composition from the initialized VM and restore request to the returned `LoadedVm`, while delegating the extracted restore transition to the helper specification. It is not the focused verification target.
 
-The logical model follows the two-view design required by the human how-to specification. `SavedVmStateView` represents the component state actually carried by the decoded `SavedState`. `VmStateView` represents the abstract state of a concrete initialized or loaded VM. `restore_projection(initial, saved, policy)` constructs the complete `LoadedVmView` expected after restore. The projection, rather than an uninterpreted request field, determines which state comes from saved state and which state remains from the destination VM.
+`prepare_snapshot_restore_for_config`, snapshot decoding, destination construction proofs, caller failure publication, deferred-state activation, and readiness publication are outside the focused TOP. They require separate contracts for an end-to-end proof, but this task does not add their proofs.
 
-`decoded_restore_request_view` abstracts the already-decoded `SavedState` together with the caller-supplied restore time and VP-selection policy. It produces `SavedVmStateView` plus the policy; it must not invent memory, external-resource, compatibility, or snapshot-identity information that is absent from those arguments. The serialized snapshot-file-to-`SavedState` correspondence remains the explicitly trusted decoding boundary required by the human how-to specification.
+## Logical state boundary
 
-The intended initial and loaded VM views describe the concrete input `InitializedVm` and returned `LoadedVm`; they are not replacement executable structs. They are declared in `worker/dispatch.spec.rs`, while their standard `View` implementations and closed representation mappings live in `worker/dispatch.proof.rs`. The remaining component correspondence functions are explicit `uninterp spec fn` proof debt recorded in `UNINTERP.json` and must be replaced by component Views as the frontend limitations are removed.
+The human-owned open model separates:
 
-The caller must establish artifact validation, memory preparation, machine compatibility, and external-resource identity before invoking `load`. At the `load` boundary, memory, compatibility, and external resources are already part of `InitializedVmView` and are frame-preserved by `restore_projection`; `SavedState` is not treated as if it contained those values. Host virtual addresses, file descriptor numbers, worker identities, `StateUnits` registration mechanics, and task allocation details are intentionally hidden.
+- `VmStateView`: the full logical runtime state represented at this boundary, including guest-visible state, destination configuration/resources, and `HostOperationalStateView`.
+- `SnapshotVmStateView`: only state represented by snapshot artifacts and relevant to restore correctness: prepared RAM, partition and stable-identity VP state, component inventory and active/pending component state, and virtual time.
+- `SavedVmStateView`: the component state carried by decoded `SavedState`; it does not contain RAM, external resources, destination compatibility, VP capacity, or snapshot-generation identity.
+- `RestoreRequestView`: `SavedVmStateView`, selected VP count, and the optional downtime policy.
+- `LoadedVmView`: the concrete helper pre/post-state together with active VP count and lifecycle phase.
 
-Because `InitializedVm::load` also implements the non-snapshot boot path, these requirements are conditional:
+`snapshot_state(vm_state)` is the explicit projection from full runtime state to snapshot state. It intentionally excludes compatibility metadata, destination VP capacity, external resource identities, and host-operational state such as tasks, sockets, signaling objects, wakers, and transient host queue occupancy.
+
+Host-side activity may change `host_operational_state` while restore runs. The success condition therefore does not require equality for that field.
+
+## Snapshot data interpretation
+
+The generic serialized state is:
 
 ```text
-saved_state.is_some() ==> decoded_restore_request_view(...).valid_for(self@)
+SavedState {
+    units: Vec<SavedStateUnit>,
+    inventory: Vec<String>,
+}
+
+SavedStateUnit {
+    name: String,
+    state: SavedStateBlob,
+}
 ```
 
-The success guarantee is conditional for the same reason:
+`inventory` is the complete ordered state-unit identity set, including stateless units. `units` contains only units with mutable serialized state. Each `name` selects one registered component, and its opaque blob is interpreted by that component's concrete saved-state schema.
 
-```text
-saved_state.is_some() ==> snapshot_restore_success(self@, request, loaded@)
-```
+The TOP currently uses `decoded_restore_request_view` as an explicit proof-debt bridge from `SavedState` and `restore_time` to the logical request. Replacing that bridge with component Views is proof work and is not part of this top-level-spec task. Protobuf codec correctness may eventually be a narrow trusted boundary, but repository-owned name-to-component interpretation must not be hidden by the final proof.
 
-No snapshot-specific requirement or postcondition is imposed when `saved_state` is `None`.
+## Preconditions
 
-## Successful restore guarantee
+`RestoreRequestView::valid_for_loaded_vm(old(self)@)` requires:
 
-On success, before guest execution:
+- the helper pre-state is `PreparingRestore`;
+- the active VP count does not exceed destination VP capacity;
+- the request's selected VP count equals the active VP count already instantiated in the helper pre-state;
+- the destination VP map has stable identities for the full destination capacity;
+- saved VP identities are a subset of destination VP identities;
+- the complete saved component inventory equals the destination component inventory;
+- active and pending saved-state domains are subsets of that inventory and of the corresponding destination component domains;
+- saved virtual time has not already incorporated restore downtime.
 
-- RAM, compatibility, external resources, and destination VP capacity remain those of the already-prepared initial VM.
-- VP state is keyed by stable VP index rather than represented only by sequence position. Saved state replaces selected VP identities that it contains; every other destination VP retains its initial/default state.
-- The selected active VP count remains between the boot-online lower bound and destination VP capacity. The compatibility relation allows the snapshot VP sequence to be a prefix of the destination capacity, as required by the human how-to specification; whether every current backend implementation supports that case is a production proof obligation rather than a specification assumption.
-- For capability-dependent optional CPU fields, `Some(value)` writes the saved value while `None` leaves the destination's initial field unchanged.
-- `VirtualTimeView` advances by the requested downtime. Its VM-time component uses `floor(downtime_ns / 100)` 100ns ticks with `u64` wrapping. TSC, backend-clock, LAPIC, RTC, and timer implementation details refine this single abstract elapsed-time observation in component proofs rather than appearing as TOP success flags.
-- The complete saved component inventory equals the destination component inventory, matching production `validate_inventory`. Mutable component-state maps are separate and may cover only a subset of that inventory. Saved active and pending state overlay the destination's initial/default component state.
-- Disabled virtio queues do not require ring-address validation. Enabled queues retain configuration and progress and remain subject to the production ring-span, alignment, overlap, and guest-memory checks.
-- The returned VM is in `PreExecutionRestored`: its restore stop guard remains held and guest execution has not begun. Externally-ready publication occurs later and is intentionally not represented as a field of `LoadedVmView`.
+Preparation establishes additional end-to-end facts before this TOP: exact snapshot memory generation, manifest/state association, machine compatibility, approved external resources, decoded state provenance, and selected-VP construction. Those obligations are documented in `PREPARATION.md` and are not asserted by `SavedState` alone.
 
-## Supported microVM state-unit profile
+## Successful postcondition
 
-The stable core microVM ABI v1/v2 inventory includes `partition`, `vp0`, `vmtime`, `pic`, `ioapic`, `lapic`, `pit`, `rtc`, `microvm-portb`, `microvm-shutdown`, and `microvm-snapshot-request`. Chipset devices are registered as children of the `chipset` state unit using runtime names supplied by the builder. Optional virtio devices use configuration-derived stable names. VMBus and VTL2 VMBus are conditional and are not guaranteed by the core microVM profile.
+On `Ok(())`, `snapshot_restore_success(old(self)@, request, final(self)@)` requires:
 
-Detailed ownership, restore mode, source references, and remaining external contracts are recorded in `COMPONENTS.md`.
+- the final snapshot-state projection equals `restore_snapshot_projection(snapshot_state(initial.state), request, initial.active_vp_count)`;
+- prepared RAM remains the RAM already installed in the helper pre-state;
+- saved partition state is restored;
+- VP state is restored by stable VP identity for selected VPs present in the saved state, while other destination VP state remains initial/default;
+- complete component inventory is preserved and saved active/pending component state overlays the initial/default component state;
+- virtual time applies exactly the optional downtime adjustment defined by `restored_virtual_time`;
+- destination compatibility, VP capacity, external resources, and active VP count are preserved;
+- the final lifecycle phase is `PreExecutionRestored`.
 
-## Current proof boundary
+The postcondition deliberately does not constrain `host_operational_state`. It also does not claim guest readiness, deferred-state activation, caller publication, or rollback after failure.
 
-The old standalone executable model has been removed. The current `worker/dispatch.spec.rs` contains only specification-mode Views and relations over the real production `InitializedVm`, `SavedState`, and `LoadedVm` types. It is included from `worker/dispatch.rs` and does not contain a second restore implementation.
+The `Err` arm has no state rollback guarantee. Failure non-publication and no-resume properties belong to separate caller contracts.
 
-The Human-owned open layer consists of:
+The shared `snapshot_restore_result` predicate contains the single definition of the successful restore result: snapshot projection equality, preserved destination frame, selected active VP count, and `PreExecutionRestored` lifecycle phase. `snapshot_restore_success` adapts the helper's `LoadedVm` pre-state to that predicate, while `snapshot_load_success` adapts the wrapper's `InitializedVm` pre-state. Neither wrapper duplicates the restore semantics.
 
-- `restore_projection`, which maps decoded saved state, destination VM state, and restore policy to the complete expected `LoadedVmView`;
-- `restore_vp_projection`, which restores saved VP state by stable VP index and preserves initial/default state for all other VP identities;
-- `snapshot_restore_success`, which requires the real returned `LoadedVmView` to equal that complete projection;
-- `RestoreRequestView::valid_for`, which groups the conditional VP-selection, inventory, component-domain, and saved-time requirements that `load` can consume from its actual inputs;
-- `saved_state_is_compatible_with`, which distinguishes exact component inventory compatibility from the subset of components carrying mutable state;
-- `boot_vp_count_is_valid`, which exposes the caller-visible VP selection constraint.
+The retained `InitializedVm::load` contract uses `valid_for_initialized_vm` and `snapshot_load_success`. It keeps the original conditional behavior for `saved_state.is_some()`, including boot-online and selected-VP bounds.
 
-The Engineer-owned closed layer is in `worker/dispatch.proof.rs`, included from `worker/dispatch.rs` as the `restore_proof` module. Its current `pre_execution_representation` predicate records how the production `LoadedVm` fields represent the pre-execution state. Future internal invariants and proof lemmas belong there rather than in the Human-owned open specification.
+## Open and closed layers
 
-`openvmm_core` opts into cargo-verus, depends on the pinned repository-local Verus source, and places an exhaustive `#[verus_spec]` result match directly on the production `InitializedVm::load` declaration. The separate `#[verus_verify]` marker is intentionally commented out rather than duplicated with `verus_spec`. The success branch uses the standard `self@` and `loaded@` Views and additionally records the closed production representation fact.
+The human-owned open layer in `worker/dispatch.spec.rs` defines the reviewable state vocabulary, projection, validity relation, and success property.
 
-`InitializedVm::load` cannot express the caller-visible failure guarantee from an `anyhow::Error`: the error does not contain guest-execution or publication state. Its error arm therefore makes no extra state claim. The no-resume/no-publication property belongs to the caller orchestration that owns those actions and must be specified there.
+The closed layer in `worker/dispatch.proof.rs` currently provides only representation bridges needed to attach the open contract to production types. These bridges are recorded in `UNINTERP.json` as proof debt. No proof, `assume`, `admit`, copied restore implementation, or predicate that directly asserts the final theorem is added by this task.
 
-The caller proof must cover both production call sites:
-
-- `VmWorker::new`: if `load` returns `Err`, control returns through `?` before assigning `restore_ready_sink`, calling `LOADED_VM.store`, constructing `VmWorker`, entering `run`, or publishing restore readiness.
-- `VmWorker::restart`: if `load` returns `Err`, control returns through `?` before `LOADED_VM.store` and before the conditional `resume`.
-
-These obligations implement the lifecycle transition `Preparing -> FailedBeforePublication`. They must eventually be attached to the real caller bodies using a caller-owned event/publication View; they must not be reconstructed from the error payload.
-
-The production body is not yet verified. Cargo-verus reaches the real async body and has advanced past the earlier tracing `__CALLSITE`, function-local constant/type, `anyhow::ensure!` formatting, trait-object lowering, byte-string constant, array-pattern, and generator limitations. The remaining immediate blocker is in the pinned Verus toolchain rather than an unsupported source expression: pruning an async root unconditionally marks the private `vstd::future::exec_await` hook reachable, but the Cargo-built vstd metadata does not export a corresponding function entry, causing `vir/src/prune.rs` to panic with `no entry found for key`. A diagnostic verifier confirmed the missing key exactly as `Fun(Path(vstd, ["future" :: "exec_await"]))`.
-
-With a diagnostic-only prune guard, translation proceeds to the next legitimate BOTTOM modeling frontier: the production `HvlitePartition` trait and its `Inspect`/`RequestYield` supertrait closure are not declared to Verus. This interface must be modeled explicitly, with narrow contracts for the restore-relevant clock and partition operations; it must not be bypassed with an empty external trait, broad `external_body`, copied executable, assumption of the TOP restore relation, or a `verus_keep_ghost`-selected replacement.
+`#[verus_spec]` contracts are attached to both the retained `InitializedVm::load` wrapper and `LoadedVm::restore_snapshot_state`. `verification/tools/verify.sh` selects the extracted helper as the focused TOP. The `#[verus_verify]` marker remains disabled because proving either body is outside the requested scope.

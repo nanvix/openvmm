@@ -26,17 +26,7 @@ pub enum FatalErrorPolicy {
     Panic(Arc<dyn Fn() + Send + Sync>),
     /// Convert the failure to a debugger break, and send the error over the
     /// given channel.
-    DebugBreak(mesh::Sender<FatalError>),
-}
-
-/// A fatal chipset error forwarded to the VM worker.
-pub struct FatalError(Box<dyn std::error::Error + Send + Sync>);
-
-impl FatalError {
-    /// Returns the underlying error.
-    pub fn into_inner(self) -> Box<dyn std::error::Error + Send + Sync> {
-        self.0
-    }
+    DebugBreak(mesh::Sender<Box<dyn std::error::Error + Send + Sync>>),
 }
 
 impl AdaptedChipset {
@@ -90,7 +80,7 @@ impl CpuIo for AdaptedChipset {
                 panic!("fatal error: {}", error)
             }
             FatalErrorPolicy::DebugBreak(channel) => {
-                channel.send(FatalError(error));
+                channel.send(error);
                 virt::VpHaltReason::SingleStep
             }
         }

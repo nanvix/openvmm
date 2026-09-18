@@ -4,23 +4,32 @@
   "entries": [
     {
       "symbol": "restore_proof::initialized_vm_representation",
-      "deferred_fact": "A total abstraction from every constructible production InitializedVm to its memory, compatibility class, VP-capacity and initial/default VP state, boot-online policy, abstract component set and state, virtual time, and external-resource View.",
+      "deferred_fact": "A total abstraction from a production InitializedVm to prepared memory, compatibility, VP capacity and initial/default VP state, boot-online policy, component inventory/state, virtual time, external resources, and host-operational state.",
       "source_evidence": [
         "openvmm/openvmm_core/src/worker/dispatch.rs"
       ],
-      "consumer": "View for InitializedVm",
-      "removal": "Replace the representation bridge with component Views for processor topology, memory, component state, virtual time, compatibility, and external resource identity."
+      "consumer": "Retained InitializedVm::load wrapper contract",
+      "removal": "Replace the whole-object bridge with component Views owned by destination construction."
+    },
+    {
+      "symbol": "restore_proof::decoded_load_restore_request_view",
+      "deferred_fact": "A total abstraction from load's optional SavedState, restore_time, and restore_vp_count arguments to the logical saved state, selected VP count, and time policy used by the conditional wrapper contract.",
+      "source_evidence": [
+        "openvmm/openvmm_defs/src/worker.rs",
+        "openvmm/openvmm_core/src/worker/dispatch.rs"
+      ],
+      "consumer": "Retained InitializedVm::load wrapper contract",
+      "removal": "Replace with production Views for decoded SavedState, restore-time input, and VP-selection policy."
     },
     {
       "symbol": "restore_proof::decoded_restore_request_view",
-      "deferred_fact": "A total abstraction from successfully decoded SavedState, restore_time, and restore_vp_count to SavedVmStateView plus restore policy. It must expose only SavedState-owned partition, stable-identity VP, inventory, mutable component, and virtual-time state, without inventing memory, resources, compatibility, provenance, or the expected LoadedVm result.",
+      "deferred_fact": "A total abstraction from the SavedState and restore_time arguments of LoadedVm::restore_snapshot_state plus the selected VP count read from its LoadedVm pre-state to SavedVmStateView and restore policy. It must expose only SavedState-owned partition, stable-identity VP, inventory, mutable component, and virtual-time state. Prepared memory, compatibility, resources, and snapshot-generation provenance are already represented by or established before the helper's LoadedVm pre-state and must not be invented here.",
       "source_evidence": [
         "openvmm/openvmm_defs/src/worker.rs",
-        "openvmm/openvmm_core/src/worker/dispatch.rs",
-        "vmm_core/src/partition_unit/vp_set.rs"
+        "openvmm/openvmm_core/src/worker/dispatch.rs"
       ],
-      "consumer": "InitializedVm::load TOP contract",
-      "removal": "Add production Views for SavedState units, VP selection policy, and restore-time inputs, then define this constructor from those Views. Keep the serialized-file decoding correspondence as the explicitly trusted boundary required by the human how-to specification."
+      "consumer": "LoadedVm::restore_snapshot_state TOP contract",
+      "removal": "Replace this bridge with production Views for SavedState units and restore-time inputs. Keep preparation and VP-instantiation contracts outside this TOP."
     },
     {
       "symbol": "restore_proof::loaded_vm_representation",

@@ -9,12 +9,14 @@
 //! reference new functionality via `Resource`s when you can to minimize build
 //! time.
 
-#![forbid(unsafe_code)]
-#![cfg_attr(verus_keep_ghost, feature(proc_macro_hygiene))]
+#![cfg_attr(not(verus_keep_ghost), forbid(unsafe_code))]
+#![cfg_attr(verus_keep_ghost, feature(allocator_api, proc_macro_hygiene))]
 
 mod emuplat;
 pub mod hypervisor_backend;
 mod partition;
+#[allow(dead_code)]
+mod verus_compat;
 mod vmgs_non_volatile_store;
 mod worker;
 

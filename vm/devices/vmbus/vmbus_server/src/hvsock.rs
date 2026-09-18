@@ -58,9 +58,9 @@ struct RelayInner {
 impl HvsockRelay {
     /// Creates and starts a relay thread, waiting for hvsocket connect requests
     /// on `recv`.
-    pub fn new<T: ParentBus + 'static>(
+    pub fn new(
         driver: impl SpawnDriver,
-        vmbus: Arc<T>,
+        vmbus: Arc<dyn ParentBus>,
         guest: HvsockRelayChannelHalf,
         hybrid_vsock_path: Option<PathBuf>,
         hybrid_vsock_listener: Option<UnixListener>,

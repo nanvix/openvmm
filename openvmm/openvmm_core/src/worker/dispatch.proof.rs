@@ -8,18 +8,28 @@
 
 use super::InitializedVm;
 use super::LoadedVm;
-use super::restore_spec::RestoreRequestView;
 use super::restore_spec::InitializedVmView;
 use super::restore_spec::LoadedVmView;
+use super::restore_spec::RestoreRequestView;
 use openvmm_defs::worker::SavedState;
 use std::time::Duration;
 use vstd::prelude::*;
 
 verus! {
 
-// The snapshot artifact and memory backing are prepared before load. This
-// bridge exposes only the SavedState-owned state and the restore policy.
+// This bridge exposes only SavedState-owned state and the restore-time policy.
+// Prepared memory, compatibility, resources, and VP selection are already
+// represented by the pre-state of LoadedVm at this TOP boundary.
 pub uninterp spec fn decoded_restore_request_view(
+    saved_state: &SavedState,
+    restore_time: &Option<(Duration, u64, Option<u64>)>,
+    selected_vp_count: nat,
+) -> RestoreRequestView;
+
+// The load wrapper additionally receives optional saved state and VP-selection
+// policy. Its bridge is separate so the helper contract does not invent those
+// caller-owned facts.
+pub uninterp spec fn decoded_load_restore_request_view(
     saved_state: &Option<SavedState>,
     restore_time: &Option<(Duration, u64, Option<u64>)>,
     restore_vp_count: &Option<u32>,

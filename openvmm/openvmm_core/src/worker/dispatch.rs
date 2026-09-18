@@ -114,7 +114,6 @@ use pci_core::PciInterruptPin;
 use pcie::root::GenericPcieRootComplex;
 use pcie::switch::GenericPcieSwitch;
 use scsi_core::ResolveScsiDeviceHandleParams;
-use scsi_core::ResolvedScsiDevice;
 use scsidisk::atapi_scsi::AtapiScsiDisk;
 use serial_16550_resources::ComPort;
 use state_unit::SpawnedUnit;
@@ -169,7 +168,6 @@ use vmm_core::input_distributor::InputDistributor;
 use vmm_core::partition_unit::Halt;
 use vmm_core::partition_unit::PartitionUnit;
 use vmm_core::partition_unit::PartitionUnitParams;
-use vmm_core::partition_unit::VpRunner;
 use vmm_core::partition_unit::block_on_vp;
 use vmm_core::vmbus_unit::ChannelUnit;
 use vmm_core::vmbus_unit::VmbusServerHandle;
@@ -195,392 +193,6 @@ use watchdog_core::resources::StaticWatchdogPlatformResolver;
 const PM_BASE: u16 = 0x400;
 #[cfg(guest_arch = "x86_64")]
 const SYSTEM_IRQ_ACPI: u32 = 9;
-
-fn unexpected_vp_binder_count(actual: usize, capacity: u32) -> anyhow::Error {
-    anyhow::anyhow!("backend returned {actual} VP binders for topology capacity {capacity}")
-}
-
-fn invalid_restore_vp_count(count: u32, capacity: u32) -> anyhow::Error {
-    anyhow::anyhow!("restore VP count {count} is outside capacity 1..={capacity}")
-}
-
-fn duplicate_ide_drive_error(channel: u8, drive: u8) -> anyhow::Error {
-    anyhow::anyhow!("ide drive {channel}:{drive} is already in use")
-}
-
-fn invalid_cxl_mmio_error(
-    name: &str,
-    high_mmio_len: u64,
-    port_count: u64,
-    required: u64,
-) -> anyhow::Error {
-    anyhow::anyhow!(
-        "invalid CXL root complex '{name}': high MMIO range {high_mmio_len:#x} is too small for {port_count} CXL root-port BAR apertures (requires {required:#x})"
-    )
-}
-
-fn cxl_ports_require_ranges_error(name: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "invalid CXL root complex '{name}': CXL-capable root ports require both CHBCR and HDM ranges"
-    )
-}
-
-fn cxl_ranges_unresolved_error(name: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "invalid CXL root complex '{name}': configured CXL CHBCR/HDM ranges were not resolved"
-    )
-}
-
-fn pcie_root_device_name(name: &str) -> String {
-    format!("pcie-root:{name}")
-}
-
-fn duplicate_pcie_port_error(name: &str) -> anyhow::Error {
-    anyhow::anyhow!("duplicate PCIe port name '{name}'")
-}
-
-fn pcie_switch_device_name(name: &str) -> String {
-    format!("pcie-switch:{name}")
-}
-
-fn missing_pcie_switch_parent_error(switch: &str, parent: &str) -> anyhow::Error {
-    anyhow::anyhow!("switch '{switch}' parent port '{parent}' not found in any root complex")
-}
-
-fn invalid_generic_initiator_node_error(
-    port_name: &str,
-    node: u32,
-    num_nodes: u32,
-) -> anyhow::Error {
-    anyhow::anyhow!(
-        "PCIe generic initiator port '{port_name}' references NUMA node {node} which does not exist (num_nodes={num_nodes})"
-    )
-}
-
-fn missing_generic_initiator_port_error(port_name: &str) -> anyhow::Error {
-    anyhow::anyhow!("generic initiator port '{port_name}' not found in PCIe topology")
-}
-
-fn unsupported_vtl1_scsi_error() -> anyhow::Error {
-    anyhow::anyhow!("vtl1 scsi controllers unsupported")
-}
-
-fn failed_vmbus_resource_context(resource_id: &str) -> String {
-    format!("failed to resolve vmbus resource {resource_id}")
-}
-
-fn unsupported_microvm_abi_error() -> anyhow::Error {
-    anyhow::anyhow!("unsupported microVM ABI reached worker construction")
-}
-
-fn unsupported_microvm_virtio_device_error(id: &str) -> anyhow::Error {
-    anyhow::anyhow!("unsupported microVM virtio device '{id}' reached worker construction")
-}
-
-fn microvm_virtio_slot_error(id: &str) -> anyhow::Error {
-    anyhow::anyhow!("microVM virtio slot for '{id}' is outside the fixed low-MMIO aperture")
-}
-
-fn tsc_frequency_mismatch_error(destination: u64, saved: u64) -> anyhow::Error {
-    anyhow::anyhow!(
-        "destination TSC frequency {destination} Hz does not match saved frequency {saved} Hz"
-    )
-}
-
-fn apic_frequency_mismatch_error(destination: u64, saved: u64) -> anyhow::Error {
-    anyhow::anyhow!(
-        "destination APIC frequency {destination} Hz does not match saved frequency {saved} Hz"
-    )
-}
-
-fn virtio_mmio_device_name(id: &str, mmio_start: u64) -> String {
-    format!("{id}-{mmio_start}")
-}
-
-fn virtio_pci_device_name(id: &str) -> String {
-    format!("{id}-pci")
-}
-
-fn clone_hvlite_partition(partition: &Arc<dyn HvlitePartition>) -> Arc<dyn HvlitePartition> {
-    partition.clone()
-}
-
-fn base_chipset_foundation<'a>(
-    gm: &GuestMemory,
-    halt_vps: &Arc<Halt>,
-    vmtime_source: &'a VmTimeSource,
-    vmtime_unit: &'a state_unit::UnitHandle,
-    partition: &Arc<dyn HvlitePartition>,
-) -> BaseChipsetFoundation<'a> {
-    BaseChipsetFoundation {
-        is_restoring: false,
-        untrusted_dma_memory: gm.clone(),
-        trusted_vtl0_dma_memory: gm.clone(),
-        power_event_handler: halt_vps.clone(),
-        debug_event_handler: halt_vps.clone(),
-        vmtime: vmtime_source,
-        vmtime_unit,
-        doorbell_registration: partition.clone().into_doorbell_registration(Vtl::Vtl0),
-    }
-}
-
-fn new_uefi_watchdog_resolver(
-    partition: &Arc<dyn HvlitePartition>,
-    halt_vps: Arc<Halt>,
-) -> emuplat::uefi::OpenvmmUefiWatchdogPlatformResolver {
-    emuplat::uefi::OpenvmmUefiWatchdogPlatformResolver::new(partition.clone(), halt_vps)
-}
-
-fn replay_mtrrs_callback(halt_vps: Arc<Halt>) -> Box<dyn Send + FnMut()> {
-    Box::new(move || halt_vps.replay_mtrrs())
-}
-
-fn new_hyperv_firmware_pcat(
-    logger: Box<dyn firmware_pcat::PcatLogger>,
-    generation_id_recv: mesh::Receiver<[u8; 16]>,
-    rom: Option<Box<dyn guestmem::MapRom>>,
-    halt_vps: Arc<Halt>,
-    config: firmware_pcat::config::PcatBiosConfig,
-) -> vmotherboard::options::dev::HyperVFirmwarePcat {
-    vmotherboard::options::dev::HyperVFirmwarePcat {
-        logger,
-        generation_id_recv,
-        rom,
-        replay_mtrrs: replay_mtrrs_callback(halt_vps),
-        config,
-    }
-}
-
-fn spawn_vmtime_state_unit(
-    state_units: &StateUnits,
-    driver_source: &VmTaskDriverSource,
-    vmtime_keeper: VmTimeKeeper,
-) -> SpawnedUnit<VmTimeKeeper> {
-    state_units
-        .add("vmtime")
-        .spawn(driver_source.simple(), |recv| {
-            let mut vmtime = vmtime_keeper;
-            async move {
-                vmm_core::vmtime_unit::run_vmtime(&mut vmtime, recv).await;
-                vmtime
-            }
-        })
-        .unwrap()
-}
-
-fn spawn_input_distributor(
-    state_units: &StateUnits,
-    driver_source: &VmTaskDriverSource,
-    mut input_distributor: InputDistributor,
-) -> SpawnedUnit<InputDistributor> {
-    state_units
-        .add("input")
-        .spawn(driver_source.simple(), async |mut recv| {
-            input_distributor.run(&mut recv).await;
-            input_distributor
-        })
-        .unwrap()
-}
-
-fn new_atapi_drive_media(disk: ResolvedScsiDevice) -> ide::DriveMedia {
-    let disk = Arc::new(AtapiScsiDisk::new(disk.0));
-    ide::DriveMedia::optical_disk(disk)
-}
-
-fn add_fake_pci_bus_root(
-    chipset_builder: &vmotherboard::ChipsetBuilder<'_>,
-    bus_id: vmotherboard::BusIdPci,
-) -> anyhow::Result<()> {
-    chipset_builder
-        .arc_mutex_device("fake-bus-root")
-        .on_pci_bus(bus_id)
-        .add(|services| {
-            missing_dev::MissingDev::from_manifest(
-                MissingDevManifest::new().claim_pci((0, 0, 0), 0x8086, 0x7111),
-                &mut services.register_mmio(),
-                &mut services.register_pio(),
-            )
-        })?;
-    Ok(())
-}
-
-#[cfg(guest_arch = "x86_64")]
-fn add_bsp_lint_target(
-    chipset_builder: &vmotherboard::ChipsetBuilder<'_>,
-    partition: &Arc<dyn HvlitePartition>,
-) {
-    chipset_builder.add_external_line_target(
-        chipset_device_resources::BSP_LINT_LINE_SET,
-        0..=1,
-        0,
-        "bsp",
-        partition.clone().into_lint_target(Vtl::Vtl0),
-    );
-}
-
-#[cfg(guest_arch = "x86_64")]
-fn new_ioapic_routing_connection(
-    partition: &Arc<dyn HvlitePartition>,
-) -> ioapic_iommu_wiring::IoApicRoutingConnection {
-    ioapic_iommu_wiring::IoApicRoutingConnection::new(partition.clone().ioapic_routing())
-}
-
-fn vmbus_server_builder<T: SpawnDriver + Clone>(
-    spawner: T,
-    synic: &Arc<dyn vmcore::synic::SynicPortAccess>,
-    gm: GuestMemory,
-) -> vmbus_server::VmbusServerBuilder<T> {
-    VmbusServer::builder(spawner, synic.clone(), gm)
-}
-
-fn new_vpci_device_interfaces(
-    partition: &Arc<dyn HvlitePartition>,
-    device_vtl: DeviceVtl,
-    device_id: u64,
-) -> anyhow::Result<(
-    Arc<dyn pci_core::msi::SignalMsi>,
-    vmcore::vpci_msi::VpciInterruptMapper,
-)> {
-    let hv_device = partition.new_virtual_device(
-        match device_vtl {
-            DeviceVtl::Vtl0 => Vtl::Vtl0,
-            DeviceVtl::Vtl1 => Vtl::Vtl1,
-            DeviceVtl::Vtl2 => Vtl::Vtl2,
-        },
-        device_id,
-    )?;
-    Ok((
-        hv_device.clone().target(),
-        hv_device.clone().interrupt_mapper(),
-    ))
-}
-
-async fn build_configured_pcie_devices(
-    devices: Vec<PcieDeviceConfig>,
-    chipset_builder: &vmotherboard::ChipsetBuilder<'_>,
-    driver_source: &VmTaskDriverSource,
-    resolver: &ResourceResolver,
-    gm: &GuestMemory,
-    partition: &Arc<dyn HvlitePartition>,
-    mapper: &membacking::DeviceMemoryMapper,
-    port_info: &std::collections::HashMap<Arc<str>, PortInfo>,
-    processor_topology: &ProcessorTopology,
-    iommu_devices: &IommuDevices,
-) -> anyhow::Result<()> {
-    try_join_all(devices.into_iter().map(|dev_cfg| {
-        let chipset_builder = chipset_builder;
-        let driver_source = driver_source;
-        let resolver = resolver;
-        let gm = gm;
-        let partition = partition;
-        let mapper = mapper;
-        let port_info = port_info;
-        let processor_topology = processor_topology;
-        let iommu_devices = iommu_devices;
-        async move {
-            let port_name: Arc<str> = dev_cfg.port_name.into();
-            let pi = port_info.get(&port_name).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "device port '{}' not found in any root complex or switch",
-                    port_name
-                )
-            })?;
-
-            let msi_conn = pci_core::msi::MsiConnection::new();
-
-            let pcie_ctx = pcie_wiring::build_device_wiring(pcie_wiring::PcieDeviceWiringParams {
-                msi_platform: pcie_wiring::PcieMsiPlatform {
-                    partition: partition.as_ref(),
-                    segment: pi.segment,
-                    processor_topology,
-                    #[cfg(guest_arch = "x86_64")]
-                    iommu: x86_iommu_for_rc(iommu_devices, pi.rc_idx),
-                },
-                guest_memory: gm,
-                bus_range: &pi.bus_range,
-                msi: &msi_conn,
-                #[cfg(guest_arch = "aarch64")]
-                smmu: smmu_for_rc(iommu_devices, pi.rc_idx),
-            });
-
-            vmm_core::device_builder::build_pcie_device(
-                vmm_core::device_builder::PciDeviceResolveContext {
-                    driver_source,
-                    resolver,
-                    resource: dev_cfg.resource,
-                    doorbell_registration: partition.clone().into_doorbell_registration(Vtl::Vtl0),
-                    shared_mem_mapper: Some(mapper),
-                },
-                chipset_builder,
-                port_name.clone(),
-                &pcie_ctx.dma_target,
-            )
-            .await?;
-
-            pcie_ctx.connect_to(&msi_conn);
-
-            anyhow::Ok(())
-        }
-    }))
-    .await?;
-    Ok(())
-}
-
-async fn bind_vp_threads(
-    vps: Vec<Box<dyn BindHvliteVp>>,
-    vp_runners: Vec<VpRunner>,
-    partition: &Arc<dyn HvlitePartition>,
-    chipset: &vmm_core::vmotherboard_adapter::AdaptedChipset,
-) -> anyhow::Result<()> {
-    let partition = partition.clone();
-    let chipset = chipset.clone();
-    try_join_all(vps.into_iter().zip(vp_runners).enumerate().map(
-        |(vp_index, (mut vp, runner))| {
-            let partition = partition.clone();
-            let chipset = chipset.clone();
-            let (send, recv) = mesh::oneshot();
-            thread::Builder::new()
-                .name(format!("vp-{}", vp_index))
-                .spawn(move || {
-                    #[cfg(not(verus_verify_core))]
-                    let vp_bind = openvmm_defs::profile::ProfileSpan::start();
-                    let bind_result = vp.bind();
-                    if vp_index == 0 {
-                        #[cfg(not(verus_verify_core))]
-                        vp_bind.complete_milestone("startup", "vp_bind_bsp", Default::default());
-                    } else {
-                        #[cfg(not(verus_verify_core))]
-                        if openvmm_defs::profile::enabled() {
-                            let phase = format!("vp_bind_ap_{vp_index}");
-                            vp_bind.complete_milestone("startup", &phase, Default::default());
-                        }
-                    }
-                    match bind_result {
-                        Ok(mut vp) => {
-                            send.send(Ok(()));
-                            block_on_vp(
-                                partition,
-                                VpIndex::new(vp_index as u32),
-                                vp.run(runner, &chipset),
-                            )
-                        }
-                        Err(err) => {
-                            send.send(Err(err));
-                        }
-                    }
-                })
-                .unwrap();
-
-            async move {
-                recv.await
-                    .unwrap()
-                    .with_context(|| format!("failed to bind vp {vp_index}"))
-            }
-        },
-    ))
-    .await?;
-    Ok(())
-}
 
 /// Creates a thread to run low-performance devices on.
 pub fn new_device_thread() -> (JoinHandle<()>, DefaultDriver) {
@@ -722,26 +334,6 @@ mod restore_vp_prefix_tests {
         assert_eq!(restore_vp_prefix("kvm", Some(2)), None);
         assert_eq!(restore_vp_prefix("whp", Some(2)), None);
     }
-}
-
-#[cfg(not(verus_verify_core))]
-fn trace_loading_bios(firmware: &impl std::fmt::Debug) {
-    tracing::debug!(?firmware, "Loading BIOS firmware.");
-}
-
-#[cfg(not(verus_verify_core))]
-fn trace_vtl2_framebuffer_gpa(gpa: u64) {
-    tracing::debug!("Vtl2 framebuffer gpa base: {:#x}", gpa);
-}
-
-#[cfg(not(verus_verify_core))]
-fn trace_floppy_opened() {
-    tracing::trace!("floppy opened based on config into DriveRibbon");
-}
-
-#[cfg(not(verus_verify_core))]
-fn trace_too_many_floppy_controllers() {
-    tracing::error!("more than 2 floppy controllers are not supported");
 }
 
 /// The VM worker, used to create and run a VM partition.
@@ -929,64 +521,6 @@ enum ResolvedIommu {
     /// Intel VT-d resources, one per unit.
     #[cfg(guest_arch = "x86_64")]
     IntelVtd(Vec<intel_vtd_wiring::ResolvedVtdResources>),
-}
-
-struct DeferredMsiConn {
-    msi_conn: pci_core::msi::MsiConnection,
-    segment: u16,
-    #[cfg_attr(not(guest_arch = "x86_64"), expect(dead_code))]
-    rc_idx: usize,
-}
-
-struct PortInfo {
-    segment: u16,
-    bus_range: pci_core::bus_range::AssignedBusRange,
-    rc_idx: usize,
-}
-
-#[verus_verify]
-struct FatalErrorReceiver {
-    _receiver: mesh::Receiver<vmm_core::vmotherboard_adapter::FatalError>,
-}
-
-struct HvlitePartitionHandle(Arc<dyn HvlitePartition>);
-
-impl HvlitePartitionHandle {
-    fn as_ref(&self) -> &dyn HvlitePartition {
-        self.0.as_ref()
-    }
-
-    fn clone_arc(&self) -> Arc<dyn HvlitePartition> {
-        self.0.clone()
-    }
-}
-
-impl std::ops::Deref for HvlitePartitionHandle {
-    type Target = dyn HvlitePartition;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref()
-    }
-}
-
-fn hvlite_partition_handle(partition: &Arc<dyn HvlitePartition>) -> HvlitePartitionHandle {
-    HvlitePartitionHandle(partition.clone())
-}
-
-fn adapt_chipset_with_debug_break(
-    chipset: Arc<vmotherboard::Chipset>,
-) -> (
-    vmm_core::vmotherboard_adapter::AdaptedChipset,
-    FatalErrorReceiver,
-) {
-    let (send, recv) = mesh::channel();
-    (
-        vmm_core::vmotherboard_adapter::AdaptedChipset::new(
-            chipset,
-            vmm_core::vmotherboard_adapter::FatalErrorPolicy::DebugBreak(send),
-        ),
-        FatalErrorReceiver { _receiver: recv },
-    )
 }
 
 /// Instantiated IOMMU devices for the VM, keyed by IOMMU type.
@@ -1323,7 +857,7 @@ struct LoadedVmInner {
     driver_source: VmTaskDriverSource,
     resolver: ResourceResolver,
     partition_unit: PartitionUnit,
-    partition: HvlitePartitionHandle,
+    partition: Arc<dyn HvlitePartition>,
     chipset_devices: ChipsetDevices,
     _vmtime: SpawnedUnit<VmTimeKeeper>,
     memory_manager: GuestMemoryManager,
@@ -1993,24 +1527,24 @@ impl InitializedVm {
         })
     }
 
-    /// Loads the state for an initialized VM.
+    /// Loads an initialized VM.
     ///
     // FUTURE: move more of this logic into new() so that more can be done
     //         outside the VM-PHU/live migration blackout window.
-    // #[verus_verify]
+    #[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
     #[cfg_attr(verus_keep_ghost, verus_spec(result =>
         requires
-            !saved_state.is_some() || restore_proof::decoded_restore_request_view(
+            !saved_state.is_some() || restore_proof::decoded_load_restore_request_view(
                 &saved_state,
                 &restore_time,
                 &restore_vp_count,
-            ).valid_for(self@),
+            ).valid_for_initialized_vm(self@),
         ensures
             match result {
                 Ok(loaded) => !saved_state.is_some() || (
-                    restore_spec::snapshot_restore_success(
+                    restore_spec::snapshot_load_success(
                         self@,
-                        restore_proof::decoded_restore_request_view(
+                        restore_proof::decoded_load_restore_request_view(
                             &saved_state,
                             &restore_time,
                             &restore_vp_count,
@@ -2019,8 +1553,6 @@ impl InitializedVm {
                     )
                     && restore_proof::pre_execution_representation(&loaded, true)
                 ),
-                // Failure-side publication and resume are owned by the callers
-                // of load, not represented by anyhow::Error.
                 Err(_) => true,
             },
     ))]
@@ -2055,13 +1587,16 @@ impl InitializedVm {
         } = self;
 
         let vp_capacity = processor_topology.vp_count();
-        if vps.len() != vp_capacity as usize {
-            return Err(unexpected_vp_binder_count(vps.len(), vp_capacity));
-        }
+        anyhow::ensure!(
+            vps.len() == vp_capacity as usize,
+            "backend returned {} VP binders for topology capacity {vp_capacity}",
+            vps.len()
+        );
         let instantiated_vp_count = restore_vp_count.unwrap_or(vp_capacity);
-        if !(1..=vp_capacity).contains(&instantiated_vp_count) {
-            return Err(invalid_restore_vp_count(instantiated_vp_count, vp_capacity));
-        }
+        anyhow::ensure!(
+            (1..=vp_capacity).contains(&instantiated_vp_count),
+            "restore VP count {instantiated_vp_count} is outside capacity 1..={vp_capacity}"
+        );
         vps.truncate(instantiated_vp_count as usize);
 
         let mut resolver = ResourceResolver::new();
@@ -2140,10 +1675,8 @@ impl InitializedVm {
         // ...but we keep a reference to the original untyped client, since we need
         // to pass it to LoadedVm so that we can `inspect` VMGS at runtime.
         let vmgs_client_inspect_handle = vmgs_client.clone();
-        let vmgs_client: Option<&dyn HvLiteVmgsNonVolatileStore> = match vmgs_client.as_ref() {
-            Some(client) => Some(client),
-            None => None,
-        };
+        let vmgs_client: Option<&dyn HvLiteVmgsNonVolatileStore> =
+            vmgs_client.as_ref().map(|x| x as _);
 
         let (halt_vps, halt_request_recv) = Halt::new();
         let halt_vps = Arc::new(halt_vps);
@@ -2151,7 +1684,9 @@ impl InitializedVm {
         resolver.add_resolver(vmm_core::platform_resolvers::HaltResolver(halt_vps.clone()));
         #[cfg(guest_arch = "x86_64")]
         let ioapic_routing = {
-            let conn = new_ioapic_routing_connection(&partition);
+            let conn = ioapic_iommu_wiring::IoApicRoutingConnection::new(
+                partition.clone().ioapic_routing(),
+            );
             resolver.add_resolver(vmm_core::platform_resolvers::IoApicRoutingResolver(
                 conn.target(),
             ));
@@ -2167,33 +1702,35 @@ impl InitializedVm {
         let mut deps_hyperv_firmware_pcat = None;
         match &cfg.load_mode {
             LoadMode::Uefi { .. } => {
+                use emuplat::uefi::*;
                 // Register the platform-specific resolvers used by the UEFI
                 // device.
                 resolver.add_resolver(emuplat::firmware::MeshLoggerResolver::new(
                     cfg.firmware_event_send.clone(),
                 ));
-                resolver
-                    .add_async_resolver(new_uefi_watchdog_resolver(&partition, halt_vps.clone()));
+                resolver.add_async_resolver(OpenvmmUefiWatchdogPlatformResolver::new(
+                    partition.clone(),
+                    halt_vps.clone(),
+                ));
             }
             #[cfg(guest_arch = "x86_64")]
             LoadMode::Pcat {
                 firmware,
                 boot_order,
             } => {
-                #[cfg(not(verus_verify_core))]
-                trace_loading_bios(firmware);
+                tracing::debug!(?firmware, "Loading BIOS firmware.");
                 let rom_builder = RomBuilder::new("bios".into(), Box::new(mapper.clone()));
                 let rom = rom_builder.build_from_file_location(firmware)?;
                 // TODO: move mtrr replay to a resource.
                 let halt_vps = halt_vps.clone();
-                deps_hyperv_firmware_pcat = Some(new_hyperv_firmware_pcat(
-                    Box::new(emuplat::firmware::MeshLogger::new(
+                deps_hyperv_firmware_pcat = Some(dev::HyperVFirmwarePcat {
+                    logger: Box::new(emuplat::firmware::MeshLogger::new(
                         cfg.firmware_event_send.clone(),
                     )),
-                    mesh::channel().1,
-                    Some(Box::new(rom)),
-                    halt_vps,
-                    {
+                    generation_id_recv: mesh::channel().1,
+                    rom: Some(Box::new(rom)),
+                    replay_mtrrs: Box::new(move || halt_vps.replay_mtrrs()),
+                    config: {
                         let pcat_slit_info =
                             if cfg.numa.nodes.len() > 1 || !cfg.numa.distances.is_empty() {
                                 Some(SlitInfo {
@@ -2271,27 +1808,37 @@ impl InitializedVm {
                                 chassis_serial_number: "9583-9572-9874-4843-7295-1653-92".into(),
                                 chassis_asset_tag: "9583-9572-9874-4843-7295-1653-92".into(),
                                 bios_lock_string: "00000000000000000000000000000000".into(),
-                                processor_manufacturer: vec![0],
-                                processor_version: vec![0],
+                                processor_manufacturer: b"\0".to_vec(),
+                                processor_version: b"\0".to_vec(),
                                 cpu_info_bundle: None,
                             },
                         }
                     },
-                ))
+                })
             }
             _ => {}
         };
 
         if let Some(gpa) = vtl2_framebuffer_gpa_base {
-            #[cfg(not(verus_verify_core))]
-            trace_vtl2_framebuffer_gpa(gpa);
+            tracing::debug!("Vtl2 framebuffer gpa base: {:#x}", gpa);
         }
 
         let state_units = StateUnits::new();
 
-        let vmtime = spawn_vmtime_state_unit(&state_units, &driver_source, vmtime_keeper);
+        let vmtime = state_units
+            .add("vmtime")
+            .spawn(driver_source.simple(), {
+                |recv| {
+                    let mut vmtime = vmtime_keeper;
+                    async move {
+                        vmm_core::vmtime_unit::run_vmtime(&mut vmtime, recv).await;
+                        vmtime
+                    }
+                }
+            })
+            .unwrap();
 
-        let input_distributor = InputDistributor::new(cfg.input);
+        let mut input_distributor = InputDistributor::new(cfg.input);
         resolver.add_async_resolver::<KeyboardInputHandleKind, _, MultiplexedInputHandle, _>(
             input_distributor.client().clone(),
         );
@@ -2299,8 +1846,13 @@ impl InitializedVm {
             input_distributor.client().clone(),
         );
 
-        let input_distributor =
-            spawn_input_distributor(&state_units, &driver_source, input_distributor);
+        let input_distributor = state_units
+            .add("input")
+            .spawn(driver_source.simple(), async |mut recv| {
+                input_distributor.run(&mut recv).await;
+                input_distributor
+            })
+            .unwrap();
 
         let mut pci_legacy_interrupts = Vec::new();
 
@@ -2323,7 +1875,8 @@ impl InitializedVm {
                             .await
                             .context("failed to open IDE DVD")?;
 
-                        new_atapi_drive_media(dvd)
+                        let scsi_disk = Arc::new(AtapiScsiDisk::new(dvd.0));
+                        ide::DriveMedia::optical_disk(scsi_disk.clone())
                     }
                     GuestMedia::Disk {
                         disk_type,
@@ -2350,7 +1903,11 @@ impl InitializedVm {
                     .replace(media);
 
                 if old_media.is_some() {
-                    return Err(duplicate_ide_drive_error(path.channel, path.drive));
+                    anyhow::bail!(
+                        "ide drive {}:{} is already in use",
+                        path.channel,
+                        path.drive
+                    );
                 }
             }
         }
@@ -2376,13 +1933,11 @@ impl InitializedVm {
             };
 
             // Add callbacks
-            base_watchdog_platform
-                .add_callback(Box::new(watchdog_callback) as Box<dyn WatchdogCallback>);
+            base_watchdog_platform.add_callback(Box::new(watchdog_callback));
 
-            resolver
-                .add_resolver(StaticWatchdogPlatformResolver::new(
-                    Box::new(base_watchdog_platform) as Box<dyn WatchdogPlatform>,
-                ));
+            resolver.add_resolver(StaticWatchdogPlatformResolver::new(Box::new(
+                base_watchdog_platform,
+            )));
         }
 
         let initial_rtc_cmos = if matches!(cfg.load_mode, LoadMode::Pcat { .. }) {
@@ -2425,16 +1980,14 @@ impl InitializedVm {
                 let disk = open_simple_disk(&resolver, disk_type, read_only, &driver_source)
                     .await
                     .context("failed to open floppy disk")?;
-                #[cfg(not(verus_verify_core))]
-                trace_floppy_opened();
+                tracing::trace!("floppy opened based on config into DriveRibbon");
 
                 if index == 0 {
                     pri_drives.push(disk);
                 } else if index == 1 {
                     sec_drives.push(disk)
                 } else {
-                    #[cfg(not(verus_verify_core))]
-                    trace_too_many_floppy_controllers();
+                    tracing::error!("more than 2 floppy controllers are not supported");
                     break;
                 }
             }
@@ -2524,8 +2077,7 @@ impl InitializedVm {
             }
         });
 
-        let primary_channel_drives = std::mem::take(&mut ide_drives[0]);
-        let secondary_channel_drives = std::mem::take(&mut ide_drives[1]);
+        let [primary_channel_drives, secondary_channel_drives] = ide_drives;
         let deps_hyperv_ide = (cfg.chipset.with_hyperv_ide).then_some(dev::HyperVIdeDeps {
             attached_to: pci_bus_id_piix4.clone(),
             primary_channel_drives,
@@ -2554,7 +2106,21 @@ impl InitializedVm {
             chipset_builder,
             device_interfaces: base_chipset_device_interfaces,
         } = BaseChipsetBuilder::new(
-            base_chipset_foundation(&gm, &halt_vps, &vmtime_source, vmtime.handle(), &partition),
+            BaseChipsetFoundation {
+                is_restoring: false,
+                untrusted_dma_memory: gm.clone(),
+                // There is no access to encrypted memory on the host, so this
+                // may be misleading. Presumably in any confidential VM
+                // scenario, devices using this will not be present or will be
+                // implemented by a paravisor. But it still must be set for
+                // non-confidential scenarios.
+                trusted_vtl0_dma_memory: gm.clone(),
+                power_event_handler: halt_vps.clone(),
+                debug_event_handler: halt_vps.clone(),
+                vmtime: &vmtime_source,
+                vmtime_unit: vmtime.handle(),
+                doorbell_registration: partition.clone().into_doorbell_registration(Vtl::Vtl0),
+            },
             base_chipset_devices,
         )
         .with_expected_manifest(cfg.chipset.clone())
@@ -2570,7 +2136,16 @@ impl InitializedVm {
             // put on the PCI bus, so we just fake one.
             //
             // This seems to appease Linux just fine
-            add_fake_pci_bus_root(&chipset_builder, pci_bus_id_generic.clone())?;
+            chipset_builder
+                .arc_mutex_device("fake-bus-root")
+                .on_pci_bus(pci_bus_id_generic.clone())
+                .add(|services| {
+                    missing_dev::MissingDev::from_manifest(
+                        MissingDevManifest::new().claim_pci((0, 0, 0), 0x8086, 0x7111),
+                        &mut services.register_mmio(),
+                        &mut services.register_pio(),
+                    )
+                })?;
         }
 
         // Add the GIC.
@@ -2581,32 +2156,38 @@ impl InitializedVm {
             *vmm_core::emuplat::gic::SPI_RANGE.start(),
             "gic",
             Arc::new(vmm_core::emuplat::gic::GicInterruptTarget::new(
-                clone_hvlite_partition(&partition).control_gic(Vtl::Vtl0),
+                partition.clone().control_gic(Vtl::Vtl0),
             )),
         );
 
         // Add the x86 BSP's LINTs for the PIC to use.
         #[cfg(guest_arch = "x86_64")]
-        add_bsp_lint_target(&chipset_builder, &partition);
+        chipset_builder.add_external_line_target(
+            chipset_device_resources::BSP_LINT_LINE_SET,
+            0..=1,
+            0,
+            "bsp",
+            partition.clone().into_lint_target(Vtl::Vtl0),
+        );
 
         if let Some(framebuffer) = base_chipset_device_interfaces.framebuffer_local_control {
             resolver.add_resolver(framebuffer);
         }
 
         let pci_inta_line = {
-            let pci_legacy_inta_irq = 11u32;
-            let pci_inta_irq = 16u32;
+            const PCI_LEGACY_INTA_IRQ: u32 = 11;
+            const PCI_INTA_IRQ: u32 = 16;
             if cfg.chipset_capabilities.with_i440bx_host_pci_bridge {
                 // Hyper-V hard-wires this to 11.
-                Some(pci_legacy_inta_irq)
+                Some(PCI_LEGACY_INTA_IRQ)
             } else if cfg.chipset.with_generic_pci_bus {
                 // Avoid an ISA interrupt to avoid conflicts and to avoid needing to
                 // configure the line as level-triggered in the MADT (necessary for
                 // Linux when the PIC is missing).
                 if cfg.chipset_capabilities.with_pic {
-                    Some(pci_legacy_inta_irq)
+                    Some(PCI_LEGACY_INTA_IRQ)
                 } else {
-                    Some(pci_inta_irq)
+                    Some(PCI_INTA_IRQ)
                 }
             } else {
                 None
@@ -2628,6 +2209,12 @@ impl InitializedVm {
         // Deferred MSI connections for root complexes and switches.
         // These are wired after IOMMU setup so that interrupt remapping
         // can be applied when an AMD IOMMU covers the root complex.
+        struct DeferredMsiConn {
+            msi_conn: pci_core::msi::MsiConnection,
+            segment: u16,
+            #[cfg_attr(not(guest_arch = "x86_64"), expect(dead_code))]
+            rc_idx: usize,
+        }
         let mut deferred_msi_conns: Vec<DeferredMsiConn> = Vec::new();
 
         let (mut pcie_host_bridges, pcie_root_complexes) = {
@@ -2651,12 +2238,13 @@ impl InitializedVm {
                         .checked_mul(CXL_COMPONENT_REGISTERS_SIZE_BYTES)
                         .context("cxl component register size overflow")?;
                     if ranges.high_mmio.len() < required_cxl_component_bar_mmio {
-                        return Err(invalid_cxl_mmio_error(
-                            &rc.name,
+                        anyhow::bail!(
+                            "invalid CXL root complex '{}': high MMIO range {:#x} is too small for {} CXL root-port BAR apertures (requires {:#x})",
+                            rc.name,
                             ranges.high_mmio.len(),
                             cxl_port_count,
-                            required_cxl_component_bar_mmio,
-                        ));
+                            required_cxl_component_bar_mmio
+                        );
                     }
                 }
 
@@ -2665,14 +2253,20 @@ impl InitializedVm {
 
                 if cxl_port_count != 0 {
                     if cxl_config.is_none() {
-                        return Err(cxl_ports_require_ranges_error(&rc.name));
+                        anyhow::bail!(
+                            "invalid CXL root complex '{}': CXL-capable root ports require both CHBCR and HDM ranges",
+                            rc.name
+                        );
                     }
                     if hdm_range.is_none() || chbcr_range.is_none() {
-                        return Err(cxl_ranges_unresolved_error(&rc.name));
+                        anyhow::bail!(
+                            "invalid CXL root complex '{}': configured CXL CHBCR/HDM ranges were not resolved",
+                            rc.name
+                        );
                     }
                 }
 
-                let device_name = pcie_root_device_name(&rc.name);
+                let device_name = format!("pcie-root:{}", rc.name);
 
                 // Create a static bus range for the root complex so that
                 // root port MSI targets can lazily resolve their BDF as
@@ -2799,6 +2393,11 @@ impl InitializedVm {
         // The segment is used for ITS device ID composition; the bus_range is
         // a shared atomic that the config space emulator updates when the
         // guest programs secondary/subordinate bus numbers.
+        struct PortInfo {
+            segment: u16,
+            bus_range: pci_core::bus_range::AssignedBusRange,
+            rc_idx: usize,
+        }
         let mut port_info: std::collections::HashMap<Arc<str>, PortInfo> =
             std::collections::HashMap::new();
         for (rc_idx, (hb, rc)) in pcie_host_bridges
@@ -2815,17 +2414,21 @@ impl InitializedVm {
                         rc_idx,
                     },
                 ) {
-                    return Err(duplicate_pcie_port_error(&p.name));
+                    anyhow::bail!("duplicate PCIe port name '{}'", p.name);
                 }
             }
         }
 
         for switch in cfg.pcie_switches {
-            let device_name = pcie_switch_device_name(&switch.name);
+            let device_name = format!("pcie-switch:{}", switch.name);
 
             // Inherit the segment and RC index from the switch's parent port.
             let parent_port_info = port_info.get(switch.parent_port.as_str()).ok_or_else(|| {
-                missing_pcie_switch_parent_error(&switch.name, &switch.parent_port)
+                anyhow::anyhow!(
+                    "switch '{}' parent port '{}' not found in any root complex",
+                    switch.name,
+                    switch.parent_port
+                )
             })?;
             let parent_segment = parent_port_info.segment;
             let parent_rc_idx = parent_port_info.rc_idx;
@@ -2869,7 +2472,7 @@ impl InitializedVm {
                         rc_idx: parent_rc_idx,
                     },
                 ) {
-                    return Err(duplicate_pcie_port_error(&p.name));
+                    anyhow::bail!("duplicate PCIe port name '{}'", p.name);
                 }
             }
 
@@ -2890,15 +2493,18 @@ impl InitializedVm {
         let mut generic_initiator_sources = Vec::new();
         for gi in &cfg.pcie_generic_initiators {
             if gi.node >= num_nodes {
-                return Err(invalid_generic_initiator_node_error(
-                    &gi.port_name,
-                    gi.node,
-                    num_nodes,
-                ));
+                anyhow::bail!(
+                    "PCIe generic initiator port '{}' references NUMA node {} which does not exist (num_nodes={num_nodes})",
+                    gi.port_name,
+                    gi.node
+                );
             }
-            let pi = port_info
-                .get(gi.port_name.as_str())
-                .ok_or_else(|| missing_generic_initiator_port_error(&gi.port_name))?;
+            let pi = port_info.get(gi.port_name.as_str()).with_context(|| {
+                format!(
+                    "generic initiator port '{}' not found in PCIe topology",
+                    gi.port_name
+                )
+            })?;
 
             // A generic initiator's SRAT entry references its device by a fixed
             // segment/bus/device/function. If the guest re-enumerates PCIe and
@@ -3035,8 +2641,10 @@ impl InitializedVm {
             IommuDevices::None => None,
         };
         #[cfg(guest_arch = "x86_64")]
-        let ioapic_iommu_rid: Option<u16> =
-            ioapic_iommu.map(|selection| ioapic_routing.connect_selection(selection));
+        let ioapic_iommu_rid: Option<u16> = ioapic_iommu.map(|sel| {
+            ioapic_routing.connect_remapper(sel.ioapic_rid, sel.remapper.clone());
+            sel.ioapic_rid
+        });
 
         // Wire deferred root complex and switch MSI connections now that
         // IOMMU setup is complete. On x86_64, this applies IOMMU
@@ -3067,18 +2675,64 @@ impl InitializedVm {
         // IOVAs using the port's assigned bus range and remap MSIs using
         // the requester ID supplied by the PCI MSI path.
 
-        build_configured_pcie_devices(
-            cfg.pcie_devices,
-            &chipset_builder,
-            &driver_source,
-            &resolver,
-            &gm,
-            &partition,
-            &mapper,
-            &port_info,
-            &processor_topology,
-            &iommu_devices,
-        )
+        try_join_all(cfg.pcie_devices.into_iter().map(|dev_cfg| {
+            let chipset_builder = &chipset_builder;
+            let driver_source = &driver_source;
+            let resolver = &resolver;
+            let gm = &gm;
+            let partition = &partition;
+            let mapper = &mapper;
+            let port_info = &port_info;
+            let processor_topology = &processor_topology;
+            let iommu_devices = &iommu_devices;
+            async move {
+                let port_name: Arc<str> = dev_cfg.port_name.into();
+                let pi = port_info.get(&port_name).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "device port '{}' not found in any root complex or switch",
+                        port_name
+                    )
+                })?;
+
+                let msi_conn = pci_core::msi::MsiConnection::new();
+
+                let pcie_ctx =
+                    pcie_wiring::build_device_wiring(pcie_wiring::PcieDeviceWiringParams {
+                        msi_platform: pcie_wiring::PcieMsiPlatform {
+                            partition: partition.as_ref(),
+                            segment: pi.segment,
+                            processor_topology,
+                            #[cfg(guest_arch = "x86_64")]
+                            iommu: x86_iommu_for_rc(iommu_devices, pi.rc_idx),
+                        },
+                        guest_memory: gm,
+                        bus_range: &pi.bus_range,
+                        msi: &msi_conn,
+                        #[cfg(guest_arch = "aarch64")]
+                        smmu: smmu_for_rc(iommu_devices, pi.rc_idx),
+                    });
+
+                vmm_core::device_builder::build_pcie_device(
+                    vmm_core::device_builder::PciDeviceResolveContext {
+                        driver_source,
+                        resolver,
+                        resource: dev_cfg.resource,
+                        doorbell_registration: partition
+                            .clone()
+                            .into_doorbell_registration(Vtl::Vtl0),
+                        shared_mem_mapper: Some(mapper),
+                    },
+                    chipset_builder,
+                    port_name.clone(),
+                    &pcie_ctx.dma_target,
+                )
+                .await?;
+
+                pcie_ctx.connect_to(&msi_conn);
+
+                anyhow::Ok(())
+            }
+        }))
         .await?;
 
         if let Some(vmbus_cfg) = cfg.vmbus {
@@ -3101,15 +2755,16 @@ impl InitializedVm {
                     .map(vmbus_core::MaxVersionInfo::new);
 
                 let vmbus_driver = driver_source.simple();
-                let vtl2_vmbus = vmbus_server_builder(vmbus_driver.clone(), &synic, gm.clone())
-                    .vtl(Vtl::Vtl2)
-                    .max_version(vtl2_max_version)
-                    .max_restore_version(vtl2_max_version)
-                    .hvsock_notify(Some(vtl2_hvsock_channel.server_half))
-                    .external_requests(Some(server_request_recv))
-                    .enable_mnf(true)
-                    .build()
-                    .context("failed to create VTL2 vmbus server")?;
+                let vtl2_vmbus =
+                    VmbusServer::builder(vmbus_driver.clone(), synic.clone(), gm.clone())
+                        .vtl(Vtl::Vtl2)
+                        .max_version(vtl2_max_version)
+                        .max_restore_version(vtl2_max_version)
+                        .hvsock_notify(Some(vtl2_hvsock_channel.server_half))
+                        .external_requests(Some(server_request_recv))
+                        .enable_mnf(true)
+                        .build()
+                        .context("failed to create VTL2 vmbus server")?;
 
                 let vtl2_vmbus = VmbusServerHandle::new(
                     &vmbus_driver,
@@ -3138,7 +2793,7 @@ impl InitializedVm {
                 .vmbus_max_version
                 .map(vmbus_core::MaxVersionInfo::new);
             let vmbus_driver = driver_source.simple();
-            let vmbus = vmbus_server_builder(vmbus_driver.clone(), &synic, gm.clone())
+            let vmbus = VmbusServer::builder(vmbus_driver.clone(), synic.clone(), gm.clone())
                 .hvsock_notify(Some(hvsock_channel.server_half))
                 .external_server(vtl2_request_send)
                 .use_message_redirect(vmbus_cfg.vtl2_redirect)
@@ -3264,7 +2919,20 @@ impl InitializedVm {
                                 .context("vpci device vnode exceeds 65535")?,
                         },
                         gm.clone(),
-                        |device_id| new_vpci_device_interfaces(&partition, dev_cfg.vtl, device_id),
+                        |device_id| {
+                            let hv_device = partition.new_virtual_device(
+                                match dev_cfg.vtl {
+                                    DeviceVtl::Vtl0 => Vtl::Vtl0,
+                                    DeviceVtl::Vtl1 => Vtl::Vtl1,
+                                    DeviceVtl::Vtl2 => Vtl::Vtl2,
+                                },
+                                device_id,
+                            )?;
+                            Ok((
+                                hv_device.clone().target(),
+                                hv_device.clone().interrupt_mapper(),
+                            ))
+                        },
                     )
                     .await?;
                 }
@@ -3328,12 +2996,12 @@ impl InitializedVm {
                 DeviceVtl::Vtl0 => vmbus_server
                     .as_ref()
                     .context("failed to find vmbus for vtl0"),
-                DeviceVtl::Vtl1 => return Err(unsupported_vtl1_scsi_error()),
+                DeviceVtl::Vtl1 => anyhow::bail!("vtl1 scsi controllers unsupported"),
                 DeviceVtl::Vtl2 => vtl2_vmbus_server
                     .as_ref()
                     .context("failed to find vmbus for vtl2"),
             }
-            .with_context(|| failed_vmbus_resource_context(resource.id()))?;
+            .with_context(|| format!("failed to resolve vmbus resource {}", resource.id()))?;
             vmbus_devices.push(
                 offer_vmbus_device_handle_unit(
                     &driver_source,
@@ -3359,12 +3027,12 @@ impl InitializedVm {
         // configure the line as level-triggered in the MADT (necessary for
         // Linux when the PIC is missing).
         let virtio_mmio_irq = {
-            let virtio_mmio_ioapic_irq = 17u32;
-            let virtio_mmio_pic_irq = 5u32;
+            const VIRTIO_MMIO_IOAPIC_IRQ: u32 = 17;
+            const VIRTIO_MMIO_PIC_IRQ: u32 = 5;
             if cfg.chipset_capabilities.with_pic {
-                virtio_mmio_pic_irq
+                VIRTIO_MMIO_PIC_IRQ
             } else {
-                virtio_mmio_ioapic_irq
+                VIRTIO_MMIO_IOAPIC_IRQ
             }
         };
         for (bus, device) in cfg.virtio_devices.into_iter() {
@@ -3411,18 +3079,22 @@ impl InitializedVm {
                                     )?;
                                     (block.role.mmio_base(), block.role.irq())
                                 }
-                                _ => return Err(unsupported_microvm_abi_error()),
+                                _ => anyhow::bail!(
+                                    "unsupported microVM ABI reached worker construction"
+                                ),
                             },
-                            _ => return Err(unsupported_microvm_virtio_device_error(&id)),
+                            _ => anyhow::bail!(
+                                "unsupported microVM virtio device '{id}' reached worker construction"
+                            ),
                         };
                         let len = openvmm_defs::config::MICROVM_VIRTIO_MMIO_LEN;
-                        if !(start >= chipset_mmio.low.start()
-                            && start
-                                .checked_add(len)
-                                .is_some_and(|end| end <= chipset_mmio.low.end()))
-                        {
-                            return Err(microvm_virtio_slot_error(&id));
-                        }
+                        anyhow::ensure!(
+                            start >= chipset_mmio.low.start()
+                                && start
+                                    .checked_add(len)
+                                    .is_some_and(|end| end <= chipset_mmio.low.end()),
+                            "microVM virtio slot for '{id}' is outside the fixed low-MMIO aperture"
+                        );
                         let disabled_features = match id.as_str() {
                             "virtio-net" => !openvmm_defs::config::MICROVM_VIRTIO_NET_FEATURES,
                             "virtiofs" => !openvmm_defs::config::MICROVM_VIRTIO_FS_FEATURES,
@@ -3449,7 +3121,7 @@ impl InitializedVm {
                         virtio_mmio_index += 1;
                         (start, 0x1000, virtio_mmio_irq, 0)
                     };
-                    let id = virtio_mmio_device_name(&id, mmio_start);
+                    let id = format!("{id}-{mmio_start}");
                     let gm = gm.clone();
                     chipset_builder.arc_mutex_device(id).try_add(|services| {
                         VirtioMmioDevice::new_with_disabled_features(
@@ -3457,8 +3129,7 @@ impl InitializedVm {
                             &driver_source.simple(),
                             gm,
                             services.new_line(IRQ_LINE_SET, "interrupt", irq),
-                            clone_hvlite_partition(&partition)
-                                .into_doorbell_registration(Vtl::Vtl0),
+                            partition.clone().into_doorbell_registration(Vtl::Vtl0),
                             mmio_start,
                             mmio_len,
                             disabled_features,
@@ -3479,7 +3150,7 @@ impl InitializedVm {
                     };
 
                     chipset_builder
-                        .arc_mutex_device(virtio_pci_device_name(&id))
+                        .arc_mutex_device(format!("{id}-pci"))
                         .with_pci_addr(0, device_number, 0)
                         .on_pci_bus(bus)
                         .try_add(|services| {
@@ -3491,8 +3162,7 @@ impl InitializedVm {
                                     PciInterruptPin::IntA,
                                     services.new_line(IRQ_LINE_SET, "interrupt", pci_inta_line),
                                 ),
-                                clone_hvlite_partition(&partition)
-                                    .into_doorbell_registration(Vtl::Vtl0),
+                                partition.clone().into_doorbell_registration(Vtl::Vtl0),
                                 &mut services.register_mmio(),
                                 Some(&mapper),
                             )
@@ -3502,13 +3172,16 @@ impl InitializedVm {
         }
 
         let (chipset, devices) = chipset_builder.build()?;
-        // TODO: Support the fatal-error policy being a command-line option.
-        let (chipset, _fatal_error_recv) = adapt_chipset_with_debug_break(chipset);
+        let (fatal_error_send, _fatal_error_recv) = mesh::channel();
+        let chipset = vmm_core::vmotherboard_adapter::AdaptedChipset::new(
+            chipset,
+            // TODO: Support this being a cmd line option
+            vmm_core::vmotherboard_adapter::FatalErrorPolicy::DebugBreak(fatal_error_send),
+        );
 
         // create a new channel to intercept guest resets
         let (halt_send, halt_recv) = mesh::channel();
 
-        #[cfg(not(verus_verify_core))]
         let partition_unit_create = openvmm_defs::profile::ProfileSpan::start();
         let (partition_unit, vp_runners) = PartitionUnit::new(
             driver_source.simple(),
@@ -3516,7 +3189,7 @@ impl InitializedVm {
                 .add("partition")
                 .depends_on(devices.chipset_unit())
                 .depends_on(vmtime.handle()),
-            clone_hvlite_partition(&partition).into_vm_partition(),
+            partition.clone().into_vm_partition(),
             PartitionUnitParams {
                 processor_topology: &processor_topology,
                 active_vp_count: Some(instantiated_vp_count),
@@ -3532,14 +3205,54 @@ impl InitializedVm {
             },
         )
         .context("failed to create partition unit")?;
-        #[cfg(not(verus_verify_core))]
         partition_unit_create.complete("startup", "partition_unit_create", Default::default());
 
         // Start the VP backing threads.
-        #[cfg(not(verus_verify_core))]
         let vp_thread_bind = openvmm_defs::profile::ProfileSpan::start();
-        bind_vp_threads(vps, vp_runners, &partition, &chipset).await?;
-        #[cfg(not(verus_verify_core))]
+        try_join_all(vps.into_iter().zip(vp_runners).enumerate().map(
+            |(vp_index, (mut vp, runner))| {
+                let partition = partition.clone();
+                let chipset = chipset.clone();
+                let (send, recv) = mesh::oneshot();
+                thread::Builder::new()
+                    .name(format!("vp-{}", vp_index))
+                    .spawn(move || {
+                        let vp_bind = openvmm_defs::profile::ProfileSpan::start();
+                        let bind_result = vp.bind();
+                        if vp_index == 0 {
+                            vp_bind.complete_milestone(
+                                "startup",
+                                "vp_bind_bsp",
+                                Default::default(),
+                            );
+                        } else if openvmm_defs::profile::enabled() {
+                            let phase = format!("vp_bind_ap_{vp_index}");
+                            vp_bind.complete_milestone("startup", &phase, Default::default());
+                        }
+                        match bind_result {
+                            Ok(mut vp) => {
+                                send.send(Ok(()));
+                                block_on_vp(
+                                    partition,
+                                    VpIndex::new(vp_index as u32),
+                                    vp.run(runner, &chipset),
+                                )
+                            }
+                            Err(err) => {
+                                send.send(Err(err));
+                            }
+                        }
+                    })
+                    .unwrap();
+
+                async move {
+                    recv.await
+                        .unwrap()
+                        .with_context(|| format!("failed to bind vp {vp_index}"))
+                }
+            },
+        ))
+        .await?;
         vp_thread_bind.complete("startup", "vp_thread_bind", Default::default());
 
         let mut this = LoadedVm {
@@ -3561,7 +3274,7 @@ impl InitializedVm {
                 driver_source,
                 resolver,
                 partition_unit,
-                partition: hvlite_partition_handle(&partition),
+                partition,
                 chipset_devices: devices,
                 _vmtime: vmtime,
                 memory_manager,
@@ -3613,85 +3326,8 @@ impl InitializedVm {
         };
 
         if let Some(saved_state) = saved_state {
-            if let Some((_, saved_frequency, saved_apic_frequency)) = restore_time {
-                let destination_frequency = this
-                    .inner
-                    .partition
-                    .tsc_frequency_hz()?
-                    .context("destination backend does not expose a guest TSC frequency")?;
-                if destination_frequency != saved_frequency {
-                    return Err(tsc_frequency_mismatch_error(
-                        destination_frequency,
-                        saved_frequency,
-                    ));
-                }
-                this.inner.partition.set_tsc_frequency_hz(saved_frequency)?;
-                let destination_apic_frequency = this
-                    .inner
-                    .partition
-                    .apic_frequency_hz()?
-                    .context("destination backend does not expose a local APIC frequency")?;
-                if let Some(saved_apic_frequency) = saved_apic_frequency {
-                    if destination_apic_frequency != saved_apic_frequency {
-                        return Err(apic_frequency_mismatch_error(
-                            destination_apic_frequency,
-                            saved_apic_frequency,
-                        ));
-                    }
-                }
-            }
-            #[cfg(not(verus_verify_core))]
-            let saved_state_restore = openvmm_defs::profile::ProfileSpan::start();
-            this.restore(saved_state)
-                .await
-                .context("loadedvm restore failed")?;
-            #[cfg(not(verus_verify_core))]
-            saved_state_restore.complete("restore", "saved_state_restore", Default::default());
-            if let Some((downtime, frequency, saved_apic_frequency)) = restore_time {
-                #[cfg(not(verus_verify_core))]
-                let state_time_advance = openvmm_defs::profile::ProfileSpan::start();
-                this.state_units
-                    .advance_time(downtime)
-                    .await
-                    .context("failed to advance restored VM time")?;
-                #[cfg(not(verus_verify_core))]
-                state_time_advance.complete("restore", "state_time_advance", Default::default());
-                #[cfg(guest_arch = "x86_64")]
-                {
-                    let apic_frequency = match saved_apic_frequency {
-                        Some(frequency) => frequency,
-                        None => this.inner.partition.apic_frequency_hz()?.context(
-                            "destination backend does not expose a local APIC frequency",
-                        )?,
-                    };
-                    #[cfg(not(verus_verify_core))]
-                    let vp_tsc_advance = openvmm_defs::profile::ProfileSpan::start();
-                    this.inner
-                        .partition_unit
-                        .advance_tsc(downtime, frequency, Some(apic_frequency))
-                        .await
-                        .context("failed to advance restored vCPU TSC")?;
-                    #[cfg(not(verus_verify_core))]
-                    vp_tsc_advance.complete("restore", "vp_tsc_advance", Default::default());
-                }
-                #[cfg(not(verus_verify_core))]
-                let backend_time_advance = openvmm_defs::profile::ProfileSpan::start();
-                this.inner
-                    .partition
-                    .advance_snapshot_time(downtime)
-                    .context("failed to advance backend snapshot clock")?;
-                #[cfg(not(verus_verify_core))]
-                backend_time_advance.complete(
-                    "restore",
-                    "backend_time_advance",
-                    Default::default(),
-                );
-            }
-            #[cfg(not(verus_verify_core))]
-            let restore_vp_stop = openvmm_defs::profile::ProfileSpan::start();
-            this.restore_start_guard = Some(this.inner.partition_unit.temporarily_stop_vps().await);
-            #[cfg(not(verus_verify_core))]
-            restore_vp_stop.complete("restore", "restore_vp_stop", Default::default());
+            this.restore_snapshot_state(saved_state, restore_time)
+                .await?;
         } else {
             // Assign PCI bus numbers/BARs before building firmware so that the
             // ACPI tables (specifically the SRAT generic-initiator entries) can
@@ -4141,6 +3777,112 @@ impl LoadedVmInner {
 }
 
 impl LoadedVm {
+    /// Restores snapshot-owned state and returns with the guest still stopped.
+    ///
+    /// Destination construction and VP instantiation happen before this
+    /// boundary. This helper owns state-unit restore, permitted time
+    /// adjustments, and acquisition of the pre-execution restore guard.
+    // #[verus_verify]
+    #[cfg_attr(verus_keep_ghost, verus_spec(result =>
+        requires
+            restore_proof::decoded_restore_request_view(
+                &saved_state,
+                &restore_time,
+                old(self)@.active_vp_count,
+            ).valid_for_loaded_vm(old(self)@),
+        ensures
+            match result {
+                Ok(()) => (
+                    restore_spec::snapshot_restore_success(
+                        old(self)@,
+                        restore_proof::decoded_restore_request_view(
+                            &saved_state,
+                            &restore_time,
+                            old(self)@.active_vp_count,
+                        ),
+                        final(self)@,
+                    )
+                    && restore_proof::pre_execution_representation(final(self), true)
+                ),
+                Err(_) => true,
+            },
+    ))]
+    async fn restore_snapshot_state(
+        &mut self,
+        saved_state: SavedState,
+        restore_time: Option<(Duration, u64, Option<u64>)>,
+    ) -> anyhow::Result<()> {
+        if let Some((_, saved_frequency, saved_apic_frequency)) = restore_time {
+            let destination_frequency = self
+                .inner
+                .partition
+                .tsc_frequency_hz()?
+                .context("destination backend does not expose a guest TSC frequency")?;
+            anyhow::ensure!(
+                destination_frequency == saved_frequency,
+                "destination TSC frequency {destination_frequency} Hz does not match saved frequency {saved_frequency} Hz"
+            );
+            self.inner.partition.set_tsc_frequency_hz(saved_frequency)?;
+            let destination_apic_frequency = self
+                .inner
+                .partition
+                .apic_frequency_hz()?
+                .context("destination backend does not expose a local APIC frequency")?;
+            if let Some(saved_apic_frequency) = saved_apic_frequency {
+                anyhow::ensure!(
+                    destination_apic_frequency == saved_apic_frequency,
+                    "destination APIC frequency {destination_apic_frequency} Hz does not match saved frequency {saved_apic_frequency} Hz"
+                );
+            }
+        }
+
+        let saved_state_restore = openvmm_defs::profile::ProfileSpan::start();
+        self.restore(saved_state)
+            .await
+            .context("loadedvm restore failed")?;
+        saved_state_restore.complete("restore", "saved_state_restore", Default::default());
+
+        if let Some((downtime, frequency, saved_apic_frequency)) = restore_time {
+            let state_time_advance = openvmm_defs::profile::ProfileSpan::start();
+            self.state_units
+                .advance_time(downtime)
+                .await
+                .context("failed to advance restored VM time")?;
+            state_time_advance.complete("restore", "state_time_advance", Default::default());
+
+            #[cfg(guest_arch = "x86_64")]
+            {
+                let apic_frequency =
+                    match saved_apic_frequency {
+                        Some(frequency) => frequency,
+                        None => self.inner.partition.apic_frequency_hz()?.context(
+                            "destination backend does not expose a local APIC frequency",
+                        )?,
+                    };
+                let vp_tsc_advance = openvmm_defs::profile::ProfileSpan::start();
+                self.inner
+                    .partition_unit
+                    .advance_tsc(downtime, frequency, Some(apic_frequency))
+                    .await
+                    .context("failed to advance restored vCPU TSC")?;
+                vp_tsc_advance.complete("restore", "vp_tsc_advance", Default::default());
+            }
+
+            let backend_time_advance = openvmm_defs::profile::ProfileSpan::start();
+            self.inner
+                .partition
+                .advance_snapshot_time(downtime)
+                .context("failed to advance backend snapshot clock")?;
+            backend_time_advance.complete("restore", "backend_time_advance", Default::default());
+        }
+
+        let restore_vp_stop = openvmm_defs::profile::ProfileSpan::start();
+        self.restore_start_guard = Some(self.inner.partition_unit.temporarily_stop_vps().await);
+        restore_vp_stop.complete("restore", "restore_vp_stop", Default::default());
+
+        Ok(())
+    }
+
     fn publish_restore_ready(&mut self) -> anyhow::Result<()> {
         if let Some(mut sink) = self.restore_ready_sink.take() {
             sink.write_all(RESTORE_READY_EVENT_V1).and_then(|()| {
@@ -4822,7 +4564,7 @@ impl LoadedVm {
                                                 dma_target: &pcie_ctx.dma_target,
                                                 register_mmio,
                                                 driver_source: &self.inner.driver_source,
-                                                doorbell_registration: self.inner.partition.clone_arc().into_doorbell_registration(Vtl::Vtl0),
+                                                doorbell_registration: self.inner.partition.clone().into_doorbell_registration(Vtl::Vtl0),
                                                 shared_mem_mapper: None,
                                             },
                                         )
