@@ -63,6 +63,23 @@ pub struct BuildSelections {
     pub test_igvm_agent_rpc_server: bool,
 }
 
+fn append_windows_external_dependency_args(
+    args: &mut Vec<OsString>,
+    external_deps: &VmmTestsExternalDeps,
+) {
+    if let VmmTestsExternalDeps::Windows(deps) = external_deps {
+        if deps.hyperv {
+            args.push("--needs-hyperv".into());
+        }
+        if deps.whp {
+            args.push("--needs-whp".into());
+        }
+        if deps.hardware_isolation {
+            args.push("--needs-hardware-isolation".into());
+        }
+    }
+}
+
 flowey_request! {
     pub struct Params {
         pub target: CommonTriple,
@@ -760,12 +777,7 @@ impl SimpleFlowNode for Node {
                         run_target_args.push("--no-reuse-prepped-vhds".into());
                     }
 
-                    if matches!(
-                        external_deps,
-                        VmmTestsExternalDeps::Windows(ref deps) if deps.hardware_isolation
-                    ) {
-                        run_target_args.push("--needs-hardware-isolation".into());
-                    }
+                    append_windows_external_dependency_args(&mut run_target_args, &external_deps);
 
                     if build.test_igvm_agent_rpc_server {
                         run_target_args.push("--needs-igvm-agent".into());
@@ -865,4 +877,33 @@ pub(crate) fn init_artifacts_dir(
         ..Default::default()
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::install_vmm_tests_external_deps::VmmTestsExternalDepsWindows;
+    use test_with_tracing::test;
+
+    #[test]
+    fn target_args_include_selected_windows_external_dependencies() {
+        let mut args = Vec::new();
+        append_windows_external_dependency_args(
+            &mut args,
+            &VmmTestsExternalDeps::Windows(VmmTestsExternalDepsWindows {
+                hyperv: true,
+                whp: true,
+                hardware_isolation: true,
+            }),
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--needs-hyperv"),
+                OsString::from("--needs-whp"),
+                OsString::from("--needs-hardware-isolation"),
+            ]
+        );
+    }
 }

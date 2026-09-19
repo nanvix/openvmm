@@ -9,6 +9,7 @@ use crate::pipelines::vmm_tests_run::resolve_target;
 use anyhow::Context;
 use flowey::node::prelude::ReadVar;
 use flowey::pipeline::prelude::*;
+use flowey_lib_hvlite::common::CommonTriple;
 use flowey_lib_hvlite::init_vmm_tests_env::PetriParams;
 use flowey_lib_hvlite::install_vmm_tests_external_deps::VmmTestsExternalDeps;
 use flowey_lib_hvlite::install_vmm_tests_external_deps::VmmTestsExternalDepsLinux;
@@ -63,6 +64,14 @@ pub struct VmmTestsRunTargetCli {
     #[clap(long)]
     no_reuse_prepped_vhds: bool,
 
+    /// Whether the tests selected require Hyper-V
+    #[clap(long)]
+    needs_hyperv: bool,
+
+    /// Whether the tests selected require WHP
+    #[clap(long)]
+    needs_whp: bool,
+
     /// Whether the tests selected require hardware isolation
     #[clap(long)]
     needs_hardware_isolation: bool,
@@ -79,6 +88,30 @@ pub struct VmmTestsRunTargetCli {
     #[clap(long, num_args = 0..=1)]
     #[expect(clippy::option_option)]
     incubator: Option<Option<PathBuf>>,
+}
+
+fn external_deps_for_target(
+    target: &CommonTriple,
+    needs_hyperv: bool,
+    needs_whp: bool,
+    needs_hardware_isolation: bool,
+) -> VmmTestsExternalDeps {
+    match target.as_triple().operating_system {
+        target_lexicon::OperatingSystem::Windows => {
+            VmmTestsExternalDeps::Windows(VmmTestsExternalDepsWindows {
+                hyperv: needs_hyperv,
+                whp: needs_whp,
+                hardware_isolation: needs_hardware_isolation,
+            })
+        }
+        target_lexicon::OperatingSystem::Linux => {
+            VmmTestsExternalDeps::Linux(VmmTestsExternalDepsLinux {
+                hugetlb_2mb_overcommit_pages: None, // TODO
+                prepare_vhost_vsock: false,         // TODO
+            })
+        }
+        _ => unreachable!(),
+    }
 }
 
 impl IntoPipeline for VmmTestsRunTargetCli {
@@ -98,6 +131,8 @@ impl IntoPipeline for VmmTestsRunTargetCli {
             skip_vhd_prompt,
             ci_profile,
             no_reuse_prepped_vhds,
+            needs_hyperv,
+            needs_whp,
             needs_hardware_isolation,
             needs_igvm_agent,
             repetitions,
@@ -119,22 +154,8 @@ impl IntoPipeline for VmmTestsRunTargetCli {
             .map(|i| resolve_incubator(i, &target))
             .transpose()?;
 
-        let external_deps = match target.as_triple().operating_system {
-            target_lexicon::OperatingSystem::Windows => {
-                VmmTestsExternalDeps::Windows(VmmTestsExternalDepsWindows {
-                    hyperv: true, // TODO
-                    whp: true,    // TODO
-                    hardware_isolation: needs_hardware_isolation,
-                })
-            }
-            target_lexicon::OperatingSystem::Linux => {
-                VmmTestsExternalDeps::Linux(VmmTestsExternalDepsLinux {
-                    hugetlb_2mb_overcommit_pages: None, // TODO
-                    prepare_vhost_vsock: false,         // TODO
-                })
-            }
-            _ => unreachable!(),
-        };
+        let external_deps =
+            external_deps_for_target(&target, needs_hyperv, needs_whp, needs_hardware_isolation);
 
         let mut pipeline = Pipeline::new();
 
@@ -187,5 +208,23 @@ impl IntoPipeline for VmmTestsRunTargetCli {
         job.finish();
 
         Ok(pipeline)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn windows_external_deps_follow_selected_backends() {
+        assert_eq!(
+            external_deps_for_target(&CommonTriple::X86_64_WINDOWS_MSVC, false, true, false,),
+            VmmTestsExternalDeps::Windows(VmmTestsExternalDepsWindows {
+                hyperv: false,
+                whp: true,
+                hardware_isolation: false,
+            })
+        );
     }
 }
