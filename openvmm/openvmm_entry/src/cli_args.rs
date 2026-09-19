@@ -1991,14 +1991,13 @@ impl Options {
             !self.hv
                 && !self.vtl2
                 && self.isolation.is_none()
-                && !self.nested_virt
                 && !self.get
                 && !self.vmbus_redirect
                 && self.vmbus_vsock_path.is_none()
                 && self.vmbus_vtl2_vsock_path.is_none()
                 && self.openhcl_dump_path.is_none()
                 && self.gdb.is_none(),
-            "microVM does not support Hyper-V, VTL2, isolation, nested virtualization, GET, or VMBus"
+            "microVM does not support Hyper-V, VTL2, isolation, GET, or VMBus"
         );
         if let Some(hypervisor) = self.hypervisor.as_deref() {
             let name = hypervisor.split(':').next().unwrap_or(hypervisor);
@@ -6425,6 +6424,14 @@ mod tests {
                 &processors.to_string(),
             ])
             .unwrap();
+            options.validate_microvm_options().unwrap();
+        }
+
+        #[test]
+        fn test_microvm_accepts_nested_virtualization() {
+            let options =
+                Options::try_parse_from(["openvmm", "--machine", "microvm", "--nested-virt"])
+                    .unwrap();
             options.validate_microvm_options().unwrap();
         }
 
