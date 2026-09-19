@@ -1166,9 +1166,8 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
     anyhow::ensure!(
         !config.hypervisor.with_hv
             && config.hypervisor.with_vtl2.is_none()
-            && config.hypervisor.with_isolation.is_none()
-            && !config.hypervisor.nested_virt,
-        "microVM does not support Hyper-V enlightenments, VTL2, isolation, or nested virtualization"
+            && config.hypervisor.with_isolation.is_none(),
+        "microVM does not support Hyper-V enlightenments, VTL2, or isolation"
     );
 
     let expected_chipset = BaseChipsetManifest {

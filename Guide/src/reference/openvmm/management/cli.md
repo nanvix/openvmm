@@ -57,9 +57,10 @@ describes the source definitions.
   expose a live control endpoint. Both consoles
   remain virtio-console devices from the guest's perspective. Ordinary
   `--virtio-blk` is rejected. All use split rings. Firmware, ACPI, SMBIOS, PCI,
-  VMBus, UARTs, graphics, isolation, nested virtualization, and other devices
-  are rejected. Host-driven save/restore, pulse-save/restore, and worker
-  restart remain unavailable.
+  VMBus, UARTs, graphics, isolation, and other devices are rejected. Nested
+  virtualization is available through `--nested-virt` on supported backends.
+  Host-driven save/restore, pulse-save/restore, and worker restart remain
+  unavailable.
 
   `microvm` may also expose a dedicated control virtio-console at MMIO
   `0xd0007000`, IRQ 3. It requires the boot virtio-console, preserves
