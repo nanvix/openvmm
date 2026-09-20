@@ -4,11 +4,11 @@
 
 ## Trigger and execution
 
-The workflow runs on published releases or manual dispatch, never on push or pull requests. It checks out control code from trusted `main`, resolves the selected release to an immutable commit, and runs the target code only in the bounded runtime.
+The workflow runs on published releases or manual dispatch, never on push or pull requests. Manual dispatch is restricted to `refs/heads/main`; release events still use their release tags. It checks out control code from trusted `main`, resolves the selected release to an immutable commit, and runs the target code only in the bounded runtime.
 
 With an existing compatible baseline, the default operation is native incremental verification. On the first invocation, the configured `bootstrap_revision` and pinned `initialization_seed` prepare a compatible baseline through native `--ci-init --byom`; the same invocation then incrementally verifies the requested release. Retained analysis, models and harnesses are reused, not discarded. Bootstrap completion alone is not a verification result for the requested release.
 
-The bootstrap request has a stable identity. An interrupted bootstrap resumes its recorded native run rather than starting another initialization. Provider holds, unresolved-runtime checks and saved retry budgets still apply. Incomplete target incrementals require explicit `resume` with the same release and native run ID.
+The bootstrap request has a stable identity. An interrupted bootstrap resumes its recorded native run rather than starting another initialization. Provider holds, unresolved-runtime checks and saved retry budgets still apply. Incomplete target incrementals require explicit `resume` with the same release and native run ID. This gate applies across request IDs and later releases for the same target, including timeout, OOM and completed-but-unpublished runs; creating another Actions dispatch does not discard pending work.
 
 The bootstrap revision must be an ancestor of the selected release. Existing incompatible baselines are not overwritten, and source identities are never relabeled. After a future history rewrite, an operator must deliberately update the bootstrap configuration and select a separate store.
 
@@ -27,6 +27,8 @@ The bootstrap revision must be an ancestor of the selected release. Existing inc
 | Execution consent | Owner-only `/mnt/data/openvmm-verification/private/specula-execution-authorization.json` |
 
 Do not register, relabel, modify or repurpose the existing NVX runner. Provision the dedicated runner separately with permission to manage repository runners. The available API access cannot inspect/register runners, so runner availability is not asserted by this change. Use a runner version compatible with the pinned checkout and artifact actions.
+
+The manual-dispatch job condition prevents selecting another ref in this workflow; it is not a boundary against someone who can modify the workflow itself. Runner administrators must restrict access to trusted repositories and, where available, trusted workflows/refs through runner-group policy. Runner labels and checking out `main` alone do not provide that restriction.
 
 The runtime, fixtures, seed and filesystem permissions must be provisioned before use; the workflow does not install packages, build images, register runners or use `sudo`. Authorized host provisioning can use:
 

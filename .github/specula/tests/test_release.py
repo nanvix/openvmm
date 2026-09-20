@@ -250,6 +250,41 @@ class ReleaseTests(unittest.TestCase):
                 self.assertFalse(record["complete"])
                 self.assertEqual(self.config["_current"], previous)
                 self.assertFalse(any(name == "promote" for name, _ in self.config["_calls"]))
+                self.config.pop("_runtime_status")
+                self.config.pop("_exit_code")
+                code, _, _ = self.run_request(self.request(
+                    "resume", request_id=status + "-resume", run_id=record["native_run"]))
+                self.assertEqual(code, 0)
+
+    def test_pending_target_blocks_new_requests_until_matching_resume(self):
+        for status, exit_code in (("native_incomplete", 1), ("wrapper_oom", 137),
+                                  ("wrapper_timeout", 124), ("wrapper_interrupted", 130)):
+            with self.subTest(status=status):
+                self.baseline()
+                self.config.update(_runtime_status=status, _exit_code=exit_code, _calls=[])
+                _, public, original = self.run_request(
+                    self.request(tag="v1", request_id=status))
+                self.config.pop("_runtime_status")
+                self.config.pop("_exit_code")
+                for mode in ("incremental", "preflight"):
+                    code, _, blocked = self.run_request(
+                        self.request(mode, request_id=status + "-" + mode))
+                    self.assertNotEqual(code, 0)
+                    self.assertEqual(blocked["status"], "resume_required")
+                    self.assertIn(original["native_run"], blocked["error"])
+                    self.assertIn(self.a, blocked["error"])
+                self.assertEqual(sum(name == "native" for name, _ in self.config["_calls"]), 1)
+                self.assertEqual(release.read_json(public / "result.json"), original)
+                code, _, completed = self.run_request(self.request(
+                    "resume", "v1", status + "-resume", run_id=original["native_run"]))
+                self.assertEqual(code, 0)
+                self.assertEqual(completed["native_run"], original["native_run"])
+                code, _, _ = self.run_request(self.request(request_id=status + "-next"))
+                self.assertEqual(code, 0)
+                calls = [args for name, args in self.config["_calls"] if name == "native"]
+                self.assertEqual(len(calls), 3)
+                self.assertIn("--run-id=" + original["native_run"], calls[1])
+                self.assertIn("--incremental", calls[2])
 
     def test_explicit_resume_preserves_native_identity(self):
         self.baseline()
@@ -292,6 +327,10 @@ class ReleaseTests(unittest.TestCase):
             self.run_request(self.request())
         run_id = self.config["_interrupted_run"]
         self.assertFalse(release.managed_record(Path(self.config["work"]), run_id).exists())
+        code, _, blocked = self.run_request(self.request(request_id="other-dispatch"))
+        self.assertNotEqual(code, 0)
+        self.assertEqual(blocked["status"], "resume_required")
+        self.assertIn(run_id, blocked["error"])
         self.config.pop("_runtime_status")
         self.config.pop("_exit_code")
         code, _, recovered = self.run_request(self.request("resume", request_id="explicit-recovery", run_id=run_id))
@@ -410,6 +449,10 @@ class ReleaseTests(unittest.TestCase):
 
         with patch.object(FakeBackend, "invoke", interrupted), self.assertRaises(SimulatedProcessDeath):
             self.run_request(self.request("resume", request_id="completion-crash", run_id=first["native_run"]))
+        code, _, blocked = self.run_request(self.request(request_id="new-after-completion-crash"))
+        self.assertNotEqual(code, 0)
+        self.assertEqual(blocked["status"], "resume_required")
+        self.assertEqual(sum(name == "native" for name, _ in self.config["_calls"]), 2)
         code, _, completed = self.run_request(self.request("resume", request_id="recover-completion",
                                                            run_id=first["native_run"]))
         self.assertEqual(code, 0)

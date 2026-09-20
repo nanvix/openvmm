@@ -33,7 +33,9 @@ concurrency:
 
 jobs:
   verify:
-    if: github.repository == 'nanvix/openvmm'
+    if: >-
+      github.repository == 'nanvix/openvmm' &&
+      (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')
     runs-on: [self-hosted, linux, x64, specula-openvmm-mshv]
     timeout-minutes: 420
     defaults:

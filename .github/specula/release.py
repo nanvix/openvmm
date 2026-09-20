@@ -525,6 +525,25 @@ def reconcile_pending(config):
         reconcile_journal(config, path)
 
 
+def require_target_resume(config, request):
+    work = Path(config["work"])
+    pending = []
+    for path in sorted((work / "releases/native-runs").glob("*.json")):
+        managed = read_json(confined(path, work))
+        if (managed["target"] == config["target"] and not managed["initialization"]
+                and not managed.get("accepted_publication")):
+            pending.append(managed)
+    if not pending or (request.mode == "resume" and any(
+        managed["native_run"] == request.run_id for managed in pending
+    )):
+        return
+    runs = "; ".join(f"{managed['native_run']} at {managed['revision']}" for managed in pending)
+    raise ReleaseError(
+        "resume_required",
+        f"Unresolved target verification: {runs}. Explicitly resume a listed native run with its original source; a new request ID cannot replace it.",
+    )
+
+
 def recover_launch(config, operation, requested_run=None):
     pointer = operation.get("launch_journal")
     if not pointer:
@@ -709,6 +728,8 @@ def run_request(config, request, *, backend_factory=Backend, bundle_directory=HE
                 backend = backend_factory(config, bundle)
             record["native_work"] = str(native_work)
             record["blockers"] = blockers
+            if not blockers:
+                require_target_resume(config, request)
             if blockers:
                 record.update(status=gate, exit_code=3)
             elif request.preflight or request.mode == "preflight":

@@ -49,6 +49,19 @@ class CITests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertIn("--incremental", calls[0])
 
+    def test_new_dispatch_cannot_replace_incomplete_target_run(self):
+        self.fixture.baseline()
+        self.config.update(_runtime_status="native_incomplete", _exit_code=1)
+        _, public, original = self.run_ci(self.fixture.request(request_id="gh-first"))
+        self.config.pop("_runtime_status")
+        self.config.pop("_exit_code")
+        code, _, blocked = self.run_ci(self.fixture.request(request_id="gh-second"))
+        self.assertNotEqual(code, 0)
+        self.assertEqual(blocked["status"], "resume_required")
+        self.assertIn(original["native_run"], blocked["error"])
+        self.assertEqual(sum(name == "native" for name, _ in self.config["_calls"]), 1)
+        self.assertEqual(release.read_json(public / "result.json"), original)
+
     def test_preflight_and_authorization_blockers_do_not_start_bootstrap(self):
         for request, blockers in (
             (self.fixture.request("preflight"), []),
