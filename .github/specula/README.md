@@ -1,0 +1,119 @@
+# Specula bug-finding CI
+
+`ci.py` is the shared local and GitHub entrypoint. It uses `release.py` for source selection, native execution, recovery and publication. The target is microVM snapshot/restore in `nanvix/openvmm`.
+
+## Trigger and execution
+
+The workflow runs on published releases or manual dispatch, never on push or pull requests. It checks out control code from trusted `main`, resolves the selected release to an immutable commit, and runs the target code only in the bounded runtime.
+
+With an existing compatible baseline, the default operation is native incremental verification. On the first invocation, the configured `bootstrap_revision` and pinned `initialization_seed` prepare a compatible baseline through native `--ci-init --byom`; the same invocation then incrementally verifies the requested release. Retained analysis, models and harnesses are reused, not discarded. Bootstrap completion alone is not a verification result for the requested release.
+
+The bootstrap request has a stable identity. An interrupted bootstrap resumes its recorded native run rather than starting another initialization. Provider holds, unresolved-runtime checks and saved retry budgets still apply. Incomplete target incrementals require explicit `resume` with the same release and native run ID.
+
+The bootstrap revision must be an ancestor of the selected release. Existing incompatible baselines are not overwritten, and source identities are never relabeled. After a future history rewrite, an operator must deliberately update the bootstrap configuration and select a separate store.
+
+## Dedicated runner prerequisites
+
+| Requirement | Configuration |
+| --- | --- |
+| Repository and runner | `nanvix/openvmm`, labels `[self-hosted, linux, x64, specula-openvmm-mshv]` |
+| Runner workspace | `/mnt/data/openvmm-verification/native-ci/runner/_work` |
+| Host | Linux x64, accessible `/dev/mshv`, Docker, Python 3, Git, approximately 30 GiB RAM |
+| Runtime identity | UID:GID `1001:1003`, device group `998` |
+| Runtime image | Immutable digest in `config.json`, Specula pinned to `088049c5b3474340213cded2664cdb674bff1e1a` |
+| Guest fixtures | Kernel and initramfs paths and SHA-256 pins in `config.json` |
+| Retained seed | Exact directory, native manifest and manifest hash in `config.json` |
+| Model credential | Owner-only `/mnt/data/openvmm-verification/private/copilot-auth.json` |
+| Execution consent | Owner-only `/mnt/data/openvmm-verification/private/specula-execution-authorization.json` |
+
+Do not register, relabel, modify or repurpose the existing NVX runner. Provision the dedicated runner separately with permission to manage repository runners. The available API access cannot inspect/register runners, so runner availability is not asserted by this change. Use a runner version compatible with the pinned checkout and artifact actions.
+
+The runtime, fixtures, seed and filesystem permissions must be provisioned before use; the workflow does not install packages, build images, register runners or use `sudo`. Authorized host provisioning can use:
+
+```bash
+bash .github/specula/controller/build-image.sh
+```
+
+See `controller/README.md` for the retained toolchain/source/package inputs. Review any rebuilt image digest and deliberately update `config.json`.
+
+The model credential stays on the host, mounted read-only only for model operations. Never substitute personal/admin credentials, host HOME or an SSH agent. No model secret is committed or uploaded.
+
+`authorization.example.json` documents version 2 operator consent: repository, target, explicit authorization, the latest acknowledged interruption and the user's approval reference. It is not a provider policy exception. Service-side filtering remains active; a new terminal policy stop creates a new hold that old consent does not clear. The committed example is disabled. Legacy version 1 records remain readable.
+
+## Resource and retry limits
+
+Each container has 26 GiB memory and 26 GiB total memory-plus-swap, six CPUs, 1024 PIDs, dropped capabilities, no-new-privileges and a read-only root filesystem. There is no Docker socket in the workload. Scratch, caches, source clones, model state and evidence remain under `/mnt/data`; engine layers remain Docker-managed.
+
+New native conversations permit two policy continuations and three temporary-provider/transport resumptions. Saved runs retain their original budgets. Exhaustion fails; no provider switch or unlimited workflow retry is introduced.
+
+Preparation and verification share a six-hour execution budget. The Actions job has a 420-minute timeout for overhead. GitHub concurrency and host/release locks prevent concurrent Specula workloads. The independent NVX runner does not share these locks; schedule other heavyweight work separately.
+
+These are operational guardrails, not an adversarial secret-isolation boundary. The model process necessarily has its dedicated credential and network access.
+
+## Local and GitHub use
+
+```bash
+# Readiness only; no model call, Rust build, VM or TLC run.
+python3 .github/specula/ci.py --mode preflight --tag RELEASE_TAG
+
+# Prepare the configured baseline if needed, then run incremental verification.
+python3 .github/specula/ci.py --tag RELEASE_TAG --request-id local-release
+
+# Resume an incomplete target verification using the same source identity.
+python3 .github/specula/ci.py \
+  --mode resume --tag RELEASE_TAG --run-id NATIVE_RUN_ID \
+  --request-id local-resume
+```
+
+Preflight may fetch public Git objects and inspect native state in a credential-free container. A cold store reports `needs_initialization`; the configured bootstrap is performed only by the normal incremental invocation, not by preflight. Other readiness blockers prevent bootstrap.
+
+Local commands also accept `--revision FULL_SHA` instead of a tag. The revision must be on trusted-main ancestry. `--mode initialize` remains available for explicit initialization, and `--preflight-only` never starts verification.
+
+After merge and runner provisioning, open **Actions → Specula release verification → Run workflow**, select `main`, choose `incremental`, and provide an existing release tag. For an incomplete target run, choose `resume` and its exact run ID. A release event automatically uses incremental mode. Old tags predating the workflow require manual dispatch; do not move tags.
+
+Completed requests reuse validated receipts rather than rerunning models. Native source, image, environment, seed and retained control-bundle identities are preserved on resume. A malformed request can fail before a report directory exists.
+
+## Results and publication
+
+GitHub displays `summary.md` and uploads only `summary.md` plus `result.json`, retained for 14 days. Detailed findings, models, prompts, traces and raw logs stay on the host. No issues, PRs, product fixes or pushes are created by CI.
+
+For the default configuration, public request reports are below:
+
+```text
+/mnt/data/openvmm-verification/native-ci/work/release-ci/
+  releases/requests/<request-id>/public/
+    summary.md
+    result.json
+  releases/rejections/<rejection-id>/public/
+  releases/active-work.json
+  initializations/<bootstrap-request-id>/
+```
+
+Use the emitted `artifact_dir` and the result's `native_work`/`native_run` to locate evidence. Errors can use a rejection directory instead of overwriting an earlier request.
+
+| Outcome | Behavior |
+| --- | --- |
+| Complete PASS / WARNING | Publish the valid native result; warnings remain visible |
+| Complete FAIL | Fail the job; a complete reusable model may still become the next baseline |
+| Incomplete / policy stop / timeout / OOM | Fail without promoting incomplete verification output |
+| Bootstrap failure | Report preparation failure; do not claim the requested release was verified |
+
+Native completion and baseline publication are not guarantees that the implementation is bug-free. Review finding evidence before using `controller/templates/copilot-fix.prompt.md` for a separately authorized fix branch and PR description.
+
+## Retained experiments and explicit imports
+
+Earlier experiments and the explicit UNVERIFIED import remain under their original directories. The default CI uses the separate `work/release-ci` store and the retained model as bootstrap input. It does not resume or overwrite those historical runs.
+
+`import_baseline.py` remains an explicit offline tool for adopting a frozen initialization package as an UNVERIFIED input. It requires the exact manifest SHA-256 and `--acknowledge-unverified`, preserves provenance, and does not fabricate a completed receipt or PASS. An imported model on an unrelated source history is not sufficient for native incremental verification; use supported seeded initialization on the intended history instead.
+
+## Lightweight development checks
+
+```bash
+cd .github/specula
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.:tests:controller/tests \
+  python3 -m unittest \
+    test_release test_runtime test_import_baseline \
+    test_seeded_initialization test_ci -q
+```
+
+These use disposable histories and synthetic execution receipts, not real model verification. Native storage/import contracts are in `controller/tests_native/` and run only in the bounded runtime. Harness contracts are documented in `harness/README.md`.
