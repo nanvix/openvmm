@@ -831,6 +831,80 @@ fn resolve_device_assignment_msi_iova_range(
     }
 }
 
+#[cfg(guest_arch = "x86_64")]
+fn validate_snapshot_restore_partition_presence(
+    saved_state: &SavedState,
+    restore_time: Option<(Duration, u64, Option<u64>)>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        restore_time.is_none()
+            || saved_state
+                .units
+                .iter()
+                .any(|unit| unit.name == "partition"),
+        "time-adjusted snapshot restore requires partition state"
+    );
+    Ok(())
+}
+
+#[cfg(all(test, guest_arch = "x86_64"))]
+mod snapshot_restore_tests {
+    use super::*;
+    use state_unit::SavedStateUnit;
+    use vmcore::save_restore::NoSavedState;
+    use vmcore::save_restore::SavedStateBlob;
+
+    fn saved_state(unit_names: &[&str]) -> SavedState {
+        SavedState {
+            units: unit_names
+                .iter()
+                .map(|name| SavedStateUnit {
+                    name: (*name).to_owned(),
+                    state: SavedStateBlob::new(NoSavedState),
+                })
+                .collect(),
+            inventory: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn restore_without_time_adjustment_allows_missing_partition_state() {
+        validate_snapshot_restore_partition_presence(&saved_state(&[]), None).unwrap();
+    }
+
+    #[test]
+    fn time_adjusted_restore_allows_partition_state() {
+        validate_snapshot_restore_partition_presence(
+            &saved_state(&["partition"]),
+            Some((Duration::ZERO, 1, None)),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn time_adjusted_restore_rejects_missing_partition_state() {
+        let error = validate_snapshot_restore_partition_presence(
+            &saved_state(&["other"]),
+            Some((Duration::ZERO, 1, None)),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "time-adjusted snapshot restore requires partition state"
+        );
+    }
+
+    #[test]
+    fn time_adjusted_restore_requires_partition_payload_not_inventory() {
+        let mut saved_state = saved_state(&[]);
+        saved_state.inventory.push("partition".to_owned());
+
+        validate_snapshot_restore_partition_presence(&saved_state, Some((Duration::ZERO, 1, None)))
+            .unwrap_err();
+    }
+}
+
 #[cfg(all(test, guest_arch = "aarch64"))]
 mod tests {
     use super::*;
@@ -3503,6 +3577,9 @@ impl InitializedVm {
         };
 
         if let Some(saved_state) = saved_state {
+            #[cfg(guest_arch = "x86_64")]
+            validate_snapshot_restore_partition_presence(&saved_state, restore_time)?;
+
             if let Some((_, saved_frequency, saved_apic_frequency)) = restore_time {
                 let destination_frequency = this
                     .inner
