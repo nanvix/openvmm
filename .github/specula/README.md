@@ -34,7 +34,7 @@ The runtime, fixtures, seed and filesystem permissions must be provisioned befor
 bash .github/specula/controller/build-image.sh
 ```
 
-See `controller/README.md` for the retained toolchain/source/package inputs. Review any rebuilt image digest and deliberately update `config.json`.
+The image build requires the immutable toolchain base in `controller/Dockerfile`, a Specula checkout at the pinned revision under `/mnt/data/openvmm-verification/repos/specula-latest-20260916`, and the retained `native-ci/cache/protoc-27.1` package. Specula's own source is archived into the image at build time, not vendored in this repository. Review any rebuilt image digest and deliberately update `config.json`.
 
 The model credential stays on the host, mounted read-only only for model operations. Never substitute personal/admin credentials, host HOME or an SSH agent. No model secret is committed or uploaded.
 
@@ -100,11 +100,15 @@ Use the emitted `artifact_dir` and the result's `native_work`/`native_run` to lo
 
 Native completion and baseline publication are not guarantees that the implementation is bug-free. Review finding evidence before using `controller/templates/copilot-fix.prompt.md` for a separately authorized fix branch and PR description.
 
-## Retained experiments and explicit imports
+## Runtime and retained assets
 
-Earlier experiments and the explicit UNVERIFIED import remain under their original directories. The default CI uses the separate `work/release-ci` store and the retained model as bootstrap input. It does not resume or overwrite those historical runs.
+The container mounts its selected state directory at `/work` and shared build caches at `/cache`. Source clones, harness, guest fixtures, control scripts and optional initialization seed are read-only mounts at `/sources`, `/harness`, `/fixtures`, `/control` and `/seed`. Mount roots must be disjoint. Resume preserves those paths and the saved seed identity.
 
-`import_baseline.py` remains an explicit offline tool for adopting a frozen initialization package as an UNVERIFIED input. It requires the exact manifest SHA-256 and `--acknowledge-unverified`, preserves provenance, and does not fabricate a completed receipt or PASS. An imported model on an unrelated source history is not sufficient for native incremental verification; use supported seeded initialization on the intended history instead.
+The runtime fixes Copilot/gpt-5.6-sol-fast/xhigh, single-agent initialization, and aggregate TLC limits of 12 GiB/four workers. Guidance also requires explicit per-job TLC bounds. The image supplies protoc 27.1 through `PROTOC` and `PROTOC_INCLUDE`; avoid broad package restoration that introduces source symlinks rejected by native isolation. Source inputs must be complete ordinary clones, not linked worktrees or partial clones.
+
+Each runtime attempt retains its command, cgroup observations, console log and status under `<native_work>/runtime/<attempt>/`. Interruption stops the owned workload and preserves progress. Native resume requires a saved conversation; a failure between phases can require a separately prepared BYOM initialization instead. Do not infer sessions or fabricate completion from an exit code alone.
+
+Historical experiments and their one-time import tools stay outside this PR. The default CI uses the separate `work/release-ci` store and retained assets through native BYOM bootstrap. Removing the one-time import code does not remove or change the model seed, existing experiment evidence or saved control bundles.
 
 ## Lightweight development checks
 
@@ -112,8 +116,8 @@ Earlier experiments and the explicit UNVERIFIED import remain under their origin
 cd .github/specula
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.:tests:controller/tests \
   python3 -m unittest \
-    test_release test_runtime test_import_baseline \
+    test_release test_runtime \
     test_seeded_initialization test_ci -q
 ```
 
-These use disposable histories and synthetic execution receipts, not real model verification. Native storage/import contracts are in `controller/tests_native/` and run only in the bounded runtime. Harness contracts are documented in `harness/README.md`.
+These use disposable histories and synthetic execution receipts, not real model verification. Native storage/runtime contracts are in `controller/tests_native/` and run only in the bounded runtime. Mount a retained controller bundle with `--control`, an existing complete checkout with `--source`, and invoke `python3 -m unittest test_store test_runtime_contract` with `PYTHONPATH=/control/tests_native:/control:/opt/specula-native` in `controller/run.py`'s credential-free `exec` mode. Harness contracts are documented in `harness/README.md`.

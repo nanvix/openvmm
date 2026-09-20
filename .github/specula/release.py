@@ -368,8 +368,6 @@ def public_report(directory, record):
              f"Native run: `{escape(record.get('native_run', 'not started'))}`", "",
              "Native completion is not human model acceptance or a bug-free guarantee.",
              "No issues, PRs, product fixes or remote configuration are created."]
-    if record.get("baseline_kind") == "imported_unverified":
-        lines += ["", "Starting base: **explicitly imported, UNVERIFIED**. This is reusable input, not a completed verification result."]
     for problem in record.get("blockers", []):
         lines += ["", "- " + escape(problem)]
     if record.get("error"):
@@ -679,9 +677,6 @@ def run_request(config, request, *, backend_factory=Backend, bundle_directory=HE
                 backend = backend_factory(config, bundle)
             current = backend.store("inspect").get("current")
             record["previous"] = current["token"] if current else None
-            if current and current.get("baseline_kind") == "imported_unverified":
-                record["baseline_kind"] = "imported_unverified"
-                record["baseline_verification_complete"] = False
             blockers = prerequisites(config)
             gate = "provider_approval_required"
             if current and current["target"] != config["target"]:
@@ -744,18 +739,6 @@ def run_request(config, request, *, backend_factory=Backend, bundle_directory=HE
                                     "or a claim that historical traces validate this revision. Produce fresh current-source "
                                     "execution, replay and final reporting; retain historical findings as prior evidence, "
                                     "not newly discovered bugs or automatically finalized classifications.\n"
-                                )
-                        if current and current.get("baseline_kind") == "imported_unverified":
-                            with guidance.open("a") as stream:
-                                stream.write(
-                                    "\n\n## Imported starting model\n\n"
-                                    "The previous model was explicitly imported from an interrupted initialization. "
-                                    "Its status is UNVERIFIED, not PASS or completed verification. "
-                                    "Reuse the retained model, harness and investigation evidence, but assess their "
-                                    "current applicability and finish the required current-source verification. "
-                                    "Review preserved confirmation candidates; absent finalized finding records "
-                                    "do not mean there were no findings. Do not label inherited candidates new "
-                                    "discoveries or reuse historical traces as fresh execution evidence.\n"
                                 )
                         artifact = "/sources/" + str(source.relative_to(root / "repos"))
                         args = ["--ci-init" if initializing else "--incremental",

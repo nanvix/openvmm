@@ -1,113 +1,48 @@
-# Local native CI: Pedro microVM snapshot and restore
+# MicroVM snapshot/restore verification
 
-## Objective and source identity
+## Source and scope
 
-Establish a source-faithful, reusable native Specula CI model of Pedro's
-guest-requested microVM snapshot transaction in the new `nanvix/openvmm` fork.
-Then maintain that model through actual descendant source changes. This is
-not upstream OpenVMM's interactive REPL save/restore and not whole-VMM analysis.
+Model guest-requested microVM snapshot/restore in `nanvix/openvmm`, not upstream interactive REPL save/restore or the entire VMM. Use the exact revision in this run's CI inputs. Instrument only Specula's private source copy; supplied source and retained assets are read-only.
 
-The parent supplies a clean, read-only ordinary Git checkout. Use the source
-identity in this run's CI inputs, not a path name or an assumed branch tip.
-Instrument only Specula's private source copy. The reference local sequence is:
+Prioritize one connected transaction:
 
-- A: `1107ec002603e262a23e5437235b81cd8bcbb377`.
-- B: `0b15589c7ee0bea4b35436255c33ea8353f0a178`, A's direct child: `chipset: reuse completed microVM snapshot requests`.
-- C: `0bc357bbcf3a654b63dfb51f1103c5751bf3d31f`, main selected on 2026-09-20; B is its ancestor.
+1. `MicrovmSnapshotRequest` PIO request, duplicate coalescing, deferred write, release, write-completion acknowledgement, transaction completion, stop/reset cancellation and completed-request reuse.
+2. Worker/controller boundary establishment, stop/save ordering, staged publication, capture-and-exit and no-destination/pre-commit recovery.
+3. Manifest-driven new-process restore with private guest memory, including two independent restores of one supported reusable artifact without artifact mutation.
+4. Consistency between boundary release, committed capture and ordinary source continuation. Releasing a deferred write is not completing the entire transaction.
 
-These are the commits on current main history after the upstream rebase. Retained seed artifacts were generated at historical A `df4da6d4062aa2c99ad8920459389c46bcd085c5`, whose corresponding historical child was `6be988cb0f9739438f578094cf911dad85ca4a41`. The old and current source identities are not interchangeable. Reuse the retained analysis/model/harness as input to a supported current-source initialization; do not claim old traces were produced by a rebased revision. The scoped A-to-B device behavior change is the same known source-history change.
+Starting points:
 
-This is an experiment over existing upstream revisions, not a request to
-implement a product fix. A defect already repaired in B is an existing known
-source-history defect, not a newly discovered OpenVMM bug.
+- `vm/devices/chipset/src/microvm.rs`
+- `openvmm/openvmm_core/src/worker/dispatch.rs`
+- `openvmm/openvmm_entry/src/vm_controller.rs` and `lib.rs`
+- `openvmm/openvmm_defs/src/rpc.rs`
+- `openvmm/openvmm_helpers/src/snapshot.rs` and `shared_memory.rs`
+- `Guide/src/user_guide/openvmm/snapshots.md`
 
-The old hardfork baseline at `521647e` is not an ancestor baseline for this
-new repository. Do not import old acceptance, old traces, or a prior pass as
-current evidence. Optional historical assets are only provisional references.
+Consult other files for these interfaces and concrete behavior. Keep finite bounds small: one vCPU, at most two requests/restores, one snapshot generation and abstract memory identity/private mutation. Do not model instruction execution, byte arrays, entire timers/filesystems or whole virtio protocols.
 
-## Scope: one coherent transaction model
+## Model reuse and incremental evidence
 
-Prioritize semantic depth within these connected mechanisms:
+Reuse prior analysis, models and harnesses, but assess their applicability to the selected source and actual source diff. Source identities before and after a rebase are not interchangeable. Historical findings are not new discoveries, and historical traces are not fresh execution evidence.
 
-1. `MicrovmSnapshotRequest` PIO request, duplicate coalescing, deferred write,
-   release, write-completion notification, transaction completion, and pending
-   request reuse. Include the independence of device polling and the next PIO
-   write. Cover ordinary stop/reset behavior at this interface.
-2. Worker/controller snapshot boundary, stop/save ordering, staged publication,
-   source capture-and-exit, and ordinary no-destination or pre-commit recovery.
-3. Manifest-driven new-process restore with private guest memory. For the
-   explicitly supported reusable snapshot mode, one committed artifact can
-   feed two independent restores without mutation by guest writes.
-4. Boundary release and guest continuation must be consistent with committed
-   capture or an ordinary resumed source. Preserve the distinction between
-   releasing a deferred write and completing the entire transaction.
+When `/seed` is provided, use native BYOM initialization to adapt retained assets rather than repeating completed archaeology. Current-source execution, trace replay, model validation, confirmation and reporting still apply. Preserve unresolved findings and assess their current applicability; do not turn absent finalized reports into a claim of no bugs.
 
-Starting points, relative to the actual source:
+For `NO_MODEL_CHANGE`, still execute the current implementation and replay fresh traces, identifying exactly what was reused and why. For changed semantics, maintain a complete current reference model as well as update-focused artifacts; do not put replacement behavior only in `Update.tla`.
 
-- `vm/devices/chipset/src/microvm.rs`, especially `MicrovmSnapshotRequest`.
-- `openvmm/openvmm_entry/src/vm_controller.rs`.
-- `openvmm/openvmm_core/src/worker/dispatch.rs`.
-- `openvmm/openvmm_defs/src/rpc.rs`.
-- `openvmm/openvmm_helpers/src/snapshot.rs` and `shared_memory.rs`.
-- `openvmm/openvmm_entry/src/lib.rs`.
-- `Guide/src/user_guide/openvmm/snapshots.md`.
+Record PIO invocation/return, whether polling originates in `poll_device` or `io_write`, and actual accepted/coalesced/notified outcomes. A completed-without-poll scenario must not insert an unobserved poll. Distinguish behavioral incompatibility from parser/schema rejection when comparing old models and new traces.
 
-Consult other files only for these interfaces and concrete behavior. Use small
-finite bounds: one vCPU, at most two requests/restores, one snapshot generation,
-and abstract RAM identity/private mutation. Do not model CPU instructions,
-byte arrays, entire hardware timers, full filesystem namespaces, or whole
-virtio protocols as state variables. Keep resource and timing interfaces
-explicit instead of claiming those abstractions prove the hardware.
+## Contracts and limitations
 
-The A-to-B delta changes the request-lifecycle implementation itself. Release
-runs may target later descendants: use their frozen input identity. Determine
-the incremental disposition from the actual source and model; do not merely
-rename the old verdict or declare model change in advance. Preserve unresolved
-findings and perform the required current applicability/confirmation work.
+Derive contracts from the selected source and documentation. Untiered reusable microVM snapshots are not single-use instance checkpoints: do not generalize repeatability, erase `resume.claim` or bypass a restore gate.
 
-Record PIO invocation/return boundaries and whether polling originated in
-poll_device or within io_write. The controlled completed-without-poll scenario
-must not insert an unobserved device poll. Record accepted/coalesced/notified
-outcomes from the actual API, not from a version-dependent expected result.
-When comparing the old model against a new trace, distinguish semantic
-incompatibility from parser/schema incompatibility. Reconcile model-review
-concerns against the current source/model before claiming acceptance.
+Tiered sandbox resources, control broker/framing, networking, virtio-fs, hotplug, Windows/WHP, KVM, OpenHCL and host REPL operations are outside initial scope. Assess whether changes in those areas affect the in-scope interfaces before excluding them.
 
-## Contracts and explicit exclusions
+Clock/counter and entropy observations do not prove exact hardware post-state, downtime compensation or cryptographic freshness. Never populate observations with model-predicted values. No hostile guests, exploitation, adversarial filesystem manipulation, fuzzing or unrelated vulnerability search is required; confirm normal correctness counterexamples with component tests or the ordinary VM scenario. Report demonstrated impact and limits. Novelty is unknown without supporting source history or tracker evidence.
 
-Derive contracts from the selected source and its current documentation.
-New snapshot tiers distinguish reusable clones from single-use instance
-checkpoints. The real first scenario intentionally uses the compatible
-untiered reusable microVM mode. Do not generalize its repeatability to
-`instance-checkpoint`, erase a `resume.claim`, or bypass a restore gate.
+## Execution and traces
 
-Tiered sandbox resources, control-session broker/framing, network, virtio-fs,
-hotplug, Windows/WHP, KVM, OpenHCL, and host REPL save/restore are outside this
-initial scope. On later updates, explicitly assess whether changes to these
-areas affect the in-scope interfaces before excluding them.
-
-Clock/counter and entropy behavior may be observed in real guest output, but
-this transaction model does not establish exact hardware clock post-state or
-cryptographic freshness. Host clocks remain live. Never populate an observed
-clock/timer field using a shadow model's predicted arithmetic.
-
-No hostile guests, exploitation, adversarial filesystem manipulation, fuzzing,
-or unrelated vulnerability search. Normal correctness counterexamples may be
-confirmed with ordinary component tests or the normal VM scenario. Report
-their actual impact and limits; do not label an unconfirmed mismatch a security
-vulnerability. If tracker access is unavailable, novelty is unknown unless
-provided source history establishes that a finding is already known.
-
-## Real execution and trace requirements
-
-The supplied `/harness` directory contains a parent-maintained normal scenario
-and usage instructions. Reuse it rather than rebuilding a VM test framework.
-It is a bootstrap aid, not automatically accepted trace evidence. Copy or
-adapt the needed harness into this run's output, retaining provenance and
-preserving the original. Its implementation inputs must be the current
-private source/binary, not an earlier run's binary.
-
-Read `/harness/README.md`. The copyable bootstrap entry points are:
+Read `/harness/README.md` and reuse the supplied normal MSHV scenario rather than rebuilding a VM framework:
 
 ```text
 bash /harness/build.sh PRIVATE_SOURCE CARGO_TARGET_DIR UNIQUE_BUILD_OUTPUT
@@ -117,128 +52,34 @@ bash /harness/run.sh --source PRIVATE_SOURCE \
 bash /harness/observe-reuse.sh PRIVATE_SOURCE CARGO_TARGET_DIR UNIQUE_TEST_OUTPUT
 ```
 
-These bootstrap receipts are not model traces. Build the run's own reusable
-`harness/run.sh` to arrange the actual instrumentation, fresh component/VM
-traces and replay inputs. Keep any copied bootstrap implementation under a
-distinct subdirectory if needed, rather than recursively invoking itself.
-Use the shared `/cache` Cargo target and registry across retries, with unique
-evidence/build-log directories. Read the actual helper before invoking it.
+Bootstrap receipts are not model traces. Build the run's own reusable harness for instrumentation, fresh component/VM traces and replay inputs. Put any copied bootstrap under a distinct subdirectory to avoid `run.sh` recursion. Use the current private source/binary and shared Cargo caches, with unique evidence/build-log directories.
 
-The same observational Rust test supplied in `reuse-observation.rs` exercises
-the real device API on both versions. Bootstrap observations recorded A
-coalescing the completed-without-poll second write and B accepting it. That
-is evidence of the already-known source delta, not a substituted trace or an
-instruction to force a verdict. Re-execute on this run's private source and
-instrument the underlying implementation for model correspondence.
+Required evidence is actual MSHV capture and source exit, two independent reusable restores, guest continuation/private-memory observations, unchanged artifact hashes, source/fixture/binary identities and process outcomes. Supplement with nonzero executed component tests for deterministic lifecycle interleavings, nonempty implementation traces, completed replay and bounded model checking.
 
-The old `phase_2_snapshot_restore` integration-test selector is absent in the
-new repository. Do not invoke an empty filter and count exit zero as coverage.
-The `phase2_snapshot_bench` example only measures host-side storage foundations;
-it is not a real VM snapshot/restore test.
+Emit events at coherent implementation boundaries; wakeups must not allow dependent observations to precede prerequisites. Do not manufacture traces, substitute archived traces for current execution, or treat derived phase counters as unobserved state.
 
-Required current-run evidence:
+The removed `phase_2_snapshot_restore` selector must not produce a zero-test success. `phase2_snapshot_bench` is a storage benchmark, not a real VM snapshot/restore scenario. Preserve observation limitations instead of weakening expected behavior.
 
-- Real `/dev/mshv` capture and source exit, followed by two independent restores
-  of the supported reusable snapshot, with fresh guest continuation evidence.
-- Source and guest-fixture identities, binary identity, unique run directory,
-  process exit outcomes, and unchanged snapshot artifact hashes.
-- Actual implementation-boundary instrumentation for the transaction model.
-  Component tests supplement the device lifecycle interleavings that a
-  nondeterministic whole-VM run does not reliably exercise.
-- Nonzero executed component tests, fresh nonempty traces, actual replay
-  completion and model-checking evidence for the selected finite profiles.
+## Resources, recovery and compiler
 
-Emit events at actual coherent source boundaries. Notifications must not let
-a dependent consumer event overtake its prerequisite trace event. Trace phase
-counters are derived observations, not proof of unobserved data post-state.
-Never manufacture traces from the expected model or replay archived traces
-as a substitute for executing this revision.
+The outer runtime provides 26 GiB memory, no extra swap, six CPUs and 1024 PIDs. Use at most four Cargo jobs. Writable state, caches, temporary output and TLC state belong under `/work` or `/cache`; use `/work/scratch`, not the 256 MiB `/run` tmpfs.
 
-The uninstrumented A bootstrap's integer-second guest wall/uptime deltas were
-zero despite a three-second host wait. Its successful continuation and private
-memory checks do not establish downtime compensation. Preserve this limitation
-unless new, correctly anchored observations resolve it.
-
-Run existing deterministic request-device tests where available, adapting
-test-only instrumentation if needed. A normal focused driver may call the
-actual Rust device API to expose pending/completion/reuse ordering; it must
-not be a reimplementation or simulator of that API. Do not weaken expected
-product behavior to make a failing scenario pass.
-
-For `NO_MODEL_CHANGE`, still run the current implementation and replay fresh
-traces. Record the precise evidence reused and why it remains applicable.
-For changed semantics, maintain a complete current reference and the native
-incremental update-focused artifacts; do not put replacement behavior only
-in `Update.tla`.
-
-## Resources and persistence
-
-The outer runtime enforces exactly 26 GiB container memory, zero extra swap,
-six CPUs and 1024 PIDs. Only one heavyweight experiment may run at a time.
-Use at most four Cargo jobs. All caches, session state, build output, large
-temporary files and TLC state must use the mounted `/work` or `/cache` paths.
-The `/run` tmpfs is only 256 MiB; use `/work/scratch` for temporary files.
-Original source, guest fixtures and supplied
-harness are read-only.
-
-For every TLC invocation use explicit small limits, normally:
+Every TLC invocation needs explicit small bounds, normally:
 
 ```text
 -m 6G -M 2G -w 4 -t 10
 ```
 
-The native aggregate limit is 12 GiB/four workers. It does not resize the
-TLC script's much larger defaults. Run campaigns sequentially. Direct Java
-must likewise have explicit heap, direct-memory, workers and finite timeout.
-Keep finite state bounds small enough for completed bounded checks rather
-than repeatedly expanding until the host or budget is exhausted.
+The aggregate TLC budget is 12 GiB/four workers; it does not resize tool defaults. Run campaigns sequentially. Direct Java requires explicit heap, direct-memory, workers and timeout. Distinguish budget-limited search from exhaustive completion at stated finite bounds.
 
-Use finite timeouts for Cargo, VM processes and tool commands. Preserve
-partial models, build output, logs, traces, TLC results and sessions when a
-command fails; diagnose and repair the infrastructure/model/harness in place.
-Do not restart initialization, delete a CI store, or discard progress merely
-because a command failed. Native resume continues the saved conversation.
-Recovery is controlled by the pinned native runtime's finite budgets. Do not add manual retry loops, change providers or disable filtering. Exhausted policy recovery is a terminal failure; retain its evidence and existing execution hold.
+Use finite Cargo/VM/tool timeouts and preserve partial work on failure. Diagnose and repair in place; do not discard a store or restart analysis merely because a command failed. Native resume retains the saved conversation. Recovery uses the pinned runtime's finite budgets; do not add manual loops, change providers or disable filtering. Exhausted policy recovery is terminal and retains its evidence/hold.
 
-Distinguish budget-limited exploration from exhaustive completion at the stated
-finite bounds. The outer acceptance record does not turn OOM, startup failure,
-empty traces, missing scenarios or interrupted replay into a pass, even if a
-native report marker exists.
+Use the runtime-provided protoc 27.1 through `PROTOC` and `PROTOC_INCLUDE`. Do not restore unrelated packages just because `.packages` is absent: absolute compiler/sysroot symlinks violate native source isolation. Do not weaken source validation or substitute a different compiler.
 
-## Report-only product boundary
+## Report-only boundary
 
-Do not fix product defects. Allowed edits are documented instrumentation,
-ordinary tests/reproduction and models/harnesses matching the original
-product semantics. Preserve every source diff; do not alter product behavior
-to repair or conceal a counterexample. A faithfully modeled product bug may
-produce a completed failing CI verdict and a reusable model.
+Do not fix product defects. Edits are limited to documented instrumentation, ordinary reproduction/tests, and models/harnesses that preserve product semantics. Retain source diffs and do not change implementation behavior, weaken invariants or hide counterexamples to obtain a pass.
 
-Never push, publish an issue/PR, deploy a workflow, register a runner, create a
-release, or modify any remote system. Do not read credentials or unrelated
-host paths. No administrative GitHub credentials are available to this task.
-Model authentication is supplied by the runtime, not by reading its secret.
+Do not push, create issues/PRs, register runners, publish releases or modify remote systems. Do not read credentials or unrelated host paths. Authentication is supplied by the runtime.
 
-Complete the native phase artifacts and verdict honestly. Keep reports concise
-and link actual evidence. A native `current` publication means reusable model
-state, not automatic human acceptance or a claim of bug-free implementation.
-Product repair remains a separate future human-authorized task.
-
-## Native initialization recovery and build compatibility
-
-The first source-based initialization completed its source/history analysis
-and modeling brief in run `20260916-053628-31e5`. It then stopped before a
-Phase 2 conversation began because package restoration introduced absolute
-symlinks into the private source tree. Native isolation correctly rejected
-those links; no model or accepted baseline was produced.
-
-When `/seed` is supplied, inspect and reuse its retained assets. It can contain the existing reference model, executable harness, analysis and historical evidence from `20260916-061854-c314`, not just the earlier analysis-only package. Adapt those assets to the selected source through native BYOM initialization instead of repeating historical archaeology. All current-source execution, trace replay, model validation, confirmation and final reporting remain required. Retained MC-1 investigation is historical evidence to assess, not a newly discovered or automatically finalized finding.
-
-The runtime now provides the repository's pinned `libprotoc 27.1` through
-`PROTOC` and `PROTOC_INCLUDE`, outside the private source tree. Cargo's
-configuration intentionally permits this inherited compiler override.
-Use that provided compiler for native GNU/MSHV builds and component tests.
-Do not run broad `restore-packages` merely because `.packages` is absent:
-it creates absolute compiler links and an unrelated musl sysroot, which the
-native source-copy validator rejects even in ignored directories. The supplied
-build helper honors an explicit `PROTOC`. Do not replace the compiler with a
-different version or weaken the native symlink/source validation.
+Complete native artifacts and reporting honestly. OOM, missing scenarios, empty traces and incomplete replay are not passes even if a marker exists. A complete FAIL can retain a reusable model, but native publication is not human acceptance or proof that the product is bug-free. Product fixes remain a separate authorized task.

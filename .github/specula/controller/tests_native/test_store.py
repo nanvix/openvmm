@@ -121,6 +121,26 @@ class NativeStoreTests(unittest.TestCase):
             operate(self.root, "promote", token=b, revision=revision_b, target=self.target, verdict="PASS")
         self.assertEqual(operate(self.root, "inspect")["current"]["token"], c)
 
+    def test_inspection_requires_native_verification_and_completion(self):
+        token, _, _ = self.publish("init")
+        state_path = self.root / token / "state.json"
+        receipt_path = self.root / "runs/init/ci-result.json"
+        state = json.loads(state_path.read_text())
+        receipt = json.loads(receipt_path.read_text())
+        for changes, receipt_changes in (
+            ({"verdict": "UNVERIFIED"}, {"verdict": "UNVERIFIED"}),
+            ({"verification": "SYNTHETIC unverified input"}, {}),
+            ({}, {"complete": False}),
+        ):
+            with self.subTest(changes=changes, receipt_changes=receipt_changes):
+                write_json(state_path, state | changes)
+                write_json(receipt_path, receipt | receipt_changes)
+                with self.assertRaises(CIError):
+                    operate(self.root, "inspect")
+        write_json(state_path, state)
+        write_json(receipt_path, receipt)
+        self.assertEqual(operate(self.root, "inspect")["current"]["token"], token)
+
 
 if __name__ == "__main__":
     if not os.environ.get("TMPDIR", "").startswith("/work/"):
