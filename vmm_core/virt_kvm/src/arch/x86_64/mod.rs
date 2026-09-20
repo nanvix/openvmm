@@ -99,6 +99,10 @@ use x86defs::msi::MsiAddress;
 use x86defs::msi::MsiData;
 use zerocopy::IntoBytes;
 
+fn kvm_vcpu_id(vp_info: &X86VpInfo) -> u32 {
+    vp_info.apic_id
+}
+
 // HACK: on certain machines, pcat spams these MSRs during boot.
 //
 // As a workaround, avoid injecting a GFP on these mystery MSRs until we can get
@@ -534,9 +538,9 @@ impl ProtoPartition for KvmProtoPartition<'_> {
         cpuid.extend(psfd_fixup);
         let cpuid = CpuidLeafSet::new(cpuid);
 
-        let bsp_apic_id = self.config.processor_topology.vp_arch(VpIndex::BSP).apic_id;
-        if bsp_apic_id != 0 {
-            self.vm.set_bsp(bsp_apic_id)?;
+        let bsp_vcpu_id = kvm_vcpu_id(&self.config.processor_topology.vp_arch(VpIndex::BSP));
+        if bsp_vcpu_id != 0 {
+            self.vm.set_bsp(bsp_vcpu_id)?;
         }
 
         // Create all VCPUs now so that they are assigned dense, sequential
@@ -548,10 +552,10 @@ impl ProtoPartition for KvmProtoPartition<'_> {
         // an O(n) linear scan.  Per-VP initialization (CPUID, MSRs, synic)
         // is deferred to bind().
         for vp_info in self.config.processor_topology.vps_arch() {
-            self.vm.add_vp(vp_info.apic_id)?;
+            self.vm.add_vp(kvm_vcpu_id(&vp_info))?;
         }
 
-        let tsc_frequency_hz = self.vm.vp(0).tsc_frequency_hz()?;
+        let tsc_frequency_hz = self.vm.vp(bsp_vcpu_id).tsc_frequency_hz()?;
         let current_max_basic_leaf =
             cpuid.result(CpuidFunction::VendorAndMaxFunction.0, 0, &[0; 4])[0];
         let mut cpuid = cpuid.into_leaves();
@@ -816,14 +820,15 @@ impl Partition for KvmPartition {
     }
 
     fn tsc_frequency_hz(&self) -> Result<Option<u64>, Self::Error> {
-        Ok(Some(self.inner.kvm.vp(0).tsc_frequency_hz()?))
+        let bsp_vcpu_id = kvm_vcpu_id(&self.inner.bsp().vp_info);
+        Ok(Some(self.inner.kvm.vp(bsp_vcpu_id).tsc_frequency_hz()?))
     }
 
     fn set_tsc_frequency_hz(&self, frequency_hz: u64) -> Result<(), Self::Error> {
         for vp in &self.inner.vps {
             self.inner
                 .kvm
-                .vp(vp.vp_info.base.vp_index.index())
+                .vp(kvm_vcpu_id(&vp.vp_info))
                 .set_tsc_frequency_hz(frequency_hz)?;
         }
         Ok(())
@@ -2072,5 +2077,35 @@ impl GuestEventPort for KvmGuestEventPort {
 impl SignalMsi for KvmPartitionInner {
     fn signal_msi(&self, _devid: Option<u32>, address: u64, data: u32) {
         self.request_msi(MsiRequest { address, data });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kvm_vcpu_id;
+    use test_with_tracing::test;
+    use virt::VpIndex;
+    use vm_topology::processor::VpInfo;
+    use vm_topology::processor::x86::X86VpInfo;
+
+    #[test]
+    fn kvm_vcpu_ids_follow_sparse_apic_ids() {
+        let vp0 = X86VpInfo {
+            base: VpInfo {
+                vp_index: VpIndex::new(0),
+                vnode: 0,
+            },
+            apic_id: 253,
+        };
+        let vp1 = X86VpInfo {
+            base: VpInfo {
+                vp_index: VpIndex::new(1),
+                vnode: 1,
+            },
+            apic_id: 254,
+        };
+
+        assert_eq!(kvm_vcpu_id(&vp0), 253);
+        assert_eq!(kvm_vcpu_id(&vp1), 254);
     }
 }
