@@ -1,8 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Keep management mutations outside the guest-requested snapshot boundary.
+//! Filter guest snapshot requests and management mutations at the snapshot boundary.
 
+use chipset_resources::microvm::MicrovmSnapshotBoundaryRequest;
 use mesh::error::RemoteError;
 use openvmm_defs::rpc::PulseSaveRestoreError;
 use openvmm_defs::rpc::VmRpc;
@@ -10,6 +11,19 @@ use openvmm_defs::rpc::VmRpc;
 #[derive(Debug, thiserror::Error)]
 #[error("VM mutation is unavailable while a microVM snapshot boundary is active")]
 struct SnapshotBoundaryActive;
+
+pub(super) fn filter_boundary_request(
+    request: MicrovmSnapshotBoundaryRequest,
+) -> Option<MicrovmSnapshotBoundaryRequest> {
+    // Stop/reset drops the release receiver but leaves the request queued.
+    // The worker serializes reset with boundary establishment, so checking
+    // before gating input or stopping VPs prevents capture of a reset VM.
+    if request.release_write.is_closed() {
+        tracelimit::warn_ratelimited!("dropping cancelled microVM snapshot boundary request");
+        return None;
+    }
+    Some(request)
+}
 
 pub(super) fn filter(message: VmRpc, boundary_active: bool) -> Option<VmRpc> {
     if !boundary_active {
@@ -52,12 +66,98 @@ pub(super) fn filter(message: VmRpc, boundary_active: bool) -> Option<VmRpc> {
 #[cfg(test)]
 mod tests {
     use super::filter;
+    use super::filter_boundary_request;
+    use chipset::microvm::MicrovmSnapshotRequest;
+    use chipset_device::io::IoError;
+    use chipset_device::io::IoResult;
+    use chipset_device::pio::PortIoIntercept;
+    use chipset_device::poll_device::PollDevice;
     use futures::executor::block_on;
     use mesh::rpc::Rpc;
     use mesh::rpc::RpcSend;
     use openvmm_defs::rpc::VmRpc;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Waker;
     use std::time::Duration;
     use test_with_tracing::test;
+    use vmcore::device_state::ChangeDeviceState;
+
+    const SNAPSHOT_PORT: u16 = 0x605;
+
+    #[test]
+    fn snapshot_boundary_drops_requests_cancelled_by_stop_or_reset() {
+        for reset in [false, true] {
+            let (send, mut requests) = mesh::channel();
+            let mut device = MicrovmSnapshotRequest::new(Some(send), Duration::from_secs(1));
+            device.start();
+            let IoResult::Defer(mut cancelled_write) = device.io_write(SNAPSHOT_PORT, &[0]) else {
+                panic!("snapshot write was not deferred");
+            };
+
+            if reset {
+                block_on(device.reset());
+            } else {
+                block_on(device.stop());
+            }
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(matches!(
+                cancelled_write.poll_write(&mut cx),
+                Poll::Ready(Err(IoError::InvalidRegister))
+            ));
+
+            device.start();
+            let IoResult::Defer(mut next_write) = device.io_write(SNAPSHOT_PORT, &[1]) else {
+                panic!("next snapshot write was not deferred");
+            };
+            // Cancellation leaves the old request ahead of the new one in the queue.
+            let old_request = requests.try_recv().unwrap();
+            assert!(old_request.release_write.is_closed());
+            assert!(filter_boundary_request(old_request).is_none());
+
+            let request = filter_boundary_request(requests.try_recv().unwrap())
+                .expect("a cancelled predecessor must not discard the next request");
+            request.release_write.send(());
+            device.poll_device(&mut cx);
+            assert!(matches!(
+                next_write.poll_write(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
+            block_on(request.write_completed).unwrap();
+            request.transaction_complete.complete(());
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn snapshot_boundary_accepts_live_request() {
+        let (send, mut requests) = mesh::channel();
+        let mut device = MicrovmSnapshotRequest::new(Some(send), Duration::from_secs(1));
+        device.start();
+        let IoResult::Defer(mut write) = device.io_write(SNAPSHOT_PORT, &[0]) else {
+            panic!("snapshot write was not deferred");
+        };
+        let request = filter_boundary_request(requests.try_recv().unwrap())
+            .expect("live snapshot request was discarded");
+        request.release_write.send(());
+        let mut cx = Context::from_waker(Waker::noop());
+        device.poll_device(&mut cx);
+        assert!(matches!(write.poll_write(&mut cx), Poll::Ready(Ok(()))));
+        block_on(request.write_completed).unwrap();
+        request.transaction_complete.complete(());
+    }
+
+    #[test]
+    fn snapshot_boundary_drops_request_from_dropped_device() {
+        let (send, mut requests) = mesh::channel();
+        let mut device = MicrovmSnapshotRequest::new(Some(send), Duration::from_secs(1));
+        assert!(matches!(
+            device.io_write(SNAPSHOT_PORT, &[0]),
+            IoResult::Defer(_)
+        ));
+        drop(device);
+        assert!(filter_boundary_request(requests.try_recv().unwrap()).is_none());
+    }
 
     #[test]
     fn mutation_outside_snapshot_reaches_dispatch() {

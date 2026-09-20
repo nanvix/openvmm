@@ -4193,6 +4193,9 @@ impl LoadedVm {
         &mut self,
         request: chipset_resources::microvm::MicrovmSnapshotBoundaryRequest,
     ) -> bool {
+        let Some(request) = snapshot_rpc::filter_boundary_request(request) else {
+            return true;
+        };
         if self.snapshot_stop_guard.is_some() {
             tracelimit::warn_ratelimited!("dropping duplicate microVM snapshot boundary request");
             request.release_write.send(());
