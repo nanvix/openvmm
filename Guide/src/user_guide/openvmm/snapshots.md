@@ -67,6 +67,27 @@ use an independent memory copy. Automatic microVM backing uses its exact RAM
 file when the filesystem supports hard links. The destination must not already
 exist. Publishing the completed directory is the commit point.
 
+On Windows, large mapped-RAM flushes use up to eight concurrent, disjoint,
+page-aligned ranges to reduce sensitivity to fragmented dirty-page writeback.
+Small ranges are flushed inline. Capture waits for every range, including
+when a flush fails; an error prevents publication. The subsequent file and
+directory durability barriers are unchanged.
+Worker startup has a cost on fast storage; this policy targets writeback
+stalls rather than guaranteeing lower capture latency on every host.
+
+The Windows-only `sparse_mmap` test `profile_fragmented_file_flush` reproduces
+the fragmented writeback workload with alternating dirty 4-KiB pages in a
+128-MiB file. It compares serial and bounded-parallel flushing, including the
+subsequent file sync, and verifies the persisted bytes. Run it on an otherwise
+idle host:
+
+```text
+cargo nextest run --profile agent --release -p sparse_mmap --run-ignored only -E "test(profile_fragmented_file_flush)" --success-output immediate
+```
+
+Timing output is diagnostic, not a portable assertion or proof that an
+external storage-throttling condition has been eliminated.
+
 ```admonish warning
 After a host-driven save, the VM remains **paused**. Guest-requested microVM
 capture instead terminates the source process after publication commits.
