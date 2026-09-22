@@ -1138,6 +1138,15 @@ mod save_restore {
                 transaction_read_mask,
             };
 
+            let status_c = StatusRegC::from(restored_state.cmos[CmosReg::STATUS_C]);
+            if status_c.irq_combined()
+                != (status_c.irq_update() || status_c.irq_periodic() || status_c.irq_alarm())
+            {
+                return Err(RestoreError::InvalidSavedState(anyhow::anyhow!(
+                    "inconsistent RTC status C interrupt flags"
+                )));
+            }
+
             self.state = restored_state;
             self.real_time_source
                 .set_time(LocalClockTime::from_millis_since_unix_epoch(
@@ -1206,6 +1215,37 @@ mod tests {
         rtc.io_write(RtcIoPort::ADDR.0, &temp).unwrap();
         rtc.io_read(RtcIoPort::DATA.0, &mut temp).unwrap();
         temp[0]
+    }
+
+    #[test]
+    fn restore_rejects_inconsistent_status_c_before_mutating_state() {
+        use vmcore::save_restore::{ProtobufSaveRestore, SavedStateBlob};
+
+        for status_c in [0x10, 0x80] {
+            let (_pool, _keeper, _, mut rtc) = new_test_rtc();
+            let before = SaveRestore::save(&mut rtc).unwrap();
+            let mut invalid = SaveRestore::save(&mut rtc).unwrap();
+            invalid.cmos[CmosReg::STATUS_C.0 as usize] = status_c;
+
+            let error =
+                ProtobufSaveRestore::restore(&mut rtc, SavedStateBlob::new(invalid)).unwrap_err();
+            match error {
+                vmcore::save_restore::RestoreError::InvalidSavedState(error) => {
+                    assert_eq!(
+                        error.to_string(),
+                        "inconsistent RTC status C interrupt flags"
+                    )
+                }
+                error => panic!("unexpected restore error: {error}"),
+            }
+
+            let after = SaveRestore::save(&mut rtc).unwrap();
+            assert_eq!(after.addr, before.addr);
+            assert_eq!(after.cmos, before.cmos);
+            assert_eq!(after.clock_time_millis, before.clock_time_millis);
+            assert_eq!(after.transaction_read_mask, before.transaction_read_mask);
+            assert_eq!(after.time_valid, before.time_valid);
+        }
     }
 
     fn set_cmos_data(rtc: &mut Rtc, addr: CmosReg, data: u8) {
