@@ -2438,11 +2438,18 @@ impl VmService {
             VmControllerEvent::ExitRequested { code } => {
                 let reason = format!("guest exited with status {code}");
                 tracing::info!(code, "guest halted with process status");
-                self.lifecycle = VmLifecycle::Halted(reason);
-                if let Some((_, response)) = self.wait_vm_response.take() {
-                    response.send(Ok(()));
+                self.lifecycle = VmLifecycle::Halted(reason.clone());
+                if code == 0 {
+                    if let Some((_, response)) = self.wait_vm_response.take() {
+                        response.send(Ok(()));
+                    }
+                    true
+                } else {
+                    if let Some((_, response)) = self.wait_vm_response.take() {
+                        response.send(Err(grpc_error(anyhow!(reason.clone()))));
+                    }
+                    return Err(anyhow!(reason));
                 }
-                true
             }
             VmControllerEvent::ExitFailed { error } => {
                 self.lifecycle = VmLifecycle::Halted(error.clone());
@@ -3578,9 +3585,21 @@ mod microvm_exit_tests {
     use test_with_tracing::test;
 
     #[test]
-    fn rpc_service_terminates_and_reports_guest_exit_failures() {
+    fn rpc_service_reports_guest_exit_status() {
         DefaultPool::run_with(async |driver| {
-            for failure in [false, true] {
+            for (event, expected_error) in [
+                (VmControllerEvent::ExitRequested { code: 0 }, None),
+                (
+                    VmControllerEvent::ExitRequested { code: 1 },
+                    Some("guest exited with status 1"),
+                ),
+                (
+                    VmControllerEvent::ExitFailed {
+                        error: "console output drain timed out".to_owned(),
+                    },
+                    Some("console output drain timed out"),
+                ),
+            ] {
                 let directory = tempfile::tempdir().unwrap();
                 let listener = UnixListener::bind(directory.path().join("rpc")).unwrap();
                 let (events, event_recv) = mesh::channel();
@@ -3599,13 +3618,7 @@ mod microvm_exit_tests {
                     transport: ResolvedTransport::Auto,
                     registry: FdRegistry::default(),
                 };
-                events.send(if failure {
-                    VmControllerEvent::ExitFailed {
-                        error: "console output drain timed out".to_owned(),
-                    }
-                } else {
-                    VmControllerEvent::ExitRequested { code: 0 }
-                });
+                events.send(event);
                 let result = mesh::CancelContext::new()
                     .with_timeout(Duration::from_secs(5))
                     .until_cancelled(service.run(listener, worker_recv))
@@ -3613,19 +3626,9 @@ mod microvm_exit_tests {
                     .expect("guest exit must stop the RPC service");
                 drop(worker_send);
                 let response = received.await.unwrap();
-                if failure {
-                    assert!(
-                        result
-                            .unwrap_err()
-                            .to_string()
-                            .contains("console output drain timed out")
-                    );
-                    assert!(
-                        response
-                            .unwrap_err()
-                            .message
-                            .contains("console output drain timed out")
-                    );
+                if let Some(expected_error) = expected_error {
+                    assert!(result.unwrap_err().to_string().contains(expected_error));
+                    assert!(response.unwrap_err().message.contains(expected_error));
                 } else {
                     result.unwrap();
                     response.unwrap();
