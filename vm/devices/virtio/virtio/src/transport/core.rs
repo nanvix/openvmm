@@ -31,6 +31,8 @@ use mesh::rpc::RpcSend;
 use pal_async::task::Spawn;
 use pal_async::task::Task;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::task::Poll;
 use vmcore::interrupt::Interrupt;
 use vmcore::save_restore::RestoreError;
@@ -47,6 +49,8 @@ pub(crate) struct QueueData {
     pub msix_vector: u16,
     #[inspect(skip)]
     pub event: pal_event::Event,
+    #[inspect(skip)]
+    pub kick_queued: Arc<AtomicBool>,
     #[inspect(skip)]
     pub saved_state: Option<QueueState>,
 }
@@ -67,6 +71,29 @@ pub(crate) trait TransportOps: Send {
     /// Return the (base_address, entry_size) for doorbell registration,
     /// or `None` if the address is not yet known.
     fn doorbell_region(&mut self) -> Option<(u64, u32)>;
+}
+
+fn mark_kick_queued(queued: &AtomicBool) -> bool {
+    !queued.swap(true, Ordering::AcqRel)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mark_kick_queued;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use test_with_tracing::test;
+
+    #[test]
+    fn queue_kicks_coalesce_until_the_command_is_dequeued() {
+        let queued = AtomicBool::new(false);
+
+        assert!(mark_kick_queued(&queued));
+        assert!(!mark_kick_queued(&queued));
+
+        queued.store(false, Ordering::Release);
+        assert!(mark_kick_queued(&queued));
+    }
 }
 
 /// State shared by both the PCI and MMIO virtio transports.
@@ -145,6 +172,7 @@ impl VirtioTransportCore {
                     initial_size: size,
                     msix_vector: 0,
                     event: pal_event::Event::new(),
+                    kick_queued: Arc::new(AtomicBool::new(false)),
                     saved_state: None,
                 })
             })
@@ -270,8 +298,10 @@ impl VirtioTransportCore {
                 // Event is reused — the device task drains any pending
                 // signal during stop_queue before reset_status runs.
                 event: _,
+                kick_queued,
                 saved_state,
             } = qd;
+            kick_queued.store(false, Ordering::Release);
             *saved_state = None;
             *params = QueueParams {
                 size: *initial_size,
@@ -521,10 +551,13 @@ impl VirtioTransportCore {
     /// Signal a queue notification by index.
     pub fn notify_queue(&self, queue_index: u32) {
         if let Some(qd) = self.queues.get(queue_index as usize) {
-            self.device_sender.send(DeviceCommand::Kick {
-                idx: queue_index as u16,
-                event: qd.event.clone(),
-            });
+            if mark_kick_queued(&qd.kick_queued) {
+                self.device_sender.send(DeviceCommand::Kick {
+                    idx: queue_index as u16,
+                    event: qd.event.clone(),
+                    queued: qd.kick_queued.clone(),
+                });
+            }
         }
     }
 

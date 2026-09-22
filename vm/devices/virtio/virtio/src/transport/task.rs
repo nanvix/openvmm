@@ -25,6 +25,9 @@ use mesh::rpc::PendingRpc;
 use mesh::rpc::Rpc;
 use mesh::rpc::RpcSend;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use vmcore::save_restore::SaveError;
@@ -63,7 +66,11 @@ pub enum DeviceCommand {
         deferred: DeferredWrite,
     },
     /// Queue notification, serialized with private-state activation.
-    Kick { idx: u16, event: pal_event::Event },
+    Kick {
+        idx: u16,
+        event: pal_event::Event,
+        queued: Arc<AtomicBool>,
+    },
     /// Inspect the device state.
     Inspect(inspect::Deferred),
 }
@@ -548,7 +555,8 @@ pub async fn run_device_task(
                 }
                 deferred.complete();
             }
-            DeviceCommand::Kick { idx, event } => {
+            DeviceCommand::Kick { idx, event, queued } => {
+                queued.store(false, Ordering::Release);
                 if let Some(slot) = task.queue_events.get_mut(idx as usize) {
                     *slot = Some(event.clone());
                 }
