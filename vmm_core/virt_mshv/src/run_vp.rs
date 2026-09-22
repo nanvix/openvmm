@@ -81,19 +81,23 @@ unsafe extern "C" fn handle_signal(
 }
 
 fn interrupt_entry(context: &mut libc::ucontext_t) {
+    // xtask-fmt allow-target-arch sys-crate
     #[cfg(target_arch = "x86_64")]
     let ip = context.uc_mcontext.gregs[libc::REG_RIP as usize] as usize;
+    // xtask-fmt allow-target-arch sys-crate
     #[cfg(target_arch = "aarch64")]
     let ip = context.uc_mcontext.pc as usize;
 
     let start = guarded_syscall as *const () as usize;
     let end = openvmm_mshv_syscall_return as *const () as usize;
     if (start..end).contains(&ip) {
+        // xtask-fmt allow-target-arch sys-crate
         #[cfg(target_arch = "x86_64")]
         {
             context.uc_mcontext.gregs[libc::REG_RIP as usize] = end as _;
             context.uc_mcontext.gregs[libc::REG_RAX as usize] = -i64::from(libc::EINTR);
         }
+        // xtask-fmt allow-target-arch sys-crate
         #[cfg(target_arch = "aarch64")]
         {
             context.uc_mcontext.pc = end as _;
@@ -109,6 +113,7 @@ unsafe extern "C" {
 // These are host syscall ABIs, not guest register layouts. The naked functions
 // never change the stack or callee-saved registers, so the signal handler can
 // return directly from any instruction before the syscall's return boundary.
+// xtask-fmt allow-target-arch cpu-intrinsic
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
 /// # Safety
@@ -140,6 +145,7 @@ unsafe extern "C" fn guarded_syscall(
     );
 }
 
+// xtask-fmt allow-target-arch cpu-intrinsic
 #[cfg(target_arch = "aarch64")]
 #[unsafe(naked)]
 /// # Safety
@@ -265,8 +271,10 @@ mod tests {
         let start = guarded_syscall as *const () as usize;
         let end = openvmm_mshv_syscall_return as *const () as usize;
         assert!(start < end);
+        // xtask-fmt allow-target-arch cpu-intrinsic
         #[cfg(target_arch = "x86_64")]
         let restarted_syscall_ip = end - 2;
+        // xtask-fmt allow-target-arch cpu-intrinsic
         #[cfg(target_arch = "aarch64")]
         let restarted_syscall_ip = end - 4;
         for (ip, interrupted) in [
@@ -280,11 +288,13 @@ mod tests {
             // SAFETY: zero is valid for this C structure; the test accesses
             // only its integer instruction-pointer and return-value fields.
             let mut context: libc::ucontext_t = unsafe { std::mem::zeroed() };
+            // xtask-fmt allow-target-arch sys-crate
             #[cfg(target_arch = "x86_64")]
             {
                 context.uc_mcontext.gregs[libc::REG_RIP as usize] = ip as _;
                 context.uc_mcontext.gregs[libc::REG_RAX as usize] = 123;
             }
+            // xtask-fmt allow-target-arch sys-crate
             #[cfg(target_arch = "aarch64")]
             {
                 context.uc_mcontext.pc = ip as _;
@@ -297,6 +307,7 @@ mod tests {
             } else {
                 123
             };
+            // xtask-fmt allow-target-arch sys-crate
             #[cfg(target_arch = "x86_64")]
             {
                 assert_eq!(
@@ -308,6 +319,7 @@ mod tests {
                     expected_result
                 );
             }
+            // xtask-fmt allow-target-arch sys-crate
             #[cfg(target_arch = "aarch64")]
             {
                 assert_eq!(context.uc_mcontext.pc as usize, expected_ip);
