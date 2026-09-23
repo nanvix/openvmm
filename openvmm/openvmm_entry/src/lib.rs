@@ -254,6 +254,22 @@ fn microvm_console_attachments_share_endpoint(
         }
 }
 
+fn microvm_console_listener_replacement_matches(
+    saved: &openvmm_helpers::snapshot::SnapshotAttachment,
+    requested: &openvmm_helpers::snapshot::SnapshotAttachment,
+) -> bool {
+    matches!(
+        saved.reconnect_policy.as_str(),
+        "recreate-listener" | "broker-authenticated-listener"
+    ) && saved.stable_id == requested.stable_id
+        && saved.kind == requested.kind
+        && saved.required == requested.required
+        && saved.reconnect_policy == requested.reconnect_policy
+        && saved.identity_kind == requested.identity_kind
+        && saved.length == requested.length
+        && saved.reconnect_timeout_ms == requested.reconnect_timeout_ms
+}
+
 #[derive(Clone)]
 struct EffectiveMicrovmNetwork {
     config: openvmm_defs::config::MicrovmNetworkConfig,
@@ -711,6 +727,23 @@ fn microvm_console_attachment_from_snapshot_with_identity(
             requested.is_some(),
             "snapshot requires an explicitly approved restore-time control attachment"
         );
+    }
+    if matches!(
+        attachment.reconnect_policy.as_str(),
+        "recreate-listener" | "broker-authenticated-listener"
+    ) {
+        if let Some(requested) = requested {
+            let requested = if control_console {
+                microvm_control_console_attachment_from_cli(requested)?
+            } else {
+                microvm_console_attachment_from_cli(requested)?
+            };
+            anyhow::ensure!(
+                microvm_console_listener_replacement_matches(attachment, &requested.2),
+                "restore-time virtio-console listener does not match the snapshot attachment contract"
+            );
+            return Ok(requested);
+        }
     }
     let config = match (
         attachment.reconnect_policy.as_str(),
@@ -1728,6 +1761,34 @@ mod microvm_console_attachment_tests {
     }
 
     #[test]
+    fn listener_replacement_contract_changes_only_endpoint_identity() {
+        let saved = socket_attachment(Path::new("source.sock"));
+        let mut requested = saved.clone();
+        requested.identity = b"restored.sock".to_vec();
+        assert!(microvm_console_listener_replacement_matches(
+            &saved, &requested
+        ));
+
+        requested.kind = "virtio-control-console".to_owned();
+        assert!(!microvm_console_listener_replacement_matches(
+            &saved, &requested
+        ));
+    }
+
+    #[test]
+    fn listener_replacement_alignment_preserves_saved_machine_contract() {
+        let saved_attachment = socket_attachment(Path::new("source.sock"));
+        let mut requested_attachment = saved_attachment.clone();
+        requested_attachment.identity = b"restored.sock".to_vec();
+        let saved = vec![saved_attachment.clone()];
+        let mut expected = vec![requested_attachment];
+
+        align_restore_console_listener_attachments(&saved, &mut expected);
+
+        assert_eq!(expected, vec![saved_attachment]);
+    }
+
+    #[test]
     fn client_attachment_is_required_and_bounded() {
         let requested = SerialConfigCli::ConnectTcp("127.0.0.1:5555".parse().unwrap());
         let (_, resource, snapshot) = microvm_console_attachment_from_cli(&requested).unwrap();
@@ -1747,6 +1808,98 @@ mod microvm_console_attachment_tests {
             microvm_console_attachment_from_snapshot(&snapshot, Some(&requested)).unwrap();
         assert!(matches!(restored, SerialConfigCli::ConnectTcp(_)));
         assert_eq!(restored_snapshot, snapshot);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listener_attachment_accepts_fresh_restore_identity_after_source_cleanup() {
+        let source_directory = tempfile::tempdir().unwrap();
+        let source = SerialConfigCli::Pipe(source_directory.path().join("source.sock"));
+        let (_, _, snapshot) = microvm_console_attachment_from_cli(&source).unwrap();
+        source_directory.close().unwrap();
+        let restore_directory = tempfile::tempdir().unwrap();
+        let requested = SerialConfigCli::Pipe(restore_directory.path().join("restored.sock"));
+
+        let (restored, resource, restored_attachment) =
+            microvm_console_attachment_from_snapshot(&snapshot, Some(&requested)).unwrap();
+
+        let SerialConfigCli::Pipe(restored_path) = restored else {
+            panic!("restore did not retain a listener");
+        };
+        assert!(restored_path.ends_with("restored.sock"));
+        assert_eq!(
+            resource.reconnect_policy,
+            virtio_resources::console::VirtioConsoleReconnectPolicy::RecreateListener
+        );
+        assert_ne!(restored_attachment.identity, snapshot.identity);
+        assert!(restored_attachment.identity.ends_with(b"restored.sock"));
+        assert!(microvm_console_listener_replacement_matches(
+            &snapshot,
+            &restored_attachment
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_control_listener_accepts_fresh_identity_after_source_cleanup() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let source_directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            source_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let source = SerialConfigCli::Pipe(source_directory.path().join("source-control.sock"));
+        let (_, _, snapshot) = microvm_control_console_attachment_from_cli(&source).unwrap();
+        source_directory.close().unwrap();
+        let restore_directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            restore_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let requested =
+            SerialConfigCli::Pipe(restore_directory.path().join("restored-control.sock"));
+
+        let (restored, resource, restored_attachment) =
+            microvm_console_attachment_from_snapshot_with_identity(
+                &snapshot,
+                Some(&requested),
+                MICROVM_CONTROL_CONSOLE_STABLE_ID,
+                MICROVM_CONTROL_CONSOLE_ATTACHMENT_KIND,
+                true,
+            )
+            .unwrap();
+
+        let SerialConfigCli::Pipe(restored_path) = restored else {
+            panic!("restore did not retain a control listener");
+        };
+        assert!(restored_path.ends_with("restored-control.sock"));
+        assert_eq!(
+            resource.reconnect_policy,
+            virtio_resources::console::VirtioConsoleReconnectPolicy::RecreateListener
+        );
+        assert_eq!(
+            restored_attachment.reconnect_policy,
+            "broker-authenticated-listener"
+        );
+        assert_ne!(restored_attachment.identity, snapshot.identity);
+        assert!(microvm_console_listener_replacement_matches(
+            &snapshot,
+            &restored_attachment
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listener_attachment_rejects_restore_client_substitution() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = SerialConfigCli::Pipe(directory.path().join("source.sock"));
+        let requested = SerialConfigCli::ConnectPipe(directory.path().join("restored.sock"));
+        let (_, _, snapshot) = microvm_console_attachment_from_cli(&source).unwrap();
+
+        assert!(microvm_console_attachment_from_snapshot(&snapshot, Some(&requested)).is_err());
     }
 
     #[test]
@@ -5620,6 +5773,36 @@ fn align_legacy_network_policy_contract(
     }
 }
 
+fn align_restore_console_listener_contract(
+    saved: &openvmm_helpers::snapshot::SnapshotMachineContract,
+    expected: &mut openvmm_helpers::snapshot::SnapshotMachineContract,
+) {
+    align_restore_console_listener_attachments(&saved.attachments, &mut expected.attachments);
+}
+
+fn align_restore_console_listener_attachments(
+    saved: &[openvmm_helpers::snapshot::SnapshotAttachment],
+    expected: &mut [openvmm_helpers::snapshot::SnapshotAttachment],
+) {
+    for stable_id in [MICROVM_CONSOLE_STABLE_ID, MICROVM_CONTROL_CONSOLE_STABLE_ID] {
+        let Some(saved_attachment) = saved
+            .iter()
+            .find(|attachment| attachment.stable_id == stable_id)
+        else {
+            continue;
+        };
+        let Some(expected_attachment) = expected
+            .iter_mut()
+            .find(|attachment| attachment.stable_id == stable_id)
+        else {
+            continue;
+        };
+        if microvm_console_listener_replacement_matches(saved_attachment, expected_attachment) {
+            expected_attachment.clone_from(saved_attachment);
+        }
+    }
+}
+
 pub(crate) fn prepare_snapshot_restore_for_config(
     snapshot: openvmm_helpers::snapshot::OpenedSnapshot,
     expected_memory_size: u64,
@@ -5696,6 +5879,7 @@ pub(crate) fn prepare_snapshot_restore_for_config(
             saved_contract.cpu_contract.clone(),
         )?;
         align_legacy_network_policy_contract(saved_contract, &mut expected_contract);
+        align_restore_console_listener_contract(saved_contract, &mut expected_contract);
         openvmm_helpers::snapshot::validate_microvm_machine_contract(manifest, &expected_contract)?;
         let capture_time: std::time::SystemTime = saved_contract
             .capture_wall_clock
