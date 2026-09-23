@@ -129,6 +129,9 @@ listener paths. The replacement must retain the saved stable device ID,
 attachment kind, backend kind, reconnect policy, required flag, and timeout;
 only the listener endpoint identity may change. This permits independent clone
 restores to use private boot-console and authenticated control sockets.
+OpenVMM validates an approved replacement without reopening or canonicalizing
+the captured listener path, so the source generation's private directory need
+not survive until restore.
 Client, inherited-provider, and disconnected attachments retain their stricter
 saved-identity requirements.
 

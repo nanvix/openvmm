@@ -728,6 +728,23 @@ fn microvm_console_attachment_from_snapshot_with_identity(
             "snapshot requires an explicitly approved restore-time control attachment"
         );
     }
+    if matches!(
+        attachment.reconnect_policy.as_str(),
+        "recreate-listener" | "broker-authenticated-listener"
+    ) {
+        if let Some(requested) = requested {
+            let requested = if control_console {
+                microvm_control_console_attachment_from_cli(requested)?
+            } else {
+                microvm_console_attachment_from_cli(requested)?
+            };
+            anyhow::ensure!(
+                microvm_console_listener_replacement_matches(attachment, &requested.2),
+                "restore-time virtio-console listener does not match the snapshot attachment contract"
+            );
+            return Ok(requested);
+        }
+    }
     let config = match (
         attachment.reconnect_policy.as_str(),
         attachment.identity_kind.as_str(),
@@ -780,16 +797,6 @@ fn microvm_console_attachment_from_snapshot_with_identity(
         } else {
             microvm_console_attachment_from_cli(requested)?
         };
-        if matches!(
-            attachment.reconnect_policy.as_str(),
-            "recreate-listener" | "broker-authenticated-listener"
-        ) {
-            anyhow::ensure!(
-                microvm_console_listener_replacement_matches(attachment, &requested.2),
-                "restore-time virtio-console listener does not match the snapshot attachment contract"
-            );
-            return Ok(requested);
-        }
         anyhow::ensure!(
             requested.2 == *attachment,
             "restore-time virtio-console does not match the snapshot attachment"
@@ -1805,11 +1812,13 @@ mod microvm_console_attachment_tests {
 
     #[cfg(unix)]
     #[test]
-    fn listener_attachment_accepts_fresh_restore_identity() {
-        let directory = tempfile::tempdir().unwrap();
-        let source = SerialConfigCli::Pipe(directory.path().join("source.sock"));
-        let requested = SerialConfigCli::Pipe(directory.path().join("restored.sock"));
+    fn listener_attachment_accepts_fresh_restore_identity_after_source_cleanup() {
+        let source_directory = tempfile::tempdir().unwrap();
+        let source = SerialConfigCli::Pipe(source_directory.path().join("source.sock"));
         let (_, _, snapshot) = microvm_console_attachment_from_cli(&source).unwrap();
+        source_directory.close().unwrap();
+        let restore_directory = tempfile::tempdir().unwrap();
+        let requested = SerialConfigCli::Pipe(restore_directory.path().join("restored.sock"));
 
         let (restored, resource, restored_attachment) =
             microvm_console_attachment_from_snapshot(&snapshot, Some(&requested)).unwrap();
@@ -1832,14 +1841,26 @@ mod microvm_console_attachment_tests {
 
     #[cfg(unix)]
     #[test]
-    fn authenticated_control_listener_accepts_fresh_restore_identity() {
+    fn authenticated_control_listener_accepts_fresh_identity_after_source_cleanup() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let source = SerialConfigCli::Pipe(directory.path().join("source-control.sock"));
-        let requested = SerialConfigCli::Pipe(directory.path().join("restored-control.sock"));
+        let source_directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            source_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let source = SerialConfigCli::Pipe(source_directory.path().join("source-control.sock"));
         let (_, _, snapshot) = microvm_control_console_attachment_from_cli(&source).unwrap();
+        source_directory.close().unwrap();
+        let restore_directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            restore_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let requested =
+            SerialConfigCli::Pipe(restore_directory.path().join("restored-control.sock"));
 
         let (restored, resource, restored_attachment) =
             microvm_console_attachment_from_snapshot_with_identity(
