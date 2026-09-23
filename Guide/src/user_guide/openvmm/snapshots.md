@@ -125,10 +125,13 @@ are mutually exclusive). Guest writes use a private copy-on-write mapping and
 do not modify the snapshot artifact.
 
 Saved virtio-console listener attachments may be rebound to fresh restore-time
-listener paths. The replacement must retain the saved stable device ID,
-attachment kind, backend kind, reconnect policy, required flag, and timeout;
-only the listener endpoint identity may change. This permits independent clone
-restores to use private boot-console and authenticated control sockets.
+listener paths. The replacement must retain the saved stable attachment ID,
+attachment kind, backend kind, reconnect policy, required flag, length, and
+timeout; only the listener endpoint identity may change. Restore callers use
+`--virtio-console listen=<FRESH-ENDPOINT>` and, for an authenticated control
+listener, `--microvm-control-console listen=<FRESH-ENDPOINT>` with
+`--microvm-control-auth-stdin`. This permits independent clone restores to use
+private boot-console and authenticated control sockets.
 OpenVMM validates an approved replacement without reopening or canonicalizing
 the captured listener path, so the source generation's private directory need
 not survive until restore.

@@ -1891,6 +1891,77 @@ mod microvm_console_attachment_tests {
         ));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn named_pipe_listener_accepts_fresh_restore_identity() {
+        let source =
+            SerialConfigCli::Pipe(PathBuf::from("//./pipe/openvmm-microvm-source-console"));
+        let requested =
+            SerialConfigCli::Pipe(PathBuf::from("//./pipe/openvmm-microvm-restored-console"));
+        let (_, _, snapshot) = microvm_console_attachment_from_cli(&source).unwrap();
+
+        let (restored, resource, restored_attachment) =
+            microvm_console_attachment_from_snapshot(&snapshot, Some(&requested)).unwrap();
+
+        let SerialConfigCli::Pipe(restored_path) = restored else {
+            panic!("restore did not retain a named-pipe listener");
+        };
+        assert_eq!(
+            restored_path,
+            PathBuf::from("//./pipe/openvmm-microvm-restored-console")
+        );
+        assert_eq!(
+            resource.reconnect_policy,
+            virtio_resources::console::VirtioConsoleReconnectPolicy::RecreateListener
+        );
+        assert_ne!(restored_attachment.identity, snapshot.identity);
+        assert!(microvm_console_listener_replacement_matches(
+            &snapshot,
+            &restored_attachment
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn authenticated_named_pipe_listener_accepts_fresh_restore_identity() {
+        let source =
+            SerialConfigCli::Pipe(PathBuf::from("//./pipe/openvmm-microvm-source-control"));
+        let requested =
+            SerialConfigCli::Pipe(PathBuf::from("//./pipe/openvmm-microvm-restored-control"));
+        let (_, _, snapshot) = microvm_control_console_attachment_from_cli(&source).unwrap();
+
+        let (restored, resource, restored_attachment) =
+            microvm_console_attachment_from_snapshot_with_identity(
+                &snapshot,
+                Some(&requested),
+                MICROVM_CONTROL_CONSOLE_STABLE_ID,
+                MICROVM_CONTROL_CONSOLE_ATTACHMENT_KIND,
+                true,
+            )
+            .unwrap();
+
+        let SerialConfigCli::Pipe(restored_path) = restored else {
+            panic!("restore did not retain an authenticated named-pipe listener");
+        };
+        assert_eq!(
+            restored_path,
+            PathBuf::from("//./pipe/openvmm-microvm-restored-control")
+        );
+        assert_eq!(
+            resource.reconnect_policy,
+            virtio_resources::console::VirtioConsoleReconnectPolicy::RecreateListener
+        );
+        assert_eq!(
+            restored_attachment.reconnect_policy,
+            "broker-authenticated-listener"
+        );
+        assert_ne!(restored_attachment.identity, snapshot.identity);
+        assert!(microvm_console_listener_replacement_matches(
+            &snapshot,
+            &restored_attachment
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn listener_attachment_rejects_restore_client_substitution() {
