@@ -36,6 +36,15 @@ use vm_resource::IntoResource;
 use vmotherboard::ChipsetDeviceHandle;
 
 impl PetriVmConfigOpenVmm {
+    /// Modify the effective Linux direct kernel command line.
+    pub fn with_linux_command_line(mut self, f: impl FnOnce(&mut String)) -> Self {
+        let LoadMode::Linux { cmdline, .. } = &mut self.config.load_mode else {
+            panic!("Linux command-line configuration requires Linux direct boot.")
+        };
+        f(cmdline);
+        self
+    }
+
     /// Enable the VTL0 alias map.
     // TODO: Remove once #912 is fixed.
     pub fn with_vtl0_alias_map(mut self) -> Self {
@@ -101,7 +110,7 @@ impl PetriVmConfigOpenVmm {
                 LoadMode::Linux { smbios, .. }
                 | LoadMode::Uefi { smbios, .. }
                 | LoadMode::Pcat { smbios, .. } => &mut **smbios,
-                LoadMode::Igvm { .. } | LoadMode::None | LoadMode::Pvh { .. } => {
+                LoadMode::Igvm { .. } | LoadMode::None => {
                     panic!("SMBIOS configuration is not supported for this load mode.")
                 }
             };

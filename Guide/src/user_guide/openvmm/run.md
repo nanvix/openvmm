@@ -78,14 +78,13 @@ NUMA, xAPIC mode, and contiguous APIC IDs `0..N-1`; APIC ID 0 is the BSP.
 Custom socket, SMT, APIC, x2APIC, and NUMA options are rejected.
 
 The microVM uses fixed virtio device slots and sandbox block roles. Its
-persisted ABI and Xen PVH layout values remain 2: the MP table still begins at
-`0x400`, while
-the boot GDT moves to `0x800` so the eight-processor table cannot overlap it.
-The MP table and ACPI MADT are generated from the same canonical topology.
-ABI and layout value 1 snapshots are rejected.
+persisted ABI and boot layout remain value 2. The
+MP floating pointer begins at `0x0`, the MP configuration table at `0x400`,
+the boot GDT at `0x1000`, and the Linux zero page at `0x2000`. No ACPI MADT or
+SMBIOS data is exposed.
 
 Snapshots record the ABI version, processor count, full topology, APIC IDs,
-and PVH layout version. Restore requires an exact match before any VP starts.
+and boot-layout version. Restore requires an exact match before any VP starts.
 For example:
 
 ```shell

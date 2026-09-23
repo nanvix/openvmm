@@ -1841,16 +1841,24 @@ impl InitializedVm {
         let mut cfg = cfg;
 
         #[cfg(guest_arch = "x86_64")]
-        if saved_state.is_none()
-            && matches!(cfg.machine_profile, MachineProfile::Microvm)
-            && let LoadMode::Pvh { cmdline, .. } = &mut cfg.load_mode
-        {
+        if saved_state.is_none() && matches!(cfg.machine_profile, MachineProfile::Microvm) {
+            let cmdline = match &mut cfg.load_mode {
+                LoadMode::Linux {
+                    cmdline,
+                    boot_mode: openvmm_defs::config::LinuxDirectBootMode::MpTable,
+                    ..
+                } => Some(cmdline),
+                _ => None,
+            };
+            let Some(cmdline) = cmdline else {
+                anyhow::bail!("microVM has no supported cold-boot command line");
+            };
             match partition
                 .tsc_frequency_hz()
                 .context("failed to query the backend guest TSC frequency")?
             {
                 Some(frequency_hz) => {
-                    super::vm_loaders::pvh::propagate_snapshot_tsc_frequency(
+                    super::vm_loaders::microvm::propagate_snapshot_tsc_frequency(
                         cmdline,
                         frequency_hz,
                         snapshot_capture_enabled,
@@ -1866,7 +1874,7 @@ impl InitializedVm {
                 .context("failed to query the backend guest LAPIC frequency")?
             {
                 Some(frequency_hz) => {
-                    super::vm_loaders::pvh::propagate_apic_frequency(cmdline, frequency_hz)
+                    super::vm_loaders::microvm::propagate_apic_frequency(cmdline, frequency_hz)
                         .context("failed to propagate the guest LAPIC frequency")?;
                 }
                 None => tracing::warn!(
@@ -3760,59 +3768,6 @@ impl LoadedVmInner {
         } = match &self.load_mode {
             LoadMode::None => return Ok(()),
             #[cfg(guest_arch = "x86_64")]
-            LoadMode::Pvh {
-                kernel,
-                initrd,
-                cmdline,
-            } => {
-                anyhow::ensure!(
-                    self.machine_profile == MachineProfile::Microvm,
-                    "PVH load mode requires the microVM profile"
-                );
-                let pvh_reserved_memory_ranges = vec![MemoryRange::new(
-                    openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA
-                        ..openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA
-                            + openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_SIZE,
-                )];
-                let apic_ids = self
-                    .processor_topology
-                    .vps_arch()
-                    .map(|vp| vp.apic_id)
-                    .collect::<Vec<_>>();
-                let tables = acpi_builder.build_acpi_tables(loader::pvh::ACPI_RSDP_ADDR, |dsdt| {
-                    add_devices_to_dsdt_x64(
-                        dsdt,
-                        &self.chipset_cfg,
-                        &self.chipset_capabilities,
-                        false,
-                        false,
-                        &self.chipset_mmio,
-                        self.virtio_mmio_region,
-                        self.virtio_mmio_irq,
-                        &self.pci_legacy_interrupts,
-                    )
-                });
-                super::vm_loaders::pvh::load_pvh(
-                    &super::vm_loaders::pvh::KernelConfig {
-                        kernel,
-                        initrd,
-                        cmdline,
-                        mem_layout: &self.mem_layout,
-                        acpi_tables: loader::pvh::AcpiTables {
-                            rsdp: tables.rsdp,
-                            tables: tables.tables,
-                        },
-                        boot_config: loader::pvh::BootConfig {
-                            apic_ids: &apic_ids,
-                            level_triggered_irqs:
-                                &openvmm_defs::config::MICROVM_LEVEL_TRIGGERED_IRQS,
-                            reserved_memory_ranges: &pvh_reserved_memory_ranges,
-                        },
-                    },
-                    &self.gm,
-                )?
-            }
-            #[cfg(guest_arch = "x86_64")]
             &LoadMode::Linux {
                 ref kernel,
                 ref initrd,
@@ -3821,75 +3776,112 @@ impl LoadedVmInner {
                 isolation,
                 boot_mode,
                 ref smbios,
-            } => {
-                match boot_mode {
-                    openvmm_defs::config::LinuxDirectBootMode::DeviceTree => {
-                        anyhow::bail!("device tree boot mode is not supported on x86_64");
-                    }
-                    openvmm_defs::config::LinuxDirectBootMode::Acpi => {}
+            } => match boot_mode {
+                openvmm_defs::config::LinuxDirectBootMode::DeviceTree => {
+                    anyhow::bail!("device tree boot mode is not supported on x86_64");
                 }
-                let isolation = match (isolation, self.hypervisor_cfg.with_isolation) {
-                    (
-                        openvmm_defs::config::LinuxIsolationConfig::Snp {
-                            restricted_injection,
-                        },
-                        Some(openvmm_defs::config::IsolationType::Snp),
-                    ) => super::vm_loaders::linux::KernelIsolationConfig::Snp(
-                        super::vm_loaders::linux::SnpKernelConfig {
-                            c_bit: self
-                                .partition
-                                .caps()
-                                .snp_c_bit
-                                .context("missing SNP C-bit CPUID information")?,
-                            restricted_injection,
-                        },
-                    ),
-                    (
-                        openvmm_defs::config::LinuxIsolationConfig::None,
-                        Some(openvmm_defs::config::IsolationType::Snp),
-                    ) => anyhow::bail!("SNP partition requires SNP Linux loader configuration"),
-                    (openvmm_defs::config::LinuxIsolationConfig::Snp { .. }, _) => {
-                        anyhow::bail!("SNP Linux loader configuration requires SNP isolation")
-                    }
-                    (openvmm_defs::config::LinuxIsolationConfig::None, _) => {
-                        super::vm_loaders::linux::KernelIsolationConfig::None
-                    }
-                };
-                let kernel_config = super::vm_loaders::linux::KernelConfig {
-                    kernel,
-                    initrd,
-                    cmdline,
-                    mem_layout: &self.mem_layout,
-                    isolation,
-                    smbios,
-                };
-                super::vm_loaders::linux::load_linux_x86(
-                    &kernel_config,
-                    &self.gm,
-                    self.partition.caps(),
-                    &self.processor_topology.vp_arch(VpIndex::BSP),
-                    |gpa| {
-                        let tables = acpi_builder.build_acpi_tables(gpa, |dsdt| {
-                            add_devices_to_dsdt_x64(
-                                dsdt,
-                                &self.chipset_cfg,
-                                &self.chipset_capabilities,
-                                enable_serial,
-                                self.vmbus_server.is_some(),
-                                &self.chipset_mmio,
-                                self.virtio_mmio_region,
-                                self.virtio_mmio_irq,
-                                &self.pci_legacy_interrupts,
-                            )
-                        });
-
-                        loader::linux::AcpiTables {
-                            rsdp: tables.rsdp,
-                            tables: tables.tables,
+                openvmm_defs::config::LinuxDirectBootMode::MpTable => {
+                    anyhow::ensure!(
+                        self.machine_profile == MachineProfile::Microvm,
+                        "Linux MP-table boot mode requires the microVM profile"
+                    );
+                    anyhow::ensure!(
+                        isolation == openvmm_defs::config::LinuxIsolationConfig::None
+                            && self.hypervisor_cfg.with_isolation.is_none(),
+                        "microVM MP-table boot does not support isolation"
+                    );
+                    let apic_ids = self
+                        .processor_topology
+                        .vps_arch()
+                        .map(|vp| vp.apic_id)
+                        .collect::<Vec<_>>();
+                    let reserved_memory_ranges = [MemoryRange::new(
+                        openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA
+                            ..openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_GPA
+                                + openvmm_defs::config::MICROVM_SHARED_STATUS_PAGE_SIZE,
+                    )];
+                    let kernel_config = super::vm_loaders::linux::KernelConfig {
+                        kernel,
+                        initrd,
+                        cmdline,
+                        mem_layout: &self.mem_layout,
+                        isolation: super::vm_loaders::linux::KernelIsolationConfig::None,
+                        smbios,
+                    };
+                    super::vm_loaders::linux::load_linux_x86_mptable(
+                        &kernel_config,
+                        &self.gm,
+                        &apic_ids,
+                        &openvmm_defs::config::MICROVM_LEVEL_TRIGGERED_IRQS,
+                        &reserved_memory_ranges,
+                    )?
+                }
+                openvmm_defs::config::LinuxDirectBootMode::Acpi => {
+                    let isolation = match (isolation, self.hypervisor_cfg.with_isolation) {
+                        (
+                            openvmm_defs::config::LinuxIsolationConfig::Snp {
+                                restricted_injection,
+                            },
+                            Some(openvmm_defs::config::IsolationType::Snp),
+                        ) => super::vm_loaders::linux::KernelIsolationConfig::Snp(
+                            super::vm_loaders::linux::SnpKernelConfig {
+                                c_bit: self
+                                    .partition
+                                    .caps()
+                                    .snp_c_bit
+                                    .context("missing SNP C-bit CPUID information")?,
+                                restricted_injection,
+                            },
+                        ),
+                        (
+                            openvmm_defs::config::LinuxIsolationConfig::None,
+                            Some(openvmm_defs::config::IsolationType::Snp),
+                        ) => {
+                            anyhow::bail!("SNP partition requires SNP Linux loader configuration")
                         }
-                    },
-                )?
-            }
+                        (openvmm_defs::config::LinuxIsolationConfig::Snp { .. }, _) => {
+                            anyhow::bail!("SNP Linux loader configuration requires SNP isolation")
+                        }
+                        (openvmm_defs::config::LinuxIsolationConfig::None, _) => {
+                            super::vm_loaders::linux::KernelIsolationConfig::None
+                        }
+                    };
+                    let kernel_config = super::vm_loaders::linux::KernelConfig {
+                        kernel,
+                        initrd,
+                        cmdline,
+                        mem_layout: &self.mem_layout,
+                        isolation,
+                        smbios,
+                    };
+                    super::vm_loaders::linux::load_linux_x86(
+                        &kernel_config,
+                        &self.gm,
+                        self.partition.caps(),
+                        &self.processor_topology.vp_arch(VpIndex::BSP),
+                        |gpa| {
+                            let tables = acpi_builder.build_acpi_tables(gpa, |dsdt| {
+                                add_devices_to_dsdt_x64(
+                                    dsdt,
+                                    &self.chipset_cfg,
+                                    &self.chipset_capabilities,
+                                    enable_serial,
+                                    self.vmbus_server.is_some(),
+                                    &self.chipset_mmio,
+                                    self.virtio_mmio_region,
+                                    self.virtio_mmio_irq,
+                                    &self.pci_legacy_interrupts,
+                                )
+                            });
+
+                            loader::linux::AcpiTables {
+                                rsdp: tables.rsdp,
+                                tables: tables.tables,
+                            }
+                        },
+                    )?
+                }
+            },
             #[cfg(guest_arch = "aarch64")]
             &LoadMode::Linux {
                 ref kernel,
@@ -4574,12 +4566,17 @@ impl LoadedVm {
                                 Default::default(),
                             );
                             let effective_command_line = match &self.inner.load_mode {
-                                LoadMode::Pvh { cmdline, .. } => cmdline.clone(),
+                                LoadMode::Linux {
+                                    cmdline,
+                                    boot_mode:
+                                        openvmm_defs::config::LinuxDirectBootMode::MpTable,
+                                    ..
+                                } => cmdline.clone(),
                                 _ => {
                                     return Err(
                                         openvmm_defs::rpc::SnapshotQuiesceError::RollbackSafe(
                                             RemoteError::new(anyhow::anyhow!(
-                                                "microVM snapshot has no effective PVH command line"
+                                                "microVM snapshot has no effective command line"
                                             )),
                                         ),
                                     );
