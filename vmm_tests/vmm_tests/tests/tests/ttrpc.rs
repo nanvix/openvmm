@@ -8,12 +8,14 @@
 // Linux.
 #[cfg(target_os = "linux")]
 mod fd_passing;
+mod microvm;
 
 use anyhow::Context;
 use futures::AsyncBufReadExt;
 use futures::AsyncReadExt;
 use guid::Guid;
 use mesh::CancelContext;
+use microvm::test_ttrpc_microvm_linux_direct_lifecycle_and_snapshot;
 use openvmm_ttrpc_vmservice as vmservice;
 use pal_async::DefaultDriver;
 use pal_async::pipe::PolledPipe;
@@ -33,6 +35,13 @@ use std::process::Stdio;
 use std::time::Duration;
 use unix_socket::UnixListener;
 use unix_socket::UnixStream;
+
+// Registered here, rather than in the `microvm` module, to keep the test named
+// `ttrpc::test_ttrpc_microvm_linux_direct_lifecycle_and_snapshot`.
+petri::test!(
+    test_ttrpc_microvm_linux_direct_lifecycle_and_snapshot,
+    microvm::lifecycle_and_snapshot_artifacts
+);
 
 petri::test!(test_ttrpc_interface, |resolver| {
     let openvmm = resolver.require(artifacts::OPENVMM_NATIVE);
@@ -127,6 +136,7 @@ async fn test_ttrpc_interface(
             vmservice::CreateVmRequest {
                 config: Some(vmservice::VmConfig::default()),
                 log_id: String::new(),
+                microvm_snapshot: None,
             },
         )
         .await
@@ -430,6 +440,7 @@ async fn test_ttrpc_interface(
                                 tag: "testfs".to_string(),
                                 root_path: virtiofs_root.to_string_lossy().into(),
                                 read_only: i == 0,
+                                ..Default::default()
                             }],
                             // A SCSI controller keeps a request channel
                             // alive for the lifetime of the VM, which used
@@ -451,6 +462,7 @@ async fn test_ttrpc_interface(
                         ..Default::default()
                     }),
                     log_id: String::new(),
+                    microvm_snapshot: None,
                 },
             )
             .await
@@ -583,6 +595,7 @@ async fn test_ttrpc_interface(
                                 tag: "hotplugfs".to_string(),
                                 root_path: hotplug_virtiofs_root.to_string_lossy().into(),
                                 read_only: true,
+                                ..Default::default()
                             },
                         ))),
                     },
@@ -917,6 +930,7 @@ async fn test_ttrpc_uefi_boot(
                         ..Default::default()
                     }),
                     log_id: String::new(),
+                    microvm_snapshot: None,
                 },
             )
             .await
@@ -1109,6 +1123,7 @@ fn virtio_fs_vpci_request(
                 tag: tag.to_string(),
                 root_path: root_path.to_string_lossy().into_owned(),
                 read_only,
+                ..Default::default()
             },
         ))),
     }

@@ -6,6 +6,9 @@
 #![expect(unsafe_code)]
 #![cfg(test)]
 
+mod interrupt;
+mod saved_state;
+
 use crate::DeviceTraits;
 use crate::DynVirtioDevice;
 use crate::PciInterruptModel;
@@ -94,20 +97,6 @@ async fn must_recv_in_timeout<T: 'static + Send>(
         .unwrap()
 }
 
-async fn assert_no_recv_in_timeout<T: 'static + Send>(
-    recv: &mut mesh::Receiver<T>,
-    timeout: Duration,
-) {
-    if mesh::CancelContext::new()
-        .with_timeout(timeout)
-        .until_cancelled(recv.next())
-        .await
-        .is_ok()
-    {
-        panic!("Expected timeout, but received a value");
-    }
-}
-
 /// Yield execution to the async executor, allowing spawned tasks to run.
 async fn yield_now() {
     let mut yielded = false;
@@ -145,6 +134,7 @@ struct VirtioTestMemoryAccess {
     /// Behind an `Arc` so each handed-out registration can remove its own entry
     /// when it is dropped.
     live_doorbells: Arc<Mutex<Vec<DoorbellSpec>>>,
+    doorbell_events: Arc<Mutex<Vec<(DoorbellSpec, Event)>>>,
 }
 
 /// A doorbell registration as the transport asked for it.
@@ -310,12 +300,22 @@ unsafe impl GuestMemoryAccess for VirtioTestMemoryAccess {
         };
         Ok(())
     }
+
+    fn compare_exchange_fallback(
+        &self,
+        address: u64,
+        current: &mut [u8],
+        new: &[u8],
+    ) -> Result<bool, GuestMemoryBackingError> {
+        self.compare_exchange_memory(address, current, new)
+    }
 }
 
 /// The handle a doorbell registration hands back. Dropping it is what
 /// UNINSTALLS the doorbell, so it de-registers itself from `live_doorbells`.
 struct DoorbellEntry {
     live: Arc<Mutex<Vec<DoorbellSpec>>>,
+    _event: interrupt::DoorbellEvent,
     spec: DoorbellSpec,
 }
 
@@ -334,7 +334,7 @@ impl DoorbellRegistration for VirtioTestMemoryAccess {
         address: u64,
         value: Option<u64>,
         length: Option<u32>,
-        _: &Event,
+        event: &Event,
     ) -> io::Result<Box<dyn Send + Sync>> {
         self.doorbell_count.fetch_add(1, Ordering::Relaxed);
         let spec = DoorbellSpec {
@@ -345,6 +345,7 @@ impl DoorbellRegistration for VirtioTestMemoryAccess {
         self.live_doorbells.lock().push(spec);
         Ok(Box::new(DoorbellEntry {
             live: self.live_doorbells.clone(),
+            _event: interrupt::DoorbellEvent::register(&self.doorbell_events, spec, event),
             spec,
         }))
     }
@@ -2558,16 +2559,21 @@ async fn verify_packed_queue_simple(driver: DefaultDriver) {
 }
 
 async fn verify_queue_simple_interrupt_control_inner(mut guest: VirtioTestGuest, with_index: bool) {
+    const COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+
     let (tx, mut rx) = mesh::mpsc_channel();
+    let (completed, mut completions) = mesh::mpsc_channel();
     let event = Event::new();
     let mut queues = guest.create_direct_queues(|i| {
         let tx = tx.clone();
+        let completed = completed.clone();
         CreateDirectQueueParams {
             process_work: Box::new(
                 move |queue: &mut VirtioQueue, work: VirtioQueueCallbackWork| {
                     assert_eq!(work.payload.len(), 1);
                     assert_eq!(work.payload[0].length, 0x1000);
                     queue.complete(work, 123);
+                    completed.send(());
                 },
             ),
             notify: Interrupt::from_fn(move || {
@@ -2582,10 +2588,13 @@ async fn verify_queue_simple_interrupt_control_inner(mut guest: VirtioTestGuest,
         guest.enable_interrupt(0, Some(1));
         guest.add_to_avail_queue(0);
         event.signal();
-        assert_no_recv_in_timeout(&mut rx, Duration::from_millis(100)).await;
+        must_recv_in_timeout(&mut completions, COMPLETION_TIMEOUT).await;
+        assert!(matches!(rx.try_recv(), Err(mesh::TryRecvError::Empty)));
         guest.add_to_avail_queue(0);
         event.signal();
-        must_recv_in_timeout(&mut rx, Duration::from_millis(100)).await;
+        must_recv_in_timeout(&mut completions, COMPLETION_TIMEOUT).await;
+        assert_eq!(rx.try_recv().unwrap(), 0);
+        assert!(matches!(rx.try_recv(), Err(mesh::TryRecvError::Empty)));
 
         let (_, len) = guest.get_next_completed(0).unwrap();
         assert_eq!(len, 123);
@@ -2597,7 +2606,9 @@ async fn verify_queue_simple_interrupt_control_inner(mut guest: VirtioTestGuest,
     guest.enable_interrupt(0, None);
     guest.add_to_avail_queue(0);
     event.signal();
-    must_recv_in_timeout(&mut rx, Duration::from_millis(100)).await;
+    must_recv_in_timeout(&mut completions, COMPLETION_TIMEOUT).await;
+    assert_eq!(rx.try_recv().unwrap(), 0);
+    assert!(matches!(rx.try_recv(), Err(mesh::TryRecvError::Empty)));
     let (_, len) = guest.get_next_completed(0).unwrap();
     assert_eq!(len, 123);
     assert_eq!(guest.get_next_completed(0).is_none(), true);
@@ -2607,7 +2618,9 @@ async fn verify_queue_simple_interrupt_control_inner(mut guest: VirtioTestGuest,
     guest.add_to_avail_queue(0);
     guest.add_to_avail_queue(0);
     event.signal();
-    assert_no_recv_in_timeout(&mut rx, Duration::from_millis(100)).await;
+    must_recv_in_timeout(&mut completions, COMPLETION_TIMEOUT).await;
+    must_recv_in_timeout(&mut completions, COMPLETION_TIMEOUT).await;
+    assert!(matches!(rx.try_recv(), Err(mesh::TryRecvError::Empty)));
     let (_, len) = guest.get_next_completed(0).unwrap();
     assert_eq!(len, 123);
     let (_, len) = guest.get_next_completed(0).unwrap();
@@ -4745,12 +4758,19 @@ async fn pci_save_restore_round_trip(driver: DefaultDriver) {
 
 #[async_test]
 async fn mmio_save_restore_round_trip(driver: DefaultDriver) {
+    for register_doorbells in [false, true] {
+        mmio_save_restore_round_trip_inner(driver.clone(), register_doorbells).await;
+    }
+}
+
+async fn mmio_save_restore_round_trip_inner(driver: DefaultDriver, register_doorbells: bool) {
     use crate::spec::mmio::VirtioMmioRegister;
     use vmcore::device_state::ChangeDeviceState;
     use vmcore::save_restore::SaveRestore;
 
     let test_mem = VirtioTestMemoryAccess::new();
-    let doorbell_registration: Arc<dyn DoorbellRegistration> = test_mem.clone();
+    let doorbell_registration: Option<Arc<dyn DoorbellRegistration>> =
+        register_doorbells.then(|| test_mem.clone() as _);
     let mem = GuestMemory::new("test", test_mem.clone());
     let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
 
@@ -4773,7 +4793,7 @@ async fn mmio_save_restore_round_trip(driver: DefaultDriver) {
         &driver_source.simple(),
         mem.clone(),
         interrupt,
-        Some(doorbell_registration.clone()),
+        doorbell_registration.clone(),
         0,
         1,
     )
@@ -4787,9 +4807,12 @@ async fn mmio_save_restore_round_trip(driver: DefaultDriver) {
     dev.stop().await;
 
     // Save state.
-    let saved = dev.save().expect("save should succeed");
+    let mut saved = dev.save().expect("save should succeed");
     assert_eq!(saved.queues.len(), 1);
     assert!(saved.queues[0].common.enable);
+    saved.interrupt_status = VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER;
+    saved_state::check_restored_queue_validation(&mut saved, guest.queue_features(), &mem);
+    drop(dev);
 
     // Create a new device and restore into it.
     let interrupt2 = LineInterrupt::detached();
@@ -4809,7 +4832,7 @@ async fn mmio_save_restore_round_trip(driver: DefaultDriver) {
         &driver_source.simple(),
         mem.clone(),
         interrupt2,
-        Some(doorbell_registration),
+        doorbell_registration,
         0,
         1,
     )
@@ -4821,6 +4844,7 @@ async fn mmio_save_restore_round_trip(driver: DefaultDriver) {
         dev2.read_u32(VirtioMmioRegister::STATUS.0 as u64) & VIRTIO_DRIVER_OK,
         0
     );
+    interrupt::check_used_buffer_ack(&test_mem, &mut dev2, register_doorbells);
 
     // Stop and clean up.
     dev2.stop().await;

@@ -41,6 +41,8 @@ pub mod p9 {
 }
 
 pub mod fs {
+    pub mod microvm;
+
     use mesh::MeshPayload;
     use vm_resource::ResourceId;
     use vm_resource::kind::VirtioDeviceHandle;
@@ -49,6 +51,7 @@ pub mod fs {
     pub struct VirtioFsHandle {
         pub tag: String,
         pub fs: VirtioFsBackend,
+        pub profile: microvm::VirtioFsProfile,
     }
 
     #[derive(MeshPayload)]
@@ -66,6 +69,7 @@ pub mod fs {
         Aggregate {
             children: Vec<VirtioFsAggregateChild>,
         },
+        Dormant,
     }
 
     /// A single host folder exposed as a named child of a [`VirtioFsBackend::Aggregate`].
@@ -143,6 +147,10 @@ pub mod net {
         pub max_queues: Option<u16>,
         pub mac_address: MacAddress,
         pub endpoint: Resource<NetEndpointHandleKind>,
+        pub egress_policy: Option<net_backend_resources::egress::EgressPolicy>,
+        pub save_restore: bool,
+        pub static_ipv4: Option<net_backend_resources::consomme::static_ipv4::StaticIpv4Config>,
+        pub effective_features: Option<u64>,
     }
 
     impl ResourceId<VirtioDeviceHandle> for VirtioNetHandle {
@@ -151,6 +159,9 @@ pub mod net {
 }
 
 pub mod console {
+    pub mod attachment;
+    pub mod control;
+
     use mesh::MeshPayload;
     use vm_resource::Resource;
     use vm_resource::ResourceId;
@@ -160,6 +171,8 @@ pub mod console {
     #[derive(MeshPayload)]
     pub struct VirtioConsoleHandle {
         pub backend: Resource<SerialBackendHandle>,
+        pub disconnect_policy: attachment::VirtioConsoleDisconnectPolicy,
+        pub attachment: Option<attachment::VirtioConsoleAttachment>,
     }
 
     impl ResourceId<VirtioDeviceHandle> for VirtioConsoleHandle {

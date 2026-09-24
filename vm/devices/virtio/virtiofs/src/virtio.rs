@@ -1,6 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use crate::VirtioFs;
+use crate::microvm::MAX_FUSE_REQUEST_BYTES;
+use crate::profile::MicroVmVirtioFsProfile;
 use crate::virtio_util::VirtioPayloadReader;
 use crate::virtio_util::VirtioPayloadWriter;
 use anyhow::Context as _;
@@ -9,6 +12,7 @@ use guestmem::GuestMemory;
 use guestmem::MappedMemoryRegion;
 use inspect::InspectMut;
 use pal_async::wait::PolledWait;
+use parking_lot::Mutex;
 use std::io;
 use std::io::Write;
 use std::sync::Arc;
@@ -22,8 +26,12 @@ use virtio::QueueResources;
 use virtio::VirtioDevice;
 use virtio::VirtioQueue;
 use virtio::VirtioQueueCallbackWork;
+use virtio::device::saved_state::DeviceStateValidator;
 use virtio::queue::QueueState;
 use virtio::spec::VirtioDeviceFeatures;
+use vmcore::save_restore::RestoreError;
+use vmcore::save_restore::SaveError;
+use vmcore::save_restore::SavedStateBlob;
 use vmcore::vm_task::VmTaskDriver;
 use vmcore::vm_task::VmTaskDriverSource;
 use zerocopy::Immutable;
@@ -50,9 +58,9 @@ const MAX_REQUEST_QUEUES: u32 = 8;
 /// PCI configuration space values for virtio-fs devices.
 #[repr(C)]
 #[derive(IntoBytes, Immutable, KnownLayout)]
-struct VirtioFsDeviceConfig {
-    tag: [u8; 36],
-    num_request_queues: u32,
+pub(crate) struct VirtioFsDeviceConfig {
+    pub(crate) tag: [u8; 36],
+    pub(crate) num_request_queues: u32,
 }
 
 /// A virtio-fs PCI device.
@@ -61,17 +69,93 @@ pub struct VirtioFsDevice {
     task_name: Box<str>,
     driver: VmTaskDriver,
     #[inspect(skip)]
-    config: VirtioFsDeviceConfig,
+    pub(crate) config: VirtioFsDeviceConfig,
     #[inspect(skip)]
-    fs: Arc<fuse::Session>,
+    pub(crate) fs: Arc<fuse::Session>,
     #[inspect(skip)]
-    workers: Vec<TaskControl<VirtioFsWorker, VirtioFsQueue>>,
+    pub(crate) workers: Vec<TaskControl<VirtioFsWorker, VirtioFsQueue>>,
     shmem_size: u64,
     #[inspect(skip)]
     shared_memory_region: Option<Arc<dyn MappedMemoryRegion>>,
     #[inspect(skip)]
     notify_corruption: Arc<dyn Fn() + Sync + Send>,
     num_request_queues: u32,
+    #[inspect(skip)]
+    pub(crate) microvm_attachment_id: Option<String>,
+    #[inspect(skip)]
+    pub(crate) microvm_profile: Option<MicroVmVirtioFsProfile>,
+    #[inspect(skip)]
+    pub(crate) stateful_fs: Option<VirtioFs>,
+    #[inspect(skip)]
+    pub(crate) admission: Arc<RequestAdmission>,
+    #[inspect(skip)]
+    pub(crate) save_error: Option<anyhow::Error>,
+}
+
+struct AdmissionState {
+    accepting: bool,
+    in_flight: u32,
+}
+
+pub(crate) struct RequestAdmission {
+    state: Mutex<AdmissionState>,
+}
+
+struct RequestGuard {
+    admission: Arc<RequestAdmission>,
+}
+
+impl RequestAdmission {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(AdmissionState {
+                accepting: true,
+                in_flight: 0,
+            }),
+        }
+    }
+
+    fn accept(self: &Arc<Self>) -> Option<RequestGuard> {
+        let mut state = self.state.lock();
+        if !state.accepting {
+            return None;
+        }
+        state.in_flight = state.in_flight.checked_add(1)?;
+        Some(RequestGuard {
+            admission: Arc::clone(self),
+        })
+    }
+
+    pub(crate) fn quiesce(&self) {
+        let mut state = self.state.lock();
+        state.accepting = false;
+    }
+
+    pub(crate) fn resume(&self) {
+        let mut state = self.state.lock();
+        state.accepting = true;
+    }
+
+    pub(crate) fn verify_drained(&self) -> anyhow::Result<()> {
+        let state = self.state.lock();
+        anyhow::ensure!(
+            !state.accepting,
+            "virtio-fs save was not preceded by input quiesce"
+        );
+        anyhow::ensure!(
+            state.in_flight == 0,
+            "virtio-fs has {} unrepresented in-flight request(s)",
+            state.in_flight
+        );
+        Ok(())
+    }
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        let mut state = self.admission.state.lock();
+        state.in_flight = state.in_flight.saturating_sub(1);
+    }
 }
 
 impl VirtioFsDevice {
@@ -142,6 +226,11 @@ impl VirtioFsDevice {
             shared_memory_region: None,
             notify_corruption,
             num_request_queues,
+            microvm_attachment_id: None,
+            microvm_profile: None,
+            stateful_fs: None,
+            admission: Arc::new(RequestAdmission::new()),
+            save_error: None,
         }
     }
 }
@@ -150,10 +239,7 @@ impl VirtioDevice for VirtioFsDevice {
     fn traits(&self) -> DeviceTraits {
         DeviceTraits {
             device_id: virtio::spec::VirtioDeviceType::FS,
-            device_features: VirtioDeviceFeatures::new()
-                .with_ring_event_idx(true)
-                .with_ring_indirect_desc(true)
-                .with_ring_packed(true),
+            device_features: crate::microvm::device::device_features(self),
             max_queues: 1 + self.num_request_queues as u16,
             device_register_length: self.config.as_bytes().len() as u32,
             shared_memory: DeviceTraitsSharedMemory {
@@ -163,28 +249,29 @@ impl VirtioDevice for VirtioFsDevice {
         }
     }
 
+    fn supports_accelerated_doorbells(&self) -> bool {
+        crate::microvm::device::supports_accelerated_doorbells(self)
+    }
+
     async fn read_registers_u32(&mut self, offset: u16) -> u32 {
         let offset = offset as usize;
         let config = self.config.as_bytes();
-        if offset < config.len() {
-            u32::from_le_bytes(
-                config[offset..offset + 4]
-                    .try_into()
-                    .expect("Incorrect length"),
-            )
-        } else {
-            0
-        }
+        config
+            .get(offset..offset.saturating_add(4))
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_le_bytes)
+            .unwrap_or(0)
     }
 
     async fn write_registers_u32(&mut self, offset: u16, val: u32) {
-        tracing::warn!(offset, val, "[virtiofs] Unknown write",);
+        tracelimit::warn_ratelimited!(offset, val, "[virtiofs] Unknown write",);
     }
 
     fn set_shared_memory_region(
         &mut self,
         region: &Arc<dyn MappedMemoryRegion>,
     ) -> anyhow::Result<()> {
+        crate::microvm::device::validate_shared_memory(self)?;
         self.shared_memory_region = Some(region.clone());
         Ok(())
     }
@@ -196,11 +283,13 @@ impl VirtioDevice for VirtioFsDevice {
         features: &VirtioDeviceFeatures,
         initial_state: Option<QueueState>,
     ) -> anyhow::Result<()> {
+        crate::microvm::device::validate_queue_features(self, features)?;
         let mut tc = TaskControl::new(VirtioFsWorker {
             fs: self.fs.clone(),
             shared_memory_region: self.shared_memory_region.clone(),
             shared_memory_size: self.shmem_size,
             notify_corruption: self.notify_corruption.clone(),
+            admission: Arc::clone(&self.admission),
         });
 
         let queue_event = PolledWait::new(&self.driver, resources.event)
@@ -233,6 +322,7 @@ impl VirtioDevice for VirtioFsDevice {
                     shared_memory_region: None,
                     shared_memory_size: 0,
                     notify_corruption: self.notify_corruption.clone(),
+                    admission: Arc::clone(&self.admission),
                 })
             });
         }
@@ -252,6 +342,7 @@ impl VirtioDevice for VirtioFsDevice {
 
     async fn reset(&mut self) {
         self.workers.clear();
+        crate::microvm::device::reset(self);
         if let Some(region) = &self.shared_memory_region {
             if let Err(e) = region.unmap(0, self.shmem_size as usize) {
                 tracing::error!(
@@ -263,16 +354,43 @@ impl VirtioDevice for VirtioFsDevice {
         self.shared_memory_region = None;
         self.fs.destroy();
     }
+
+    async fn quiesce_input(&mut self) -> anyhow::Result<()> {
+        crate::microvm::device::quiesce_input(self);
+        Ok(())
+    }
+
+    async fn resume_input(&mut self) -> anyhow::Result<()> {
+        crate::microvm::device::resume_input(self);
+        Ok(())
+    }
+
+    fn supports_save_restore(&self) -> bool {
+        crate::microvm::device::supports_save_restore(self)
+    }
+
+    fn save_device(&mut self) -> Result<Option<SavedStateBlob>, SaveError> {
+        crate::microvm::device::save_device(self)
+    }
+
+    fn restore_device(&mut self, state: Option<SavedStateBlob>) -> Result<(), RestoreError> {
+        crate::microvm::device::restore_device(self, state)
+    }
+
+    fn device_state_validator(&self) -> DeviceStateValidator {
+        crate::microvm::device::device_state_validator(self)
+    }
 }
 
-struct VirtioFsWorker {
+pub(crate) struct VirtioFsWorker {
     fs: Arc<fuse::Session>,
     shared_memory_region: Option<Arc<dyn MappedMemoryRegion>>,
     shared_memory_size: u64,
     notify_corruption: Arc<dyn Fn() + Sync + Send>,
+    admission: Arc<RequestAdmission>,
 }
 
-struct VirtioFsQueue {
+pub(crate) struct VirtioFsQueue {
     queue: VirtioQueue,
     mem: GuestMemory,
 }
@@ -284,15 +402,21 @@ impl AsyncRun<VirtioFsQueue> for VirtioFsWorker {
         state: &mut VirtioFsQueue,
     ) -> Result<(), Cancelled> {
         loop {
+            // Admission must precede queue.next(): after save closes the
+            // gate, an unowned descriptor must remain on the virtqueue rather
+            // than being dequeued and falsely completed with an empty reply.
+            let Some(request_guard) = self.admission.accept() else {
+                break;
+            };
             let work = stop.until_stopped(state.queue.next()).await?;
             let Some(work) = work else { break };
             match work {
                 Ok(work) => {
-                    let bytes = process_virtiofs_request(self, &state.mem, &work);
+                    let bytes = process_virtiofs_request(self, &state.mem, &work, request_guard);
                     state.queue.complete(work, bytes);
                 }
                 Err(err) => {
-                    tracing::error!(
+                    tracelimit::error_ratelimited!(
                         error = &err as &dyn std::error::Error,
                         "Failed processing queue"
                     );
@@ -308,13 +432,25 @@ fn process_virtiofs_request(
     worker: &VirtioFsWorker,
     mem: &GuestMemory,
     work: &VirtioQueueCallbackWork,
+    _request_guard: RequestGuard,
 ) -> u32 {
+    let readable_len = work.get_payload_length(false) as usize;
+    if readable_len > MAX_FUSE_REQUEST_BYTES {
+        tracelimit::error_ratelimited!(
+            readable_len,
+            max_request_bytes = MAX_FUSE_REQUEST_BYTES,
+            "virtio-fs request exceeds the fixed maximum size"
+        );
+        (worker.notify_corruption)();
+        return 0;
+    }
+
     // Parse the request.
     let reader = VirtioPayloadReader::new(mem, work);
     let request = match fuse::Request::new(reader) {
         Ok(request) => request,
         Err(e) => {
-            tracing::error!(
+            tracelimit::error_ratelimited!(
                 error = &e as &dyn std::error::Error,
                 "[virtiofs] Invalid FUSE message, error"
             );
@@ -363,16 +499,20 @@ struct VirtioReplySender<'a> {
 impl fuse::ReplySender for VirtioReplySender<'_> {
     fn send(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<()> {
         let mut writer = VirtioPayloadWriter::new(self.mem, self.work);
-        let mut size = 0;
+        let mut size: usize = 0;
 
         // Write all the slices to the payload buffers.
         // N.B. write_vectored isn't used because it isn't guaranteed to write all the data.
         for buf in bufs {
             writer.write_all(buf)?;
-            size += buf.len();
+            size = size
+                .checked_add(buf.len())
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
         }
 
-        self.bytes_written = size as u32;
+        self.bytes_written = size
+            .try_into()
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
         Ok(())
     }
 }
@@ -421,6 +561,7 @@ mod tests {
     use crate::VirtioFs;
     use pal_async::DefaultDriver;
     use pal_async::async_test;
+    use test_with_tracing::test;
     use vmcore::vm_task::SingleDriverBackend;
 
     fn make_device(
@@ -448,6 +589,7 @@ mod tests {
             device.traits().max_queues,
             1 + DEFAULT_NUM_REQUEST_QUEUES as u16
         );
+        assert!(device.supports_accelerated_doorbells());
     }
 
     #[async_test]
@@ -475,5 +617,17 @@ mod tests {
         assert_eq!(device.num_request_queues, 3);
         assert_eq!(device.config.num_request_queues, 3);
         assert_eq!(device.traits().max_queues, 4);
+    }
+
+    #[test]
+    fn closed_admission_rejects_new_work_until_all_requests_drain() {
+        let admission = Arc::new(RequestAdmission::new());
+        let request = admission.accept().unwrap();
+        admission.quiesce();
+        assert!(admission.accept().is_none());
+        assert!(admission.verify_drained().is_err());
+
+        drop(request);
+        admission.verify_drained().unwrap();
     }
 }

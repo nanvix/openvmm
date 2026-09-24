@@ -603,10 +603,10 @@ pub(super) fn snp_hv_cpuid_overrides(native_max_leaf: u32) -> [virt::CpuidLeaf; 
     // isolation CPUID contract from MSHV_PT_ISOLATION_SNP. Cloud Hypervisor
     // does not install an equivalent override, but we have not confirmed
     // whether its environment receives the isolation leaves correctly from
-    // MSHV. Without these overrides, ACI Linux does not recognize a
+    // MSHV. Without these overrides, the guest kernel does not recognize a
     // non-paravisor Hyper-V SNP guest and uses the hypercall-page overlay
     // instead of direct VMMCALL hypercalls. Correctly describing isolation
-    // also keeps ACI's restricted-injection doorbell EOI path active, making
+    // also keeps the restricted-injection doorbell EOI path active, making
     // the previous APIC-access recommendation mask unnecessary.
     [
         // Make the isolation configuration leaf discoverable.
@@ -639,8 +639,8 @@ pub(super) fn snp_start_vp_vmsa_gpa(
     context: &hvdef::hypercall::InitialVpContextX64,
 ) -> Option<u64> {
     let encoded = context.rip;
-    // TODO: Confirm this ACI-specific overload is the intended Microsoft
-    // Hypervisor SNP contract. ACI zeroes the nominal register context and
+    // TODO: Confirm this launch-context overload is the intended Microsoft
+    // Hypervisor SNP contract. The guest zeroes the nominal register context and
     // stores `vmsa_gpa | 1` in its first eight bytes for HvCallStartVP.
     if encoded & 1 == 0
         || context.as_bytes()[size_of::<u64>()..]
@@ -784,7 +784,8 @@ impl MshvPartitionInner {
 
         let sev_control =
             mshv_bindings::snp::get_sev_control_register(vmsa_gpa / hvdef::HV_PAGE_SIZE);
-        self.bsp_vcpufd
+        self.finalized()?
+            .bsp_vcpufd
             .set_hvdef_regs(&[HvRegisterAssoc::from((
                 HvX64RegisterName::SevControl,
                 sev_control,
@@ -802,7 +803,8 @@ impl MshvPartitionInner {
         if count > x86defs::snp::HV_PSP_CPUID_LEAF_COUNT_MAX {
             return Err(SnpError::TooManyCpuidEntries(count).into());
         }
-        if self.caps.hv1 {
+        let finalized = self.finalized()?;
+        if finalized.caps.hv1 {
             // TODO: Determine the correct long-term strategy for exposing
             // synthetic Hyper-V CPUID leaves to direct-boot SNP guests: include
             // them in the measured CPUID page, rely on GHCB CPUID fallback, or
@@ -837,12 +839,12 @@ impl MshvPartitionInner {
 
         for leaf in &mut page.cpuid_leaf_info[..count] {
             let values = get_snp_cpuid_values(
-                &self.bsp_vcpufd,
+                &finalized.bsp_vcpufd,
                 leaf.eax_in,
                 leaf.ecx_in,
                 leaf.xfem_in,
                 leaf.xss_in,
-                self.caps.hv1,
+                finalized.caps.hv1,
             )
             .map_err(|e| SnpError::Cpuid(e.into()))?;
             leaf.eax_out = values[0];
@@ -1399,7 +1401,7 @@ impl MshvProcessor<'_> {
                     0,
                     0,
                     0,
-                    self.partition.caps.hv1,
+                    self.partition.caps().hv1,
                 )
                 .map_err(|err| {
                     tracelimit::error_ratelimited!(
@@ -1578,7 +1580,7 @@ impl MshvProcessor<'_> {
                     index,
                     xfem,
                     xss,
-                    self.partition.caps.hv1,
+                    self.partition.caps().hv1,
                 )
                 .map_err(|err| {
                     tracelimit::error_ratelimited!(
@@ -1946,7 +1948,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_aci_snp_start_vp_context() {
+    fn parses_snp_start_vp_context() {
         let mut context = hvdef::hypercall::InitialVpContextX64::new_zeroed();
         context.rip = 0x517001;
         assert_eq!(snp_start_vp_vmsa_gpa(&context), Some(0x517000));

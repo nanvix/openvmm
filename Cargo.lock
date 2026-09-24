@@ -577,6 +577,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 name = "chipset"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "bitfield-struct 0.11.0",
  "chipset_device",
@@ -591,7 +592,9 @@ dependencies = [
  "mesh",
  "open_enum",
  "pal_async",
+ "parking_lot",
  "power_resources",
+ "serial_core",
  "test_with_tracing",
  "thiserror 2.0.16",
  "tracelimit",
@@ -642,6 +645,7 @@ dependencies = [
 name = "chipset_device_resources"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chipset_device",
  "guestmem",
@@ -686,6 +690,7 @@ dependencies = [
 name = "chipset_legacy"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chipset",
  "chipset_device",
@@ -2342,6 +2347,7 @@ dependencies = [
  "serde",
  "serde_json",
  "target-lexicon",
+ "test_with_tracing",
  "vmm_test_images",
 ]
 
@@ -2360,6 +2366,7 @@ dependencies = [
  "sysinfo",
  "target-lexicon",
  "tempfile",
+ "test_with_tracing",
  "toml_edit",
  "which 8.0.0",
  "xshell",
@@ -2383,6 +2390,7 @@ dependencies = [
  "sha2",
  "target-lexicon",
  "tempfile",
+ "test_with_tracing",
  "toml_edit",
  "vmm_test_images",
  "which 8.0.0",
@@ -2469,6 +2477,7 @@ dependencies = [
  "tempfile",
  "test_with_tracing",
  "thiserror 2.0.16",
+ "tracelimit",
  "tracing",
  "zerocopy",
 ]
@@ -4539,6 +4548,7 @@ dependencies = [
  "range_map_vec",
  "slab",
  "sparse_mmap",
+ "tempfile",
  "thiserror 2.0.16",
  "tracing",
  "virt",
@@ -4979,6 +4989,7 @@ dependencies = [
  "guid",
  "inspect",
  "mesh",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "vm_resource",
 ]
@@ -4990,6 +5001,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "consomme",
+ "guestmem",
  "inspect",
  "inspect_counters",
  "mesh",
@@ -5785,6 +5797,7 @@ dependencies = [
  "build_rs_guest_arch",
  "cache_topology",
  "cfg-if",
+ "chipset",
  "chipset_device",
  "chipset_device_resources",
  "chipset_device_worker",
@@ -5877,6 +5890,7 @@ name = "openvmm_defs"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "chipset_resources",
  "floppy_resources",
  "framebuffer",
  "get_resources",
@@ -5890,6 +5904,7 @@ dependencies = [
  "net_backend_resources",
  "openvmm_pcat_locator",
  "smbios_defs",
+ "state_unit",
  "thiserror 2.0.16",
  "tpm_resources",
  "unix_socket",
@@ -5897,6 +5912,7 @@ dependencies = [
  "virt_whp",
  "vm_resource",
  "vmbus_proxy",
+ "vmcore",
  "vmgs_resources",
  "vmm_core_defs",
  "vmotherboard",
@@ -5936,6 +5952,7 @@ dependencies = [
  "input_core",
  "inspect",
  "inspect_proto",
+ "libc",
  "memory_range",
  "mesh",
  "mesh_process",
@@ -5957,6 +5974,8 @@ dependencies = [
  "prost",
  "rustyline",
  "scsidisk_resources",
+ "serde",
+ "serde_json",
  "serial_16550_resources",
  "serial_core",
  "serial_socket",
@@ -6059,11 +6078,17 @@ dependencies = [
  "hypervisor_resources",
  "libc",
  "mesh",
+ "net_backend_resources",
+ "nix 0.30.1",
  "openvmm_defs",
+ "pal",
+ "sha2",
  "sparse_mmap",
  "tempfile",
+ "thiserror 2.0.16",
  "tracing",
  "vm_resource",
+ "windows-sys 0.61.0",
 ]
 
 [[package]]
@@ -7674,15 +7699,20 @@ name = "serial_socket"
 version = "0.0.0"
 dependencies = [
  "futures",
+ "getrandom 0.4.2",
  "inspect",
+ "libc",
  "mesh",
  "pal",
  "pal_async",
+ "pal_async_test",
  "serial_core",
  "socket2",
+ "test_with_tracing",
  "tracing",
  "unix_socket",
  "vm_resource",
+ "windows-sys 0.61.0",
 ]
 
 [[package]]
@@ -7939,6 +7969,8 @@ dependencies = [
  "libc",
  "pal",
  "parking_lot",
+ "tempfile",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "trycopy",
  "windows-sys 0.61.0",
@@ -9646,6 +9678,7 @@ dependencies = [
  "parking_lot",
  "pci_core",
  "slab",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "tracelimit",
  "tracing",
@@ -9735,7 +9768,6 @@ dependencies = [
  "pal_event",
  "parking_lot",
  "pci_core",
- "signal-hook",
  "test_with_tracing",
  "thiserror 2.0.16",
  "tracelimit",
@@ -9889,6 +9921,7 @@ dependencies = [
  "pci_core",
  "range_map_vec",
  "sparse_mmap",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "tracelimit",
  "tracing",
@@ -9928,6 +9961,7 @@ dependencies = [
  "test_with_tracing",
  "thiserror 2.0.16",
  "tracelimit",
+ "tracing",
  "virtio_resources",
  "virtio_spec",
  "vm_resource",
@@ -9940,6 +9974,7 @@ name = "virtio_blk"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "async-trait",
  "disk_backend",
  "disklayer_ram",
@@ -9968,10 +10003,12 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chipset_device",
  "futures",
  "futures-concurrency",
  "guestmem",
  "inspect",
+ "mesh",
  "pal_async",
  "pal_event",
  "parking_lot",
@@ -9980,7 +10017,6 @@ dependencies = [
  "test_with_tracing",
  "thiserror 2.0.16",
  "tracelimit",
- "tracing",
  "virtio",
  "virtio_resources",
  "vm_resource",
@@ -9994,6 +10030,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bitfield-struct 0.11.0",
+ "chipset_device",
  "futures",
  "guestmem",
  "inspect",
@@ -10063,6 +10100,7 @@ version = "0.0.0"
 dependencies = [
  "mesh",
  "net_backend_resources",
+ "serial_core",
  "unix_socket",
  "vm_resource",
 ]
@@ -10137,12 +10175,14 @@ name = "virtiofs"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "chipset_device",
  "fuse",
  "futures",
  "guestmem",
  "inspect",
  "lx",
  "lxutil",
+ "mesh",
  "ntapi",
  "pal",
  "pal_async",
@@ -10151,6 +10191,8 @@ dependencies = [
  "task_control",
  "tempfile",
  "test_with_tracing",
+ "thiserror 2.0.16",
+ "tracelimit",
  "tracing",
  "virtio",
  "virtio_resources",
@@ -10751,6 +10793,7 @@ dependencies = [
  "iced-x86",
  "input_core",
  "inspect",
+ "loader",
  "memory_range",
  "mesh",
  "pal_async",
@@ -10760,6 +10803,7 @@ dependencies = [
  "power_resources",
  "slab",
  "state_unit",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "tracing",
  "virt",

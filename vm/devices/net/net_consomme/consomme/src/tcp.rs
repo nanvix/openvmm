@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 mod assembler;
+mod limits;
 mod ring;
 
 use super::Access;
@@ -56,7 +57,6 @@ use std::io::ErrorKind;
 use std::io::IoSlice;
 use std::io::IoSliceMut;
 use std::net::IpAddr;
-use std::net::Shutdown;
 use std::net::SocketAddr;
 use std::net::SocketAddrV4;
 use std::net::SocketAddrV6;
@@ -74,6 +74,7 @@ pub(crate) struct Tcp {
     listeners: HashMap<PortForwardKey, TcpListener>,
     #[inspect(skip)]
     timer: Option<TcpTimer>,
+    max_connections: usize,
     connection_params: ConnectionParams,
     aggregate_stats: TcpAggregateStats,
 }
@@ -164,6 +165,7 @@ impl Tcp {
             connections: HashMap::new(),
             listeners: HashMap::new(),
             timer: None,
+            max_connections: crate::limits::DEFAULT_MAX_ACTIVE_TCP_FLOWS,
             connection_params: ConnectionParams {
                 rx_buffer: NormalizedBufferBounds::from_bounds(rx_buffer),
                 tx_buffer: NormalizedBufferBounds::from_bounds(tx_buffer),
@@ -814,8 +816,17 @@ impl<T: Client> Access<'_, T> {
                             dst: ft.src,
                         };
 
+                        let at_capacity = self.inner.tcp.connections.len()
+                            >= self.inner.tcp.max_connections;
                         match self.inner.tcp.connections.entry(ft) {
                             hash_map::Entry::Vacant(e) => {
+                                if at_capacity {
+                                    tracelimit::warn_ratelimited!(
+                                        max_connections = self.inner.tcp.max_connections,
+                                        "dropping inbound TCP flow because the active-flow limit was reached"
+                                    );
+                                    return true;
+                                }
                                 let mut sender = Sender {
                                     ft: &ft,
                                     client: self.client,
@@ -1050,6 +1061,8 @@ impl<T: Client> Access<'_, T> {
             state: &mut self.inner.state,
         };
 
+        self.inner.tcp.check_flow_limit(&ft)?;
+
         match self.inner.tcp.connections.entry(ft) {
             hash_map::Entry::Occupied(mut e) => {
                 let keep = e.get_mut().inner.handle_packet(&mut sender, &tcp)?;
@@ -1097,7 +1110,12 @@ impl<T: Client> Access<'_, T> {
                     } else {
                         // Resolve virtual mapped addresses back to real host
                         // addresses before establishing the connection.
-                        let resolved_dst = sender.state.resolve_destination(&sender.ft.dst);
+                        let Some(resolved_dst) = sender
+                            .state
+                            .resolve_flow_destination(&sender.ft.dst, IpProtocol::Tcp)
+                        else {
+                            return Err(DropReason::DestinationNotAllowed);
+                        };
                         // If this is directed to a local port owned by the guest, use the
                         // appropriate host port substitution.
                         let is_local_address = sender.state.params.is_local_address(&resolved_dst);
@@ -1770,7 +1788,7 @@ impl TcpConnectionInner {
         &mut self,
         cx: &mut Context<'_>,
         sender: &mut Sender<'_, impl Client>,
-        socket: &mut PolledSocket<Socket>,
+        socket: &mut (impl AsyncWrite + Unpin),
         static_dns: &mut Option<StaticDnsTcpInspection>,
         dns: &DnsResolver,
     ) -> bool {
@@ -1866,19 +1884,22 @@ impl TcpConnectionInner {
             .is_none_or(StaticDnsTcpInspection::is_empty);
         if self.rx_buffer.is_empty() && static_dns_empty && self.state.rx_fin() && !self.is_shutdown
         {
-            if let Err(err) = socket.get().shutdown(Shutdown::Write) {
-                tracelimit::warn_ratelimited!(
-                    error = &err as &dyn std::error::Error,
-                    src = %sender.ft.src,
-                    dst = %sender.ft.dst,
-                    "shutdown error"
-                );
-                if sender.try_rst(self.tx_send, Some(self.rx_seq)) {
-                    self.stats.rsts_tx.increment();
+            match Pin::new(socket).poll_close(cx) {
+                Poll::Ready(Ok(())) => self.is_shutdown = true,
+                Poll::Pending => {}
+                Poll::Ready(Err(err)) => {
+                    tracelimit::warn_ratelimited!(
+                        error = &err as &dyn std::error::Error,
+                        src = %sender.ft.src,
+                        dst = %sender.ft.dst,
+                        "shutdown error"
+                    );
+                    if sender.try_rst(self.tx_send, Some(self.rx_seq)) {
+                        self.stats.rsts_tx.increment();
+                    }
+                    return false;
                 }
-                return false;
             }
-            self.is_shutdown = true;
         }
 
         true

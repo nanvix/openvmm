@@ -3,6 +3,8 @@
 
 //! Per-VP state.
 
+mod snapshot;
+
 use super::SegmentRegister;
 use super::TableRegister;
 use super::X86PartitionCapabilities;
@@ -24,6 +26,7 @@ use hvdef::HvX64SegmentRegister;
 use hvdef::HvX64TableRegister;
 use inspect::Inspect;
 use mesh_protobuf::Protobuf;
+pub use snapshot::TscDeadline;
 use std::fmt::Debug;
 use vm_topology::processor::x86::X86VpInfo;
 use x86defs::RFlags;
@@ -1707,6 +1710,12 @@ pub struct SyntheticMsrs {
     #[mesh(5)]
     #[inspect(iter_by_index)]
     pub sint: [u64; 16],
+    /// KVM wall-clock GPA/configuration MSR.
+    #[mesh(6)]
+    pub kvm_wall_clock: u64,
+    /// KVM system-time GPA/configuration MSR.
+    #[mesh(7)]
+    pub kvm_system_time: u64,
 }
 
 impl HvRegisterState<HvX64RegisterName, 20> for SyntheticMsrs {
@@ -1762,16 +1771,21 @@ impl HvRegisterState<HvX64RegisterName, 20> for SyntheticMsrs {
 
 impl StateElement<X86PartitionCapabilities, X86VpInfo> for SyntheticMsrs {
     fn is_present(caps: &X86PartitionCapabilities) -> bool {
-        caps.hv1
+        caps.hv1 || caps.kvm_clock
     }
 
     fn at_reset(_caps: &X86PartitionCapabilities, _vp_info: &X86VpInfo) -> Self {
+        if !_caps.hv1 {
+            return Self::default();
+        }
         Self {
             vp_assist_page: 0,
             scontrol: 1,
             siefp: 0,
             simp: 0,
             sint: [0x10000; 16],
+            kvm_wall_clock: 0,
+            kvm_system_time: 0,
         }
     }
 }
@@ -1962,6 +1976,7 @@ state_trait! {
     (12, "cet", cet, set_cet, Cet),
     (13, "cet_ss", cet_ss, set_cet_ss, CetSs),
     (14, "tsc_aux", tsc_aux, set_tsc_aux, TscAux),
+    (15, "tsc_deadline", tsc_deadline, set_tsc_deadline, TscDeadline),
 
     // Synic state
     (100, "synic", synic_msrs, set_synic_msrs, SyntheticMsrs),

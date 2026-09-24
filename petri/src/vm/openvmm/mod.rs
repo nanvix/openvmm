@@ -11,6 +11,7 @@
 mod construct;
 #[cfg(target_os = "linux")]
 mod hugetlb;
+pub(crate) mod microvm;
 mod modify;
 mod runtime;
 mod start;
@@ -185,6 +186,11 @@ pub struct PetriVmConfigOpenVmm {
     // Deferred IOMMU configuration: (rc_name, iommu_config) pairs resolved
     // against pcie_root_complexes at VM start time.
     pending_iommu: Vec<(String, openvmm_defs::config::PcieIommuConfig)>,
+
+    // PCIe ports of devices that were configured without save/restore
+    // support. The startup save/restore test is skipped while any of these
+    // ports has a device.
+    pcie_ports_without_save_restore: Vec<String>,
 }
 /// Various channels and resources used to interact with the VM while it is running.
 struct PetriVmResourcesOpenVmm {
@@ -196,6 +202,7 @@ struct PetriVmResourcesOpenVmm {
     pipette_listener: PolledSocket<UnixListener>,
     vtl2_pipette_listener: Option<PolledSocket<UnixListener>>,
     linux_direct_serial_agent: Option<LinuxDirectSerialAgent>,
+    microvm: Option<microvm::RuntimeResources>,
 
     /// When set, the host connects to pipette via TCP through consomme
     /// port forwarding instead of accepting on the Unix socket listener.

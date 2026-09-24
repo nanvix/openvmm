@@ -166,6 +166,8 @@ pub struct SyntheticProcessorFeatures {
 pub struct WHvError(NonZeroI32);
 
 impl WHvError {
+    pub const ERROR_NOT_SUPPORTED: Self = Self(NonZeroI32::new(0x8007_0032_u32 as i32).unwrap());
+
     pub const WHV_E_UNKNOWN_CAPABILITY: Self =
         Self(NonZeroI32::new(api::WHV_E_UNKNOWN_CAPABILITY).unwrap());
 
@@ -735,6 +737,15 @@ impl Partition {
 
     pub fn reference_time(&self) -> Result<u64> {
         self.get_property(partition_prop::ReferenceTime)
+    }
+
+    pub fn extended_vm_exits(&self) -> Result<abi::WHV_EXTENDED_VM_EXITS> {
+        self.get_property(partition_prop::ExtendedVmExits)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn x64_msr_exit_bitmap(&self) -> Result<abi::WHV_X64_MSR_EXIT_BITMAP> {
+        self.get_property(partition_prop::X64MsrExitBitmap)
     }
 
     pub fn physical_address_width(&self) -> Result<u32> {

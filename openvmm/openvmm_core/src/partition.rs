@@ -11,6 +11,8 @@
 //!
 //! If this ends up not being true, then this layer should probably be removed.
 
+pub mod microvm;
+
 use anyhow::Context as _;
 use async_trait::async_trait;
 use guestmem::DoorbellRegistration;
@@ -54,7 +56,12 @@ use vmm_core::partition_unit::VmPartition;
 use vmm_core::partition_unit::VpRunner;
 
 /// A base partition, with methods needed at rutnime along with methods to initialize the vm.
-pub trait HvlitePartition: Inspect + Send + Sync + RequestYield {
+pub trait HvlitePartition:
+    Inspect + Send + Sync + RequestYield + microvm::MicrovmPartition
+{
+    /// Completes backend partition initialization after guest memory is attached.
+    fn finalize_memory(&self) -> anyhow::Result<()>;
+
     /// Gets a line set target to trigger local APIC LINTs.
     ///
     /// The line number is the VP index times 2, plus the LINT number (0 or 1).
@@ -187,6 +194,11 @@ impl<T> HvlitePartition for T
 where
     T: BasicPartitionStateAccess + ArchPartition + PartitionMemoryMapper + PartitionAccessState,
 {
+    fn finalize_memory(&self) -> anyhow::Result<()> {
+        Partition::finalize_memory(self)?;
+        Ok(())
+    }
+
     #[cfg(guest_arch = "x86_64")]
     fn into_lint_target(self: Arc<Self>, vtl: Vtl) -> Arc<dyn LineSetTarget> {
         Arc::new(vmm_core::emuplat::apic::ApicLintLineTarget::new(self, vtl))
@@ -380,6 +392,11 @@ impl<T: Processor> Processor for WrappedVp<'_, T> {
 
     fn access_state(&mut self, vtl: Vtl) -> Self::StateAccess<'_> {
         self.0.access_state(vtl)
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn advance_tsc(&mut self, cycles: u64) -> anyhow::Result<()> {
+        self.0.advance_tsc(cycles)
     }
 
     fn vtl_inspectable(&self, vtl: Vtl) -> bool {

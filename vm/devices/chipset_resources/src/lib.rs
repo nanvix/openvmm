@@ -145,6 +145,8 @@ pub mod pit {
     }
 }
 
+pub mod microvm;
+
 pub mod battery {
     //! Resource definitions for the battery device
 

@@ -89,7 +89,9 @@ impl PetriVmRuntime for PetriVmOpenVmm {
         tracing::info!(?halt_reason, "Got halt reason");
 
         let reason = match halt_reason {
-            HaltReason::PowerOff => PetriHaltReason::PowerOff,
+            HaltReason::PowerOff | HaltReason::PowerOffWithStatus { .. } => {
+                PetriHaltReason::PowerOff
+            }
             HaltReason::Reset => PetriHaltReason::Reset,
             HaltReason::Hibernate => PetriHaltReason::Hibernate,
             HaltReason::TripleFault { .. } => PetriHaltReason::TripleFault,
@@ -363,6 +365,22 @@ impl PetriVmOpenVmm {
         pub async fn verify_save_restore(&mut self) -> anyhow::Result<()>
     );
     petri_vm_fn!(pub(crate) async fn launch_linux_direct_pipette(&mut self) -> anyhow::Result<()>);
+    petri_vm_fn!(
+        /// Wait for a microVM portb console marker.
+        pub async fn wait_for_microvm_portb_output(&mut self, marker: &str) -> anyhow::Result<()>
+    );
+    petri_vm_fn!(
+        /// Wait for an exact byte sequence from the microVM portb console.
+        pub async fn wait_for_microvm_portb_bytes(&mut self, marker: &[u8]) -> anyhow::Result<()>
+    );
+    petri_vm_fn!(
+        /// Write raw bytes to the microVM portb console input stream.
+        pub async fn write_microvm_portb_input(&mut self, input: &[u8]) -> anyhow::Result<()>
+    );
+    petri_vm_fn!(
+        /// Perform one pulse save/restore operation.
+        pub async fn pulse_save_restore(&mut self) -> anyhow::Result<()>
+    );
 
     /// Wrap the provided future in a race with the worker process's halt
     /// notification channel. This is useful for preventing a future from
@@ -795,6 +813,10 @@ impl PetriVmInner {
                 Err(RpcError::Channel(err)) => return Err(err.into()),
                 Err(RpcError::Call(PulseSaveRestoreError::ResetNotSupported)) => {
                     tracing::warn!("Reset not supported, could not test save + restore.");
+                    break;
+                }
+                Err(RpcError::Call(PulseSaveRestoreError::UnsupportedMachineProfile)) => {
+                    tracing::warn!("Save + restore is unavailable for this machine profile.");
                     break;
                 }
                 Err(RpcError::Call(PulseSaveRestoreError::Other(err))) => {

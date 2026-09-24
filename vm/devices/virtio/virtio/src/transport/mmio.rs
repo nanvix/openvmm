@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+pub(super) mod interrupt;
+
 use super::StalledIo;
 use super::core::TransportOps;
 use super::core::VirtioTransportCore;
@@ -25,7 +27,7 @@ use guestmem::DoorbellRegistration;
 use guestmem::GuestMemory;
 use inspect::Inspect;
 use inspect::InspectMut;
-use pal_async::task::Spawn;
+use interrupt::MmioDriver;
 use parking_lot::Mutex;
 use std::fmt;
 use std::ops::RangeInclusive;
@@ -44,16 +46,23 @@ struct MmioTransport {
     #[inspect(hex)]
     vendor_id: u32,
     interrupt_state: Arc<Mutex<InterruptState>>,
+    #[inspect(skip)]
+    interrupt_ack: interrupt::InterruptAck,
 }
 
 #[derive(Inspect)]
 struct InterruptState {
     interrupt: LineInterrupt,
     status: u32,
+    #[inspect(flatten)]
+    delivery: interrupt::StatusDelivery,
 }
 
 impl InterruptState {
     fn update(&mut self, is_set: bool, bits: u32) {
+        if self.delivery.update(&self.interrupt, is_set, bits) {
+            return;
+        }
         if is_set {
             self.status |= bits;
         } else {
@@ -80,7 +89,7 @@ impl TransportOps for MmioTransport {
     }
 
     fn reset_interrupts(&mut self) {
-        self.interrupt_state.lock().update(false, !0);
+        self.reset_interrupt_state();
     }
 
     fn doorbell_region(&mut self) -> Option<(u64, u32)> {
@@ -108,20 +117,50 @@ impl fmt::Debug for VirtioMmioDevice {
 impl VirtioMmioDevice {
     pub fn new(
         device: Box<dyn DynVirtioDevice>,
-        driver: &impl Spawn,
+        driver: &impl MmioDriver,
         guest_memory: GuestMemory,
         interrupt: LineInterrupt,
         doorbell_registration: Option<Arc<dyn DoorbellRegistration>>,
         mmio_gpa: u64,
         mmio_len: u64,
     ) -> std::io::Result<Self> {
+        Self::new_with_disabled_features_and_interrupt_mode(
+            device,
+            driver,
+            guest_memory,
+            interrupt,
+            doorbell_registration,
+            mmio_gpa,
+            mmio_len,
+            0,
+            interrupt::VirtioMmioInterruptMode::Legacy,
+        )
+    }
+
+    /// Creates an MMIO transport with explicit interrupt-status delivery.
+    pub fn new_with_disabled_features_and_interrupt_mode(
+        device: Box<dyn DynVirtioDevice>,
+        driver: &impl MmioDriver,
+        guest_memory: GuestMemory,
+        interrupt: LineInterrupt,
+        doorbell_registration: Option<Arc<dyn DoorbellRegistration>>,
+        mmio_gpa: u64,
+        mmio_len: u64,
+        disabled_features: u64,
+        interrupt_mode: interrupt::VirtioMmioInterruptMode,
+    ) -> std::io::Result<Self> {
         let traits = device.traits();
+        let (delivery, ack) = interrupt::setup(&*device, &guest_memory, interrupt_mode)?;
         let interrupt_state = Arc::new(Mutex::new(InterruptState {
             interrupt,
             status: 0,
+            delivery,
         }));
+        let ack = ack.register(driver, &doorbell_registration, mmio_gpa, &interrupt_state);
 
-        let core = VirtioTransportCore::new(device, driver, guest_memory, doorbell_registration)?;
+        let mut core =
+            VirtioTransportCore::new(device, driver, guest_memory, doorbell_registration)?;
+        core.device_feature = core.device_feature.without_bits(disabled_features);
 
         Ok(Self {
             core,
@@ -130,6 +169,7 @@ impl VirtioMmioDevice {
                 device_id: traits.device_id.0 as u32,
                 vendor_id: 0x1af4,
                 interrupt_state,
+                interrupt_ack: ack,
             },
         })
     }
@@ -183,7 +223,7 @@ impl VirtioMmioDevice {
                     .is_some_and(|qd| qd.params.enable) as u32
             }
             VirtioMmioRegister::QUEUE_NOTIFY => 0,
-            VirtioMmioRegister::INTERRUPT_STATUS => self.mmio.interrupt_state.lock().status,
+            VirtioMmioRegister::INTERRUPT_STATUS => self.mmio.read_interrupt_status(),
             VirtioMmioRegister::INTERRUPT_ACK => 0,
             VirtioMmioRegister::STATUS => self.core.device_status.as_u32(),
             VirtioMmioRegister::QUEUE_DESC_LOW => self
@@ -359,6 +399,18 @@ impl ChangeDeviceState for VirtioMmioDevice {
         self.core.start(&mut self.mmio);
     }
 
+    async fn start_fallible(&mut self) -> anyhow::Result<()> {
+        self.core.start_fallible(&mut self.mmio).await
+    }
+
+    async fn quiesce_input(&mut self) -> anyhow::Result<()> {
+        self.core.quiesce_input().await
+    }
+
+    async fn resume_input(&mut self) -> anyhow::Result<()> {
+        self.core.resume_input().await
+    }
+
     async fn stop(&mut self) {
         self.core.stop(&mut self.mmio).await;
     }
@@ -392,6 +444,7 @@ mod saved_state {
         use crate::transport::saved_state::state::CommonQueueState;
         use crate::transport::saved_state::state::CommonSavedState;
         use mesh::payload::Protobuf;
+        use vmcore::save_restore::SavedStateBlob;
         use vmcore::save_restore::SavedStateRoot;
 
         #[derive(Protobuf)]
@@ -410,6 +463,8 @@ mod saved_state {
             pub queues: Vec<SavedQueueState>,
             #[mesh(3)]
             pub interrupt_status: u32,
+            #[mesh(4)]
+            pub device_state: Option<SavedStateBlob>,
         }
     }
 
@@ -427,7 +482,8 @@ mod saved_state {
                         common: self.core.save_queue_common(i),
                     })
                     .collect(),
-                interrupt_status: self.mmio.interrupt_state.lock().status,
+                device_state: self.core.take_device_state()?,
+                interrupt_status: self.mmio.read_interrupt_status(),
             })
         }
 
@@ -435,10 +491,12 @@ mod saved_state {
             &mut self,
             state: Self::SavedState,
         ) -> Result<(), vmcore::save_restore::RestoreError> {
+            self.mmio.reset_interrupt_state();
             let saved_queue_count = state.queues.len();
             self.core.restore_common(
                 &mut self.mmio,
                 &state.common,
+                state.device_state,
                 state.queues.into_iter().map(|sq| (sq.common, 0)),
                 saved_queue_count,
             )?;
@@ -446,8 +504,7 @@ mod saved_state {
             // Restore MMIO-specific interrupt state.
             {
                 let mut is = self.mmio.interrupt_state.lock();
-                is.status = state.interrupt_status;
-                is.interrupt.set_level(is.status != 0);
+                is.restore_status(state.interrupt_status)?;
             }
 
             Ok(())

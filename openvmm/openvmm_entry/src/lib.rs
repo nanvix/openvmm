@@ -11,9 +11,11 @@ mod cli_args;
 mod crash_dump;
 mod kvp;
 mod meshworker;
+mod microvm;
 mod pidfile;
 mod repl;
 mod serial_io;
+mod snapshot_restore;
 mod storage_builder;
 mod tracing_init;
 mod ttrpc;
@@ -39,6 +41,7 @@ use cli_args::TpmVersionCli;
 use cli_args::UefiConsoleModeCli;
 use cli_args::VirtioBusCli;
 use cli_args::VmgsCli;
+use cli_args::microvm::MachineProfileCli;
 use crash_dump::spawn_dump_handler;
 use cxl_spec::test::CxlTestDeviceHandle;
 use disk_backend_resources::DelayDiskHandle;
@@ -148,6 +151,11 @@ use vmotherboard::ChipsetDeviceHandle;
 use vnc_worker_defs::VncParameters;
 
 pub fn openvmm_main() {
+    #[cfg(target_os = "linux")]
+    if let Err(error) = pal::unix::fd_table::expand_fd_table() {
+        eprintln!("warning: failed to expand the file descriptor table: {error}");
+    }
+
     // Save the current state of the terminal so we can restore it back to
     // normal before exiting.
     #[cfg(unix)]
@@ -194,6 +202,7 @@ struct VmResources {
     consomme_rpc: Option<mesh::Sender<net_backend_resources::consomme::ConsommeRequest>>,
     ged_rpc: Option<mesh::Sender<get_resources::ged::GuestEmulationRequest>>,
     vtl2_settings: Option<vtl2_settings_proto::Vtl2Settings>,
+    microvm: microvm::MicrovmResources,
     /// Receives dirty rectangles from the synthetic video device for the VNC worker.
     dirty_rect_recv: Option<mesh::Receiver<Vec<video_core::DirtyRect>>>,
     #[cfg(windows)]
@@ -230,7 +239,9 @@ fn build_switch_list(all_switches: &[cli_args::GenericPcieSwitchCli]) -> Vec<Pci
 }
 
 fn base_chipset_type(opt: &Options) -> BaseChipsetType {
-    if opt.igvm.is_some() {
+    if opt.machine == MachineProfileCli::Microvm {
+        BaseChipsetType::Microvm
+    } else if opt.igvm.is_some() {
         match opt.igvm_personality {
             None => BaseChipsetType::HclHost,
             Some(IgvmPersonalityCli::Uefi) => BaseChipsetType::HypervGen2Uefi,
@@ -317,9 +328,11 @@ async fn vm_config_from_command_line(
     spawner: impl Spawn,
     mesh: &VmmMesh,
     opt: &Options,
+    microvm_restore: &microvm::MicrovmRestore,
 ) -> anyhow::Result<(Config, VmResources)> {
     opt.validate_isolation_options()?;
     opt.validate_igvm_options()?;
+    let mut microvm = microvm::MicrovmConfigBuilder::new(opt, microvm_restore)?;
 
     let (_, serial_driver) = DefaultPool::spawn_on_thread("serial");
 
@@ -385,6 +398,19 @@ async fn vm_config_from_command_line(
             SerialConfigCli::Tcp(addr) => {
                 Some(serial_io::bind_tcp_serial(&addr).context("failed to bind serial")?)
             }
+            SerialConfigCli::ConnectPipe(path) => Some(
+                serial_io::connect::connect_serial_with_timeout(
+                    &path,
+                    Duration::from_millis(
+                        openvmm_defs::microvm::MICROVM_CONSOLE_RECONNECT_TIMEOUT_MS,
+                    ),
+                )
+                .context("failed to connect serial")?,
+            ),
+            SerialConfigCli::ConnectTcp(addr) => Some(serial_io::connect::connect_tcp_serial(
+                &addr,
+                Duration::from_millis(openvmm_defs::microvm::MICROVM_CONSOLE_RECONNECT_TIMEOUT_MS),
+            )?),
             SerialConfigCli::NewConsole(app, window_title) => {
                 let path = console_relay::random_console_path();
                 let config =
@@ -415,11 +441,13 @@ async fn vm_config_from_command_line(
         opt.com4.as_ref().is_some_and(|c| c.debugger_mode),
     ];
 
+    microvm.setup_portb(&console_state, &serial_driver)?;
+
     let serial0_cfg = setup_serial(
         "com1",
         opt.com1
             .clone()
-            .map_or(SerialConfigCli::Console, |c| c.backend),
+            .map_or(microvm.default_com1_backend(), |c| c.backend),
         if cfg!(guest_arch = "x86_64") {
             "ttyS0"
         } else {
@@ -506,7 +534,9 @@ async fn vm_config_from_command_line(
         "debugcon",
     )?;
 
-    let virtio_console_backend = if let Some(serial_cfg) = opt.virtio_console.clone() {
+    let virtio_console_backend = if microvm.is_active() {
+        microvm.setup_virtio_consoles(&console_state, &serial_driver)?
+    } else if let Some(serial_cfg) = opt.virtio_console.clone() {
         setup_serial("virtio-console", serial_cfg, "hvc0")?
     } else {
         None
@@ -649,6 +679,8 @@ async fn vm_config_from_command_line(
             .await?;
     }
 
+    microvm.add_sandbox_blocks(&mut storage).await?;
+
     for &cli_args::IdeDiskCli {
         ref kind,
         read_only,
@@ -767,6 +799,9 @@ async fn vm_config_from_command_line(
 
     let mut nic_index = 0;
     for cli_cfg in &opt.net {
+        if microvm.is_active() {
+            continue;
+        }
         if cli_cfg.pcie_port.is_some() {
             anyhow::bail!("`--net` does not support PCIe");
         }
@@ -1333,7 +1368,12 @@ async fn vm_config_from_command_line(
         TpmVersionCli::V185 => TpmVersion::V185,
     });
 
-    if opt.restore_snapshot.is_some() {
+    microvm.add_chipset_devices(&mut chipset_devices)?;
+
+    if let Some(microvm_load_mode) = microvm.load_mode(arch)? {
+        load_mode = microvm_load_mode;
+        with_hv = false;
+    } else if opt.restore_snapshot.is_some() {
         // Snapshot restore: skip firmware loading entirely. Device state and
         // memory come from the snapshot directory.
         load_mode = LoadMode::None;
@@ -1482,6 +1522,7 @@ async fn vm_config_from_command_line(
         };
     }
 
+    microvm.validate_vmgs()?;
     let mut vmgs = Some(if let Some(VmgsCli { kind, provision }) = &opt.vmgs {
         let disk = VmgsDisk {
             disk: disk_open(kind, false)
@@ -1501,6 +1542,7 @@ async fn vm_config_from_command_line(
     } else {
         VmgsResource::Ephemeral
     });
+    microvm.filter_vmgs(&mut vmgs);
 
     if with_get && with_hv {
         let has_vtl0_nvme = storage.has_vtl0_nvme();
@@ -1821,6 +1863,8 @@ async fn vm_config_from_command_line(
         }
     };
 
+    microvm.add_virtio_devices(&mut add_virtio_device, &mut resources)?;
+
     for cli_cfg in &opt.virtio_net {
         if cli_cfg.underhill {
             anyhow::bail!("use --net uh:[...] to add underhill NICs")
@@ -1830,6 +1874,10 @@ async fn vm_config_from_command_line(
             max_queues: vport.max_queues,
             mac_address: vport.mac_address,
             endpoint: vport.endpoint,
+            egress_policy: None,
+            save_restore: false,
+            static_ipv4: None,
+            effective_features: None,
         }
         .into_resource();
         if let Some(pcie_port) = &cli_cfg.pcie_port {
@@ -1849,6 +1897,7 @@ async fn vm_config_from_command_line(
                 root_path: args.path.clone(),
                 mount_options: args.options.clone(),
             },
+            profile: virtio_resources::fs::microvm::VirtioFsProfile::Standard,
         }
         .into_resource();
         if let Some(pcie_port) = &args.pcie_port {
@@ -1867,6 +1916,7 @@ async fn vm_config_from_command_line(
             fs: virtio_resources::fs::VirtioFsBackend::SectionFs {
                 root_path: args.path.clone(),
             },
+            profile: virtio_resources::fs::microvm::VirtioFsProfile::Standard,
         }
         .into_resource();
         if let Some(pcie_port) = &args.pcie_port {
@@ -1926,8 +1976,10 @@ async fn vm_config_from_command_line(
 
     if let Some(backend) = virtio_console_backend {
         let resource: Resource<VirtioDeviceHandle> =
-            virtio_resources::console::VirtioConsoleHandle { backend }.into_resource();
-        if let Some(pcie_port) = &opt.virtio_console_pcie_port {
+            microvm.virtio_console_handle(backend).into_resource();
+        if microvm.is_active() {
+            add_virtio_device(VirtioBusCli::Mmio, resource);
+        } else if let Some(pcie_port) = &opt.virtio_console_pcie_port {
             pcie_devices.push(PcieDeviceConfig {
                 port_name: pcie_port.clone(),
                 resource: VirtioPciDeviceHandle(resource).into_resource(),
@@ -1936,6 +1988,7 @@ async fn vm_config_from_command_line(
             add_virtio_device(VirtioBusCli::Auto, resource);
         }
     }
+    microvm.add_control_console(&mut add_virtio_device)?;
 
     // Handle --vhost-user arguments.
     #[cfg(target_os = "linux")]
@@ -2022,6 +2075,8 @@ async fn vm_config_from_command_line(
     }
 
     let mut cfg = Config {
+        machine_profile: opt.machine.into(),
+        microvm: Default::default(),
         chipset,
         load_mode,
         floppy_disks,
@@ -2166,6 +2221,7 @@ async fn vm_config_from_command_line(
     };
 
     storage.build_config(&mut cfg, &mut resources, opt.scsi_sub_channels)?;
+    microvm.finish(&mut cfg, &mut resources)?;
     resources.serial_driver = Some(serial_driver);
     validate_snp_config(&cfg)?;
     Ok((cfg, resources))
@@ -2305,8 +2361,12 @@ fn parse_endpoint(
             };
             net_backend_resources::consomme::ConsommeHandle {
                 cidr: cidr.clone(),
+                static_ipv4: None,
                 ports,
                 recv,
+                allow_host_local_access: None,
+                map_gateway_to_host_loopback: None,
+                gateway_loopback_proxy_port: None,
             }
             .into_resource()
         }
@@ -2344,6 +2404,9 @@ fn parse_endpoint(
                 let _ = name;
                 bail!("TAP backend is only supported on Linux")
             }
+        }
+        EndpointConfigCli::Microvm(_) => {
+            bail!("a bare IPv4/prefix --net is only supported by the microVM profile")
         }
     };
 
@@ -2603,54 +2666,8 @@ pub(crate) const GUEST_ARCH: &str = if cfg!(guest_arch = "x86_64") {
     "aarch64"
 };
 
-/// Open a snapshot directory and validate it against the current VM config.
-/// Returns the shared memory fd (from memory.bin) and the saved device state.
-fn prepare_snapshot_restore(
-    snapshot_dir: &Path,
-    opt: &Options,
-) -> anyhow::Result<(
-    openvmm_defs::worker::SharedMemoryFd,
-    mesh::payload::message::ProtobufMessage,
-)> {
-    let (manifest, state_bytes) = openvmm_helpers::snapshot::read_snapshot(snapshot_dir)?;
-
-    // Validate manifest against current VM config.
-    openvmm_helpers::snapshot::validate_manifest(
-        &manifest,
-        GUEST_ARCH,
-        opt.memory_size(),
-        opt.processors,
-        system_page_size(),
-    )?;
-
-    // Open memory.bin (existing file, no create, no resize).
-    let memory_file = fs_err::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(snapshot_dir.join("memory.bin"))?;
-
-    // Validate file size matches expected memory size.
-    let file_size = memory_file.metadata()?.len();
-    if file_size != manifest.memory_size_bytes {
-        anyhow::bail!(
-            "memory.bin size ({file_size} bytes) doesn't match manifest ({} bytes)",
-            manifest.memory_size_bytes,
-        );
-    }
-
-    let shared_memory_fd =
-        openvmm_helpers::shared_memory::file_to_shared_memory_fd(memory_file.into())?;
-
-    // Reconstruct ProtobufMessage from the saved state bytes.
-    // The save side wrote mesh::payload::encode(ProtobufMessage), so we decode
-    // back to ProtobufMessage.
-    let state_msg: mesh::payload::message::ProtobufMessage = mesh::payload::decode(&state_bytes)
-        .context("failed to decode saved state from snapshot")?;
-
-    Ok((shared_memory_fd, state_msg))
-}
-
 fn do_main(pidfile_guard: &mut Option<pidfile::Pidfile>) -> anyhow::Result<i32> {
+    openvmm_defs::profile::initialize();
     #[cfg(windows)]
     pal::windows::disable_hard_error_dialog();
 
@@ -2662,6 +2679,7 @@ fn do_main(pidfile_guard: &mut Option<pidfile::Pidfile>) -> anyhow::Result<i32> 
     meshworker::run_vmm_mesh_host()?;
 
     let opt = cli_args::parse_options();
+    microvm::report::validate_early_options(&opt)?;
     if let Some(path) = &opt.write_saved_state_proto {
         mesh::payload::protofile::DescriptorWriter::new(vmcore::save_restore::saved_state_roots())
             .write_to_path(path)
@@ -2724,7 +2742,7 @@ fn do_main(pidfile_guard: &mut Option<pidfile::Pidfile>) -> anyhow::Result<i32> 
         }
     }
 
-    DefaultPool::run_with(async |driver| run_control(&driver, opt).await)
+    DefaultPool::run_with(async |driver| microvm::report::run_control(&driver, opt).await)
 }
 
 fn new_hvsock_service_id(port: u32) -> Guid {
@@ -2750,10 +2768,19 @@ async fn run_control(driver: &DefaultDriver, opt: Options) -> anyhow::Result<i32
 async fn run_control_inner(
     driver: &DefaultDriver,
     mesh_slot: &mut Option<VmmMesh>,
-    opt: Options,
+    mut opt: Options,
 ) -> anyhow::Result<i32> {
     let mesh = mesh_slot.as_ref().unwrap();
-    let (mut vm_config, mut resources) = vm_config_from_command_line(driver, mesh, &opt).await?;
+    let mut restore = snapshot_restore::SnapshotRestore::open(&opt)?;
+    let microvm_restore = microvm::prepare_restore(&mut opt, restore.snapshot())?;
+    let (mut vm_config, mut resources) =
+        vm_config_from_command_line(driver, mesh, &opt, &microvm_restore).await?;
+    let mut microvm = microvm::MicrovmLaunch::new(
+        &opt,
+        &vm_config,
+        std::mem::take(&mut resources.microvm),
+        microvm_restore,
+    )?;
 
     let mut vnc_worker = None;
     if opt.gfx || opt.vnc.vnc {
@@ -2874,12 +2901,24 @@ async fn run_control_inner(
     // spin up the VM
     let (vm_rpc, rpc_recv) = mesh::channel();
     let (notify_send, notify_recv) = mesh::channel();
+    let (snapshot_boundary_requests, snapshot_ready, snapshot_requests) =
+        microvm.snapshot_channels();
+    let hypervisor = match &opt.hypervisor {
+        Some(name) => openvmm_helpers::hypervisor::hypervisor_resource(name)?,
+        None if opt.machine == MachineProfileCli::Microvm => {
+            openvmm_helpers::hypervisor::microvm::choose_microvm_hypervisor()?
+        }
+        None => openvmm_helpers::hypervisor::choose_hypervisor()?,
+    };
+    let source_hypervisor = hypervisor.id().to_owned();
     let vm_worker = {
         let vm_host = mesh.make_host("vm", opt.log_file.clone()).await?;
 
-        let (shared_memory, saved_state) = if let Some(snapshot_dir) = &opt.restore_snapshot {
-            let (fd, state_msg) = prepare_snapshot_restore(snapshot_dir, &opt)?;
+        let (shared_memory, saved_state) = if opt.restore_snapshot.is_some() {
+            let (fd, state_msg) = restore.prepare(&opt, &microvm, &source_hypervisor)?;
             (Some(fd), Some(state_msg))
+        } else if let Some(shared_memory) = microvm.capture_shared_memory()? {
+            (Some(shared_memory), None)
         } else {
             let shared_memory = opt
                 .memory_backing_file()
@@ -2892,22 +2931,35 @@ async fn run_control_inner(
                 .transpose()?;
             (shared_memory, None)
         };
+        let restore = restore.into_worker();
+        let restore_ready_sink = snapshot_restore::restore_ready_sink(&opt)?;
 
         let params = VmWorkerParameters {
-            hypervisor: match &opt.hypervisor {
-                Some(name) => openvmm_helpers::hypervisor::hypervisor_resource(name)?,
-                None => openvmm_helpers::hypervisor::choose_hypervisor()?,
-            },
+            hypervisor,
             cfg: vm_config,
             saved_state,
             shared_memory,
+            shared_memory_copy_on_write: restore.shared_memory_copy_on_write,
+            snapshot_restore_guards: restore.guards,
+            snapshot_boundary_requests,
+            snapshot_ready,
+            snapshot_capture_enabled: microvm.snapshot_capture_enabled(),
+            restore_downtime: restore.downtime,
+            restore_tsc_frequency_hz: restore.tsc_frequency_hz,
+            restore_apic_frequency_hz: restore.apic_frequency_hz,
+            restore_cpu_contract: restore.cpu_contract,
+            restore_ready_sink,
+            restore_gate_timeout: microvm.restore_gate_timeout(&opt),
+            restore_vp_count: opt.microvm.restore_processors,
             rpc: rpc_recv,
             notify: notify_send,
         };
+        let worker_launch = openvmm_defs::profile::ProfileSpan::start();
         vm_host
             .launch_worker(VM_WORKER, params)
             .await
-            .context("failed to launch vm worker")?
+            .context("failed to launch vm worker")
+            .inspect(|_| snapshot_restore::worker_launched(worker_launch))?
     };
 
     if opt.restore_snapshot.is_some() {
@@ -2915,7 +2967,10 @@ async fn run_control_inner(
     }
 
     if !opt.paused {
-        vm_rpc.call(VmRpc::Resume, ()).await?;
+        anyhow::ensure!(
+            vm_rpc.call_failable(VmRpc::Resume, ()).await?,
+            "VM failed to start; inspect the worker log for the device startup error"
+        );
     }
 
     let paravisor_diag = Arc::new(diag_client::DiagClient::from_dialer(
@@ -2955,11 +3010,12 @@ async fn run_control_inner(
         vm_rpc: vm_rpc.clone(),
         paravisor_diag: Some(paravisor_diag),
         igvm_path: opt.igvm.clone(),
-        memory_backing_file: opt.memory_backing_file().cloned(),
+        memory_backing_file: microvm.memory_backing_file(&opt),
         memory: opt.memory_size(),
         processors: opt.processors,
         log_file: opt.log_file.clone(),
         crash_dump_path: opt.crash_dump_path.clone(),
+        microvm: microvm.into_controller(&opt, source_hypervisor, snapshot_requests),
         guest_power_actions: vm_controller::GuestPowerActions {
             shutdown: opt.guest_shutdown_action,
             reset: opt.guest_reset_action,
@@ -2988,18 +3044,19 @@ async fn run_control_inner(
             kvp_ic: resources.kvp_ic,
             console_in: resources.console_in,
             has_vtl2,
+            launch: repl::launch::ReplLaunch::from_options(&opt),
         },
     )
     .await;
 
     // Wait for the controller task to finish (it stops the VM worker and
     // shuts down the mesh).
-    controller_task.await;
+    let teardown = controller_task.await;
     drop(serial_driver);
 
     // run_repl returns the exit status: the code the guest drove via an opt-in
     // exit (VmControllerEvent::ExitRequested), or 0 when the VM stopped normally.
-    repl_result
+    teardown.enforce(opt.machine == MachineProfileCli::Microvm, repl_result)
 }
 
 struct DiagDialer {

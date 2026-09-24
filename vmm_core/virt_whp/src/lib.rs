@@ -10,12 +10,16 @@
 #![expect(clippy::undocumented_unsafe_blocks, clippy::missing_safety_doc)]
 
 mod apic;
+#[cfg(guest_arch = "x86_64")]
+mod cpu_contract;
 pub mod device;
 mod emu;
 mod hypercalls;
 mod memory;
 mod regs;
 mod synic;
+#[cfg(guest_arch = "x86_64")]
+mod tsc;
 mod vm_state;
 mod vp;
 mod vp_state;
@@ -122,6 +126,12 @@ struct WhpPartitionInner {
     caps: virt::PartitionCapabilities,
     #[cfg(guest_arch = "x86_64")]
     cpuid: virt::CpuidLeafSet,
+    #[cfg(guest_arch = "x86_64")]
+    #[inspect(flatten)]
+    cpuid_topology: cpu_contract::CpuidTopology,
+    #[cfg(guest_arch = "x86_64")]
+    #[inspect(flatten)]
+    clock: tsc::PartitionClock,
     vtl0_alias_map_offset: Option<u64>,
     monitor_page: MonitorPage,
     hvstate: Hv1State,
@@ -529,6 +539,8 @@ impl virt::ResetPartition for WhpPartition {
     type Error = Error;
 
     fn reset(&self) -> Result<(), Error> {
+        #[cfg(guest_arch = "x86_64")]
+        self.inner.reset_restored_tsc()?;
         self.inner.vtl0.reset()?;
         self.validate_is_reset(Vtl::Vtl0);
 
@@ -605,6 +617,31 @@ impl virt::AcceptInitialPages for WhpPartition {
 impl virt::Partition for WhpPartition {
     fn initial_vp_state_source(&self) -> virt::InitialVpStateSource {
         virt::InitialVpStateSource::Registers
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn cpu_compatibility_contract(&self) -> virt::x86::CpuCompatibilityContract {
+        virt::x86::CpuCompatibilityContract::new(&self.inner.caps, &self.inner.cpuid)
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn tsc_frequency_hz(&self) -> Result<Option<u64>, Self::Error> {
+        Ok(Some(self.inner.clock.tsc_frequency_hz))
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn set_tsc_frequency_hz(&self, frequency_hz: u64) -> Result<(), Self::Error> {
+        self.inner.clock.check_frequency(frequency_hz)
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn advance_snapshot_time(&self, _duration: std::time::Duration) -> Result<(), Self::Error> {
+        self.inner.advance_snapshot_time()
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn apic_frequency_hz(&self) -> Result<Option<u64>, Self::Error> {
+        self.inner.apic_frequency_hz()
     }
 
     fn supports_reset(&self) -> Option<&dyn virt::ResetPartition<Error = Error>> {
@@ -825,6 +862,9 @@ pub enum Error {
     GicV2NotSupported,
     #[error("failed to compute topology cpuid")]
     TopologyCpuid(#[source] virt::x86::topology::UnknownVendor),
+    #[cfg(guest_arch = "x86_64")]
+    #[error(transparent)]
+    TscFrequencyCpuid(#[from] virt::x86::tsc::TscFrequencyCpuidError),
     #[error("{0} is not supported on this architecture")]
     UnsupportedParameter(&'static str),
     #[error("WHP does not support nested virtualization on this host")]
@@ -837,6 +877,11 @@ pub enum Error {
     NestedVirtIncompatibleWithIsolation,
     #[error("WHP does not support {0:?} isolation")]
     IsolationNotSupported(IsolationType),
+    #[error("saved TSC frequency {saved} Hz does not match destination frequency {destination} Hz")]
+    TscFrequencyMismatch { saved: u64, destination: u64 },
+    #[cfg(guest_arch = "x86_64")]
+    #[error("timestamp intercept arrived without a restored TSC clock")]
+    UnexpectedTimestampExit,
 }
 
 trait WhpResultExt<T> {
@@ -987,7 +1032,8 @@ impl ProtoPartition for WhpProtoPartition<'_> {
         // the memory backing can resolve them on demand (soft large pages, lazy
         // commit). WHP on aarch64 does not deliver these faults, so the backing
         // must not defer any commit or protection to a fault.
-        cfg!(guest_arch = "x86_64")
+        // Pure COW restores intentionally leave these faults to WHP.
+        cfg!(guest_arch = "x86_64") && self.config.user_mode_memory_faults
     }
 
     fn build(
@@ -1107,6 +1153,9 @@ impl WhpPartitionInner {
         // These are validated by VtlPartition::new and only consumed on x86_64.
         let _ = (user_mode_apic, offload_enlightenments, nested_virt);
 
+        #[cfg(guest_arch = "x86_64")]
+        let tsc_frequency = vtl0.whp.tsc_frequency().for_op("get tsc frequency")?;
+
         // FUTURE: register cpuid results with the hypervisor, and register
         // appropriate per-VP results where necessary (or tell the hypervisor
         // the AMD topology information so that it can provide per-VP results
@@ -1148,6 +1197,8 @@ impl WhpPartitionInner {
                         .map(|(f, v)| virt::CpuidLeaf::new(f.0, [v.eax, v.ebx, v.ecx, v.edx])),
                     );
                     hv1_emulator::cpuid::process_hv_cpuid_leaves(&mut cpuid, false, [0; 4]);
+                } else {
+                    cpuid.push(cpu_contract::mask_gpa_pinning_enlightenment());
                 }
             }
 
@@ -1185,6 +1236,7 @@ impl WhpPartitionInner {
             )
             .map_err(Error::TopologyCpuid)?;
 
+            let cpuid = tsc::add_frequency_leaves(cpuid, tsc_frequency, &vtl0)?;
             virt::CpuidLeafSet::new(cpuid)
         };
 
@@ -1288,7 +1340,6 @@ impl WhpPartitionInner {
             if vtl0.hypervisor_enlightened {
                 Hv1State::Offloaded
             } else {
-                let tsc_frequency = vtl0.whp.tsc_frequency().for_op("get tsc frequency")?;
                 let ref_time = ReferenceTimeSource::new(VmTimeReferenceTimeSource::new(
                     proto_config.vmtime.clone(),
                 ));
@@ -1317,6 +1368,10 @@ impl WhpPartitionInner {
             caps,
             #[cfg(guest_arch = "x86_64")]
             cpuid,
+            #[cfg(guest_arch = "x86_64")]
+            cpuid_topology: cpu_contract::CpuidTopology::new(proto_config.processor_topology),
+            #[cfg(guest_arch = "x86_64")]
+            clock: tsc::PartitionClock::new(tsc_frequency),
             vtl0_alias_map_offset,
             monitor_page: MonitorPage::new(),
             hvstate,
@@ -1476,6 +1531,11 @@ impl VtlPartition {
             .for_op("set processor count")?;
 
         #[cfg(guest_arch = "x86_64")]
+        if config.versioned_cpu_contract {
+            cpu_contract::configure_versioned_contract(&mut whp_config, &mut extended_exits)?;
+        }
+
+        #[cfg(guest_arch = "x86_64")]
         if nested_virt {
             match whp_config.set_property(whp::PartitionProperty::NestedVirtualization(true)) {
                 Ok(_) => {}
@@ -1561,8 +1621,10 @@ impl VtlPartition {
         // for ROM regions, resulting in an extra syscall and C++ exception for
         // each such exit. We know locally whether memory is supposed to be
         // mapped writable, so we can avoid this.
+        // Pure writable-COW microVM restores leave these faults to WHP instead,
+        // avoiding one VP exit and populate call per first-touch page.
         // TODO-aarch64
-        if cfg!(guest_arch = "x86_64") {
+        if cfg!(guest_arch = "x86_64") && config.user_mode_memory_faults {
             extended_exits |= whp::abi::WHV_EXTENDED_VM_EXITS::GpaAccessFaultExit;
         }
 
@@ -1754,7 +1816,10 @@ impl VtlPartition {
 
             Box::new(memory::vtl2_mapper::VtlMemoryMapper::new(mapping_state))
         } else {
-            Box::new(memory::WhpMemoryMapper::new(with_overlays))
+            Box::new(memory::WhpMemoryMapper::with_lazy_registration(
+                with_overlays,
+                config.lazy_memory_registration,
+            ))
         };
 
         Ok(Self {

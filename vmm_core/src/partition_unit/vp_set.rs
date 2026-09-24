@@ -3,6 +3,11 @@
 
 //! Virtual processor state management.
 
+mod boundary;
+mod prefix;
+#[cfg(guest_arch = "x86_64")]
+mod tsc;
+
 use super::HaltReason;
 use super::HaltReasonReceiver;
 use super::InternalHaltReason;
@@ -77,6 +82,10 @@ trait ControlVp: ProtobufSaveRestore {
 
     /// Scrub per-VP state for a VTL.
     fn scrub(&mut self, vtl: Vtl) -> anyhow::Result<()>;
+
+    /// Advances the stopped vCPU TSC after snapshot downtime.
+    #[cfg(guest_arch = "x86_64")]
+    fn advance_tsc(&mut self, advance: tsc::TscAdvance) -> anyhow::Result<()>;
 
     #[cfg(feature = "gdb")]
     fn debug(&mut self) -> &mut dyn DebugVp;
@@ -173,6 +182,11 @@ where
                 })
             }
         }
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn advance_tsc(&mut self, advance: tsc::TscAdvance) -> anyhow::Result<()> {
+        advance.apply(self.vp)
     }
 
     fn inspect_vp(
@@ -753,6 +767,7 @@ pub struct VpSet {
     inner: Arc<Inner>,
     #[inspect(rename = "vp", iter_by_index, safe)]
     vps: Vec<Vp>,
+    vp_capacity: usize,
     #[inspect(skip)]
     started: bool,
 }
@@ -768,7 +783,11 @@ struct Vp {
 }
 
 impl VpSet {
-    pub fn new(vtl_guest_memory: [Option<GuestMemory>; NUM_VTLS], halt: Arc<Halt>) -> Self {
+    pub fn new(
+        vtl_guest_memory: [Option<GuestMemory>; NUM_VTLS],
+        halt: Arc<Halt>,
+        vp_capacity: usize,
+    ) -> Self {
         let inner = Inner {
             vtl_guest_memory,
             halt,
@@ -776,6 +795,7 @@ impl VpSet {
         Self {
             inner: Arc::new(inner),
             vps: Vec::new(),
+            vp_capacity,
             started: false,
         }
     }
@@ -831,7 +851,8 @@ impl VpSet {
     /// Stops all VPs.
     pub async fn stop(&mut self) {
         if self.started {
-            self.vps
+            let stops = self
+                .vps
                 .iter()
                 .map(|vp| {
                     let (send, recv) = mesh::oneshot();
@@ -839,9 +860,9 @@ impl VpSet {
                     // Ignore VPs whose runners have been dropped.
                     async { recv.await.ok() }
                 })
-                .collect::<JoinAll<_>>()
-                .await;
+                .collect::<JoinAll<_>>();
             self.started = false;
+            stops.await;
         }
     }
 
@@ -881,6 +902,7 @@ impl VpSet {
 
     pub async fn save(&mut self) -> Result<Vec<(VpIndex, SavedStateBlob)>, SaveError> {
         assert!(!self.started);
+        self.validate_save_vp_count()?;
         self.vps
             .iter()
             .enumerate()
@@ -903,6 +925,7 @@ impl VpSet {
         states: impl IntoIterator<Item = (VpIndex, SavedStateBlob)>,
     ) -> Result<(), RestoreError> {
         assert!(!self.started);
+        let states = self.select_instantiated_vp_states(states)?;
         states
             .into_iter()
             .map(|(vp_index, data)| {
@@ -987,7 +1010,7 @@ impl VpSet {
         vp: VpIndex,
         vtl: Vtl,
     ) -> anyhow::Result<hyperv_dump::VpState> {
-        self.vps[vp.index() as usize]
+        self.instantiated_vp(vp)?
             .send
             .call(|x| VpEvent::State(StateEvent::GetDumpVpState(x)), vtl)
             .await
@@ -1003,7 +1026,7 @@ impl VpSet {
         vp: VpIndex,
         state: virt::x86::DebugState,
     ) -> anyhow::Result<()> {
-        self.vps[vp.index() as usize]
+        self.instantiated_vp(vp)?
             .send
             .call(
                 |x| VpEvent::State(StateEvent::Debug(DebugEvent::SetDebugState(x))),
@@ -1032,7 +1055,7 @@ impl VpSet {
         vp: VpIndex,
         state: Box<DebuggerVpState>,
     ) -> anyhow::Result<()> {
-        self.vps[vp.index() as usize]
+        self.instantiated_vp(vp)?
             .send
             .call(
                 |x| VpEvent::State(StateEvent::Debug(DebugEvent::SetVpState(x))),
@@ -1043,7 +1066,7 @@ impl VpSet {
     }
 
     pub async fn get_vp_state(&self, vp: VpIndex) -> anyhow::Result<Box<DebuggerVpState>> {
-        self.vps[vp.index() as usize]
+        self.instantiated_vp(vp)?
             .send
             .call(
                 |x| VpEvent::State(StateEvent::Debug(DebugEvent::GetVpState(x))),
@@ -1059,7 +1082,7 @@ impl VpSet {
         gva: u64,
         len: usize,
     ) -> anyhow::Result<Vec<u8>> {
-        self.vps[vp.index() as usize]
+        self.instantiated_vp(vp)?
             .send
             .call(
                 |x| VpEvent::State(StateEvent::Debug(DebugEvent::ReadVirtualMemory(x))),
@@ -1075,7 +1098,7 @@ impl VpSet {
         gva: u64,
         data: Vec<u8>,
     ) -> anyhow::Result<()> {
-        self.vps[vp.index() as usize]
+        self.instantiated_vp(vp)?
             .send
             .call(
                 |x| VpEvent::State(StateEvent::Debug(DebugEvent::WriteVirtualMemory(x))),
@@ -1101,6 +1124,8 @@ enum StateEvent {
     Restore(Rpc<SavedStateBlob, Result<(), RestoreError>>),
     Reset(mesh::rpc::FailableRpc<(), ()>),
     Scrub(mesh::rpc::FailableRpc<Vtl, ()>),
+    #[cfg(guest_arch = "x86_64")]
+    AdvanceTsc(mesh::rpc::FailableRpc<tsc::TscAdvance, ()>),
     #[cfg(feature = "dump")]
     GetDumpVpState(Rpc<Vtl, anyhow::Result<hyperv_dump::VpState>>),
     #[cfg(feature = "gdb")]
@@ -1347,6 +1372,8 @@ impl RunnerInner {
             StateEvent::Restore(rpc) => rpc.handle_sync(|data| vp.restore(data)),
             StateEvent::Reset(rpc) => rpc.handle_failable_sync(|()| vp.reset()),
             StateEvent::Scrub(rpc) => rpc.handle_failable_sync(|vtl| vp.scrub(vtl)),
+            #[cfg(guest_arch = "x86_64")]
+            StateEvent::AdvanceTsc(rpc) => rpc.handle_failable_sync(|tsc| vp.advance_tsc(tsc)),
             #[cfg(feature = "dump")]
             StateEvent::GetDumpVpState(rpc) => rpc.handle_sync(|vtl| vp.get_dump_vp_state(vtl)),
             #[cfg(feature = "gdb")]

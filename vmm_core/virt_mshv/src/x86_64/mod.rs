@@ -3,6 +3,9 @@
 
 //! x86_64-specific implementation of the mshv hypervisor backend.
 
+mod extint;
+pub(crate) mod finalize;
+mod tsc;
 mod vm_state;
 mod vp_state;
 
@@ -36,7 +39,6 @@ use hvdef::hypercall::HvRegisterAssoc;
 use memory_range::MemoryRange;
 use mshv_ioctls::InterruptRequest;
 use mshv_ioctls::VcpuFd;
-use pal::unix::pthread::Pthread;
 use parking_lot::Mutex;
 use pci_core::msi::SignalMsi;
 use std::os::fd::AsRawFd;
@@ -117,6 +119,7 @@ impl virt::Hypervisor for LinuxMshv {
         );
         let create_args =
             partition_create_args(snp, x2apic, config.processor_topology.smt_enabled());
+        let create_args = tsc::with_features1(create_args, config.versioned_cpu_contract);
 
         let vmfd = create_vm_with_retry(&self.mshv, &create_args)?;
 
@@ -247,13 +250,13 @@ fn snp_synthetic_features() -> hvdef::HvPartitionSyntheticProcessorFeatures {
         .with_access_partition_reference_counter(true)
         .with_access_synic_regs(true)
         .with_access_synthetic_timer_regs(true)
-        // HACK: Do not advertise AccessPartitionReferenceTsc to the ACI SNP
-        // kernel yet. Physical Hyper-V and Cloud Hypervisor both advertise
+        // HACK: Do not advertise AccessPartitionReferenceTsc to SNP guests yet.
+        // Physical Hyper-V and Cloud Hypervisor both advertise
         // it, relying on the hypervisor/MSHV rather than userspace to service
         // HV_X64_MSR_REFERENCE_TSC and its page. OpenVMM launch-imports GPA
-        // 0x3402000 normally; the ACI kernel then shares it as its retained
+        // 0x3402000 normally; the guest kernel then shares it as its retained
         // Hyper-V `tsc_pg`. MSHV accepts the initial import but later reports
-        // that GPA as unaccepted when device I/O begins. Keeping ACI on the
+        // that GPA as unaccepted when device I/O begins. Keeping the guest on the
         // reference counter MSR makes virtio-blk write/readback work.
         // Re-enable this after tracing and fixing MSHV's SNP PSC/host-access
         // handling for the shared reference-TSC page.
@@ -304,10 +307,13 @@ fn validate_snp_cpuid_offload_config(
     Ok(())
 }
 
-impl MshvProtoPartition<'_> {
+impl MshvPartitionInner {
     /// Build partition capabilities from partition properties instead of
     /// CPUID.
-    fn caps_from_properties(&self) -> Result<virt::x86::X86PartitionCapabilities, Error> {
+    fn caps_from_properties(
+        &self,
+        bsp: &VcpuFd,
+    ) -> Result<virt::x86::X86PartitionCapabilities, Error> {
         use virt::x86::X86PartitionCapabilities;
         use virt::x86::XsaveCapabilities;
         use x86defs::cpuid::Vendor;
@@ -335,12 +341,11 @@ impl MshvProtoPartition<'_> {
             .get_partition_property(HvPartitionPropertyCode::MaxXsaveDataSize.0)
             .map_err(|e| ErrorInner::GetPartitionProperty(e.into()))?;
 
-        let reset_rdx = if self.config.isolation.isolation_type() == virt::IsolationType::Snp {
+        let reset_rdx = if self.isolation_type() == virt::IsolationType::Snp {
             0
         } else {
             let mut assoc = [HvRegisterAssoc::from((HvX64RegisterName::Rdx, 0u64))];
-            self.bsp
-                .get_hvdef_regs(&mut assoc)
+            bsp.get_hvdef_regs(&mut assoc)
                 .map_err(ErrorInner::Register)?;
             assoc[0].value.as_u64()
         };
@@ -355,13 +360,13 @@ impl MshvProtoPartition<'_> {
             vm_topology::processor::x86::ApicMode::X2ApicEnabled
         );
 
-        let hv1 = self.config.hv_config.is_some();
+        let hv1 = self.config.hv_configured;
         Ok(X86PartitionCapabilities {
             vendor,
             hv1,
             hv1_reference_tsc_page: hv1_reference_tsc_page_supported(
                 hv1,
-                self.config.isolation.isolation_type(),
+                self.isolation_type(),
                 true,
             ),
             xsave: XsaveCapabilities {
@@ -378,6 +383,10 @@ impl MshvProtoPartition<'_> {
             cet_ss: false,
             sgx: false,
             tsc_aux: false,
+            // MSHV does not reliably deliver TSC deadline events to direct-boot
+            // guests. Fall back to the LAPIC count-mode clockevent.
+            tsc_deadline: false,
+            kvm_clock: false,
             vtom: None,
             physical_address_width: self
                 .vmfd
@@ -392,7 +401,9 @@ impl MshvProtoPartition<'_> {
             nested_virt: false,
         })
     }
+}
 
+impl MshvProtoPartition<'_> {
     fn max_physical_address_size(&self) -> u8 {
         self.vmfd
             .get_partition_property(HvPartitionPropertyCode::PhysicalAddressWidth.0)
@@ -437,14 +448,11 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             let expose_hypervisor = self.config.hv_config.is_some();
             cpuid.extend(snp_cpuid_overrides(expose_hypervisor));
             if expose_hypervisor {
-                let native_max_leaf = self
-                    .bsp
-                    .get_cpuid_values(hvdef::HV_CPUID_FUNCTION_HV_VENDOR_AND_MAX_FUNCTION, 0, 0, 0)
-                    .map(|values| values[0])
-                    .unwrap_or(hvdef::HV_CPUID_FUNCTION_MS_HV_ISOLATION_CONFIGURATION);
+                let native_max_leaf = finalize::snp_native_hv_max_leaf(&cpuid);
                 cpuid.extend(snp_hv_cpuid_overrides(native_max_leaf));
             }
         }
+        let cpuid = tsc::add_cpuid_leaves(&self.vmfd, cpuid)?;
         let cpuid = virt::CpuidLeafSet::new(cpuid);
 
         // Apply CPUID overrides partition-wide.
@@ -485,44 +493,6 @@ impl ProtoPartition for MshvProtoPartition<'_> {
                 .map_err(|e| ErrorInner::RegisterCpuid(e.into()))?;
         }
 
-        let caps = {
-            let mut cpuid_error = None;
-            let cpuid_caps = virt::PartitionCapabilities::from_cpuid(
-                self.config.processor_topology,
-                &mut |function, index| {
-                    self.bsp
-                        .get_cpuid_values(function, index, 0, 0)
-                        .unwrap_or_else(|err| {
-                            cpuid_error.get_or_insert(err);
-                            [0; 4]
-                        })
-                },
-            );
-            let mut caps = match (cpuid_caps, cpuid_error) {
-                (Ok(caps), None) => caps,
-                (result, error) => {
-                    tracing::warn!(
-                        error = error.as_ref().map(|err| err as &dyn std::error::Error),
-                        capabilities_error = result
-                            .err()
-                            .as_ref()
-                            .map(|err| err as &dyn std::error::Error),
-                        "failed to query CPUID capabilities, falling back to partition properties; some features may be unavailable"
-                    );
-                    self.caps_from_properties()?
-                }
-            };
-            caps.hv1 = self.config.hv_config.is_some();
-            caps.hv1_reference_tsc_page = hv1_reference_tsc_page_supported(
-                caps.hv1,
-                self.config.isolation.isolation_type(),
-                caps.hv1_reference_tsc_page,
-            );
-            caps.xsaves_state_bv_broken = true;
-            caps.can_freeze_time = true;
-            caps
-        };
-
         let apic_id_map = self
             .config
             .processor_topology
@@ -543,7 +513,7 @@ impl ProtoPartition for MshvProtoPartition<'_> {
         let time_frozen = isolation.is_isolated();
         let inner = Arc::new(MshvPartitionInner {
             vmfd: self.vmfd,
-            bsp_vcpufd: self.bsp,
+            finalized: Default::default(),
             memory: Default::default(),
             gm: config.guest_memory.clone(),
             mem_layout: config.mem_layout.clone(),
@@ -552,8 +522,8 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             gsi_states: Mutex::new(Box::new(
                 [crate::irqfd::GsiState::Unallocated; crate::irqfd::NUM_GSIS],
             )),
-            caps,
             synic_ports: Default::default(),
+            config: finalize::CreationConfig::new(cpuid, &self.config),
             software_devices: ApicSoftwareDevices::new(apic_id_map),
             isolation,
             // SNP partition creation set TimeFreeze=1 before this object was built.
@@ -587,6 +557,30 @@ impl virt::Partition for MshvPartition {
         self.inner.isolation.initial_vp_state_source()
     }
 
+    fn finalize_memory(&self) -> Result<(), Self::Error> {
+        self.inner.finalize_memory()
+    }
+
+    fn cpu_compatibility_contract(&self) -> virt::x86::CpuCompatibilityContract {
+        virt::x86::CpuCompatibilityContract::new(self.inner.caps(), &self.inner.config.cpuid)
+    }
+
+    fn tsc_frequency_hz(&self) -> Result<Option<u64>, Self::Error> {
+        self.inner.tsc_frequency_hz()
+    }
+
+    fn set_tsc_frequency_hz(&self, frequency_hz: u64) -> Result<(), Self::Error> {
+        self.inner.set_tsc_frequency_hz(frequency_hz)
+    }
+
+    fn advance_snapshot_time(&self, _duration: std::time::Duration) -> Result<(), Self::Error> {
+        self.inner.advance_snapshot_time()
+    }
+
+    fn apic_frequency_hz(&self) -> Result<Option<u64>, Self::Error> {
+        self.inner.apic_frequency_hz()
+    }
+
     fn supports_initial_page_acceptance(
         &self,
     ) -> Option<&dyn virt::AcceptInitialPages<Error = Error>> {
@@ -607,7 +601,7 @@ impl virt::Partition for MshvPartition {
     }
 
     fn caps(&self) -> &virt::PartitionCapabilities {
-        &self.inner.caps
+        self.inner.caps()
     }
 
     fn request_msi(&self, _vtl: Vtl, request: MsiRequest) {
@@ -627,11 +621,7 @@ impl virt::Partition for MshvPartition {
         if vp.needs_yield.request_yield() {
             let thread = vp.thread.read();
             if let Some(thread) = *thread {
-                if thread != Pthread::current() {
-                    thread
-                        .signal(libc::SIGRTMIN())
-                        .expect("thread cancel signal failed");
-                }
+                crate::run_vp::cancel(thread).expect("thread cancel signal failed");
             }
         }
     }
@@ -643,13 +633,7 @@ impl virt::X86Partition for MshvPartition {
     }
 
     fn pulse_lint(&self, vp_index: VpIndex, vtl: Vtl, lint: u8) {
-        // TODO: Implement LINT injection for non-isolated MSHV partitions.
-        //
-        // The legacy PIC/PIT are temporarily attached for direct-boot TSC
-        // calibration, but MSHV isolated VPs cannot receive PIC ExtINT through
-        // LINT0. The guest must route runtime interrupts through the IOAPIC/MSI
-        // path; PIC-dependent isolated guests are not supported.
-        tracelimit::warn_ratelimited!(?vp_index, ?vtl, lint, "ignored lint pulse");
+        self.inner.pulse_lint(vp_index, vtl, lint)
     }
 }
 
@@ -757,9 +741,10 @@ impl virt::BindProcessor for MshvProcessorBinder {
 
     fn bind(&mut self) -> Result<Self::Processor<'_>, Self::Error> {
         let inner = &self.partition.vps[self.vpindex.index() as usize];
+        let finalized = self.partition.finalized()?;
 
         let vcpufd = if self.vpindex.is_bsp() {
-            &self.partition.bsp_vcpufd
+            &finalized.bsp_vcpufd
         } else {
             if self.vcpufd.is_none() {
                 let vcpufd = self
@@ -808,7 +793,7 @@ impl virt::BindProcessor for MshvProcessorBinder {
         if this.partition.isolation.snp().is_none() {
             // Set the APIC state.
             let apic_base =
-                virt::vp::Apic::at_reset(&this.partition.caps, &this.inner.vp_info).apic_base;
+                virt::vp::Apic::at_reset(&finalized.caps, &this.inner.vp_info).apic_base;
 
             let regs = &[
                 HvRegisterAssoc::from((
@@ -822,7 +807,7 @@ impl virt::BindProcessor for MshvProcessorBinder {
                 )),
             ];
 
-            let reg_count = if this.partition.caps.x2apic { 2 } else { 3 };
+            let reg_count = if finalized.caps.x2apic { 2 } else { 3 };
 
             vcpufd
                 .set_hvdef_regs(&regs[..reg_count])
@@ -888,6 +873,9 @@ impl MshvProcessor<'_> {
             HvMessageType::HvMessageTypeX64ApicEoi => {
                 let msg = exit.as_message::<hvdef::HvX64ApicEoiMessage>();
                 dev.handle_eoi(msg.interrupt_vector);
+            }
+            HvMessageType::HvMessageTypeX64InterruptionDeliverable => {
+                self.handle_interrupt_deliverable(exit, dev);
             }
             exit_type => {
                 panic!("Unhandled vcpu exit code {exit_type:?}");
@@ -981,7 +969,7 @@ impl EmulatorSupport for MshvEmulationState<'_> {
     }
 
     fn vendor(&self) -> x86defs::cpuid::Vendor {
-        self.partition.caps.vendor
+        self.partition.caps().vendor
     }
 
     fn gp(&mut self, reg: x86emu::Gp) -> u64 {

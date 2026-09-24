@@ -36,6 +36,15 @@ use vm_resource::IntoResource;
 use vmotherboard::ChipsetDeviceHandle;
 
 impl PetriVmConfigOpenVmm {
+    /// Modify the effective Linux direct kernel command line.
+    pub fn with_linux_command_line(mut self, f: impl FnOnce(&mut String)) -> Self {
+        let LoadMode::Linux { cmdline, .. } = &mut self.config.load_mode else {
+            panic!("Linux command-line configuration requires Linux direct boot.")
+        };
+        f(cmdline);
+        self
+    }
+
     /// Enable the VTL0 alias map.
     // TODO: Remove once #912 is fixed.
     pub fn with_vtl0_alias_map(mut self) -> Self {
@@ -116,8 +125,12 @@ impl PetriVmConfigOpenVmm {
     pub fn with_nic(mut self) -> Self {
         let endpoint = net_backend_resources::consomme::ConsommeHandle {
             cidr: None,
+            static_ipv4: None,
             ports: Vec::new(),
             recv: None,
+            allow_host_local_access: None,
+            map_gateway_to_host_loopback: None,
+            gateway_loopback_proxy_port: None,
         }
         .into_resource();
         if let Some(vtl2_settings) = self.runtime_config.vtl2_settings.as_mut() {
@@ -162,8 +175,12 @@ impl PetriVmConfigOpenVmm {
     pub fn with_pcie_nic(mut self, port_name: &str, mac_address: MacAddress) -> Self {
         let endpoint = net_backend_resources::consomme::ConsommeHandle {
             cidr: None,
+            static_ipv4: None,
             ports: Vec::new(),
             recv: None,
+            allow_host_local_access: None,
+            map_gateway_to_host_loopback: None,
+            gateway_loopback_proxy_port: None,
         }
         .into_resource();
         self.config.pcie_devices.push(PcieDeviceConfig {
@@ -209,26 +226,33 @@ impl PetriVmConfigOpenVmm {
     ///
     /// This exposes a virtio-net device on a PCIe root port, suitable for
     /// guests running virtio drivers (e.g. Linux with UEFI boot).
+    ///
+    /// The NIC does not support save/restore, so the VM skips its startup
+    /// save/restore test.
     pub fn with_virtio_nic(mut self, port_name: &str, mac_address: MacAddress) -> Self {
         let endpoint = net_backend_resources::consomme::ConsommeHandle {
             cidr: None,
+            static_ipv4: None,
             ports: Vec::new(),
             recv: None,
+            allow_host_local_access: None,
+            map_gateway_to_host_loopback: None,
+            gateway_loopback_proxy_port: None,
         }
         .into_resource();
 
-        self.config.pcie_devices.push(PcieDeviceConfig {
-            port_name: port_name.to_string(),
-            resource: virtio_resources::VirtioPciDeviceHandle(
-                virtio_resources::net::VirtioNetHandle {
-                    max_queues: None,
-                    mac_address,
-                    endpoint,
-                }
-                .into_resource(),
-            )
-            .into_resource(),
-        });
+        self.push_virtio_nic(
+            port_name,
+            virtio_resources::net::VirtioNetHandle {
+                max_queues: None,
+                mac_address,
+                endpoint,
+                egress_policy: None,
+                save_restore: false,
+                static_ipv4: None,
+                effective_features: None,
+            },
+        );
 
         self
     }
@@ -240,10 +264,14 @@ impl PetriVmConfigOpenVmm {
     /// This configures consomme to forward the pipette TCP port from the
     /// host into the guest, so the petri framework can connect to the
     /// pipette agent over TCP.
+    ///
+    /// The NIC does not support save/restore, so the VM skips its startup
+    /// save/restore test.
     pub fn with_tcp_pipette_nic(mut self, port_name: &str, mac_address: MacAddress) -> Self {
         let (port_send, port_recv) = mesh::oneshot();
         let endpoint = net_backend_resources::consomme::ConsommeHandle {
             cidr: None,
+            static_ipv4: None,
             ports: vec![net_backend_resources::consomme::HostPortConfig {
                 protocol: net_backend_resources::consomme::HostPortProtocol::Tcp,
                 host_address: Some(net_backend_resources::consomme::HostIpAddress::Ipv4(
@@ -253,22 +281,42 @@ impl PetriVmConfigOpenVmm {
                 guest_port: pipette_client::PIPETTE_PORT as u16,
             }],
             recv: None,
+            allow_host_local_access: None,
+            map_gateway_to_host_loopback: None,
+            gateway_loopback_proxy_port: None,
         }
         .into_resource();
-        self.config.pcie_devices.push(PcieDeviceConfig {
-            port_name: port_name.to_string(),
-            resource: virtio_resources::VirtioPciDeviceHandle(
-                virtio_resources::net::VirtioNetHandle {
-                    max_queues: None,
-                    mac_address,
-                    endpoint,
-                }
-                .into_resource(),
-            )
-            .into_resource(),
-        });
+        self.push_virtio_nic(
+            port_name,
+            virtio_resources::net::VirtioNetHandle {
+                max_queues: None,
+                mac_address,
+                endpoint,
+                egress_policy: None,
+                save_restore: false,
+                static_ipv4: None,
+                effective_features: None,
+            },
+        );
         self.resources.tcp_pipette_port = Some(port_recv);
         self
+    }
+
+    /// Add a virtio-net device on a PCIe root port.
+    ///
+    /// A virtio-net device supports save/restore only when its handle opts in
+    /// with a static IPv4 identity and a fixed feature contract. Saving a VM
+    /// with any other virtio-net device fails, so record the port to make the
+    /// VM skip its startup save/restore test while that device is configured.
+    fn push_virtio_nic(&mut self, port_name: &str, nic: virtio_resources::net::VirtioNetHandle) {
+        if !nic.save_restore {
+            self.pcie_ports_without_save_restore
+                .push(port_name.to_string());
+        }
+        self.config.pcie_devices.push(PcieDeviceConfig {
+            port_name: port_name.to_string(),
+            resource: virtio_resources::VirtioPciDeviceHandle(nic.into_resource()).into_resource(),
+        });
     }
 
     /// Request nested virtualization support from the host hypervisor.

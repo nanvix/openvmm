@@ -115,7 +115,7 @@ pub trait ProtobufSaveRestore {
 }
 
 /// An opaque saved state blob, encoded as a protobuf message.
-#[derive(Debug, Protobuf)]
+#[derive(Clone, Debug, Protobuf)]
 #[mesh(transparent)]
 pub struct SavedStateBlob(ProtobufAny);
 
@@ -140,6 +140,11 @@ impl SavedStateBlob {
     /// Decodes the protobuf message into `T`.
     pub fn parse<T: SavedStateRoot>(&self) -> Result<T, payload::Error> {
         self.0.parse()
+    }
+
+    /// Returns the encoded state payload length without decoding it.
+    pub fn encoded_len(&self) -> usize {
+        self.0.value_len()
     }
 }
 
@@ -242,5 +247,18 @@ pub mod private {
                     Some(&protofile::message_description::<$ident>());
             };
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NoSavedState;
+    use super::SavedStateBlob;
+
+    #[test]
+    fn cloned_saved_state_blob_parses() {
+        let state = SavedStateBlob::new(NoSavedState);
+        state.clone().parse::<NoSavedState>().unwrap();
+        state.parse::<NoSavedState>().unwrap();
     }
 }

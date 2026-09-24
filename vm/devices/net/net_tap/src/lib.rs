@@ -6,8 +6,10 @@
 #![cfg(target_os = "linux")]
 #![expect(missing_docs)]
 
+mod quiesce;
 pub mod resolver;
 pub mod tap;
+mod tx;
 
 use async_trait::async_trait;
 use futures::io::AsyncRead;
@@ -26,19 +28,15 @@ use net_backend::TxId;
 use net_backend::TxMetadata;
 use net_backend::TxOffloadSupport;
 use net_backend::TxSegment;
-use net_backend::linearize;
-use net_backend::next_packet;
+use net_backend_resources::egress::EgressPolicy;
 use pal_async::driver::Driver;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::io::ErrorKind;
-use std::io::Write;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use zerocopy::FromBytes;
-use zerocopy::IntoBytes;
 
 // TODO: These virtio net header types duplicate definitions in virtio_net.
 // Consider extracting a shared `virtio_net_header` crate if more consumers
@@ -112,6 +110,7 @@ pub use vnet_hdr::*;
 /// An endpoint based on a TAP interface.
 pub struct TapEndpoint {
     tap: Arc<Mutex<Option<tap::Tap>>>,
+    egress_policy: Option<EgressPolicy>,
 }
 
 impl TapEndpoint {
@@ -138,6 +137,7 @@ impl TapEndpoint {
 
         Ok(Self {
             tap: Arc::new(Mutex::new(Some(tap))),
+            egress_policy: None,
         })
     }
 }
@@ -166,7 +166,13 @@ impl Endpoint for TapEndpoint {
         queues.push(Box::new(TapQueue::new(
             config.driver.as_ref(),
             self.tap.clone(),
+            self.egress_policy.clone(),
         )?));
+        Ok(())
+    }
+
+    fn set_egress_policy(&mut self, policy: EgressPolicy) -> anyhow::Result<()> {
+        self.egress_policy = Some(policy);
         Ok(())
     }
 
@@ -197,6 +203,8 @@ struct TapQueue {
     tap: Option<tap::PolledTap>,
     inner: Inner,
     buffer: Box<[u8]>,
+    tx: tx::TxState,
+    input_quiesced: bool,
 }
 
 struct Inner {
@@ -219,7 +227,11 @@ impl Drop for TapQueue {
 }
 
 impl TapQueue {
-    fn new(driver: &dyn Driver, slot: Arc<Mutex<Option<tap::Tap>>>) -> anyhow::Result<Self> {
+    fn new(
+        driver: &dyn Driver,
+        slot: Arc<Mutex<Option<tap::Tap>>>,
+        egress_policy: Option<EgressPolicy>,
+    ) -> anyhow::Result<Self> {
         let tap = slot.lock().take().expect("queue is already in use");
         let tap = tap.polled(driver)?;
         Ok(Self {
@@ -230,16 +242,25 @@ impl TapQueue {
                 rx_ready: VecDeque::new(),
             },
             buffer: vec![0; 65535 + size_of::<VirtioNetHdr>()].into_boxed_slice(),
+            tx: tx::TxState::new(egress_policy),
+            input_quiesced: false,
         })
     }
 }
 
+#[async_trait]
 impl Queue for TapQueue {
     fn poll_ready(&mut self, cx: &mut Context<'_>, pool: &mut dyn BufferAccess) -> Poll<()> {
+        if self.poll_tx(cx).is_ready() {
+            return Poll::Ready(());
+        }
         if !self.inner.rx_ready.is_empty() {
             return Poll::Ready(());
         }
 
+        if self.input_quiesced {
+            return Poll::Pending;
+        }
         let tap = if let Some(tap) = self.tap.as_mut() {
             tap
         } else {
@@ -287,6 +308,9 @@ impl Queue for TapQueue {
     }
 
     fn rx_avail(&mut self, _pool: &mut dyn BufferAccess, done: &[RxId]) {
+        if self.input_quiesced {
+            return;
+        }
         self.inner.rx_free.extend(done);
     }
 
@@ -308,78 +332,27 @@ impl Queue for TapQueue {
         pool: &mut dyn BufferAccess,
         mut segments: &[TxSegment],
     ) -> anyhow::Result<(bool, usize)> {
-        let n = segments.len();
-        // Synchronously send packets received from the guest to host's network.
-        if let Some(tap) = self.tap.as_mut() {
-            while !segments.is_empty() {
-                let (meta, _segs, _rest) = next_packet(segments);
-                let hdr = build_vnet_hdr(meta);
-                let hdr_bytes = hdr.as_bytes();
-                let mut packet = linearize(pool, &mut segments)?;
-
-                // Fix up the IPv4 header checksum when the frontend
-                // requested IPv4 header checksum offload.
-                //
-                // The virtio vnet header has no mechanism for IPv4 header
-                // checksum offload, so we compute it in software. This
-                // also covers NDIS/netvsp LSO packets, where the guest
-                // driver zeroes ip_check (NDIS convention); the kernel's
-                // TAP GSO engine requires a valid checksum to segment
-                // the packet correctly.
-                // Same NDIS/LSO convention for IPv6: the guest zeroes the IPv6
-                // payload-length field on segmentation-offload frames. IPv6 has
-                // no header checksum (so the IPv4 fixup above never runs for it);
-                // fix the length here so the kernel TAP GSO engine can segment.
-                if meta.flags.offload_ip_header_checksum() && meta.flags.is_ipv4() {
-                    fixup_ipv4_header_checksum(&mut packet, meta.l2_len as usize);
-                }
-                if meta.flags.offload_tcp_segmentation() && meta.flags.is_ipv6() {
-                    fixup_ipv6_payload_length(&mut packet, meta.l2_len as usize);
-                }
-
-                let bufs = [
-                    std::io::IoSlice::new(hdr_bytes),
-                    std::io::IoSlice::new(&packet),
-                ];
-                match tap.write_vectored(&bufs) {
-                    Ok(bytes_written) => {
-                        assert_eq!(
-                            bytes_written,
-                            hdr_bytes.len() + packet.len(),
-                            "TAP should never partial write"
-                        );
-                    }
-                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                        // dropped packet: buffer is full
-
-                        // TODO: return partial transmit here. This relies on
-                        // remembering this condition and polling for POLLOUT in
-                        // poll_ready().
-                    }
-                    Err(err) if err.raw_os_error() == Some(libc::EIO) => {
-                        // dropped packet: interface is not up
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            error = &err as &dyn std::error::Error,
-                            "write to TAP interface failed"
-                        );
-                    }
-                }
-            }
-        }
-        let completed_synchronously = true;
-        Ok((completed_synchronously, n))
+        self.transmit(pool, &mut segments)
     }
 
     fn tx_poll(
         &mut self,
         _pool: &mut dyn BufferAccess,
-        _done: &mut [TxId],
+        done: &mut [TxId],
     ) -> Result<usize, TxError> {
-        // Packets are sent synchronously so there is no no need to check here if
-        // sending has been completed.
-        Ok(0)
+        self.poll_tx_done(done)
+    }
+
+    async fn quiesce(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+    ) -> anyhow::Result<net_backend::quiesce::QueueQuiesceResult> {
+        self.quiesce_queue().await
+    }
+
+    fn resume(&mut self) -> anyhow::Result<()> {
+        self.input_quiesced = false;
+        Ok(())
     }
 }
 

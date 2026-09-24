@@ -31,7 +31,13 @@ impl ResolveResource<VirtioDeviceHandle, VirtioFsHandle> for VirtioFsResolver {
         resource: VirtioFsHandle,
         input: VirtioResolveInput<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        if let Some(device) = crate::microvm::resolver::resolve(&resource, input.driver_source)? {
+            return Ok(device.into());
+        }
         let device = match &resource.fs {
+            VirtioFsBackend::Dormant => {
+                anyhow::bail!("standard virtio-fs requires an active backend")
+            }
             VirtioFsBackend::HostFs {
                 root_path,
                 mount_options,
@@ -46,15 +52,13 @@ impl ResolveResource<VirtioDeviceHandle, VirtioFsHandle> for VirtioFsResolver {
                 None,
             ),
             #[cfg(windows)]
-            VirtioFsBackend::SectionFs { root_path } => {
-                VirtioFsDevice::new(
-                    input.driver_source,
-                    &resource.tag,
-                    crate::SectionFs::new(root_path)?,
-                    8 * 1024 * 1024 * 1024, // 8GB of shared memory,
-                    None,
-                )
-            }
+            VirtioFsBackend::SectionFs { root_path } => VirtioFsDevice::new(
+                input.driver_source,
+                &resource.tag,
+                crate::SectionFs::new(root_path)?,
+                8 * 1024 * 1024 * 1024, // 8GB of shared memory,
+                None,
+            ),
             #[cfg(not(windows))]
             VirtioFsBackend::SectionFs { .. } => {
                 anyhow::bail!("section fs not supported on this platform")
