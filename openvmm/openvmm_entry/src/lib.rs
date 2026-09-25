@@ -1988,6 +1988,7 @@ async fn vm_config_from_command_line(
             add_virtio_device(VirtioBusCli::Auto, resource);
         }
     }
+    microvm.add_control_console(&mut add_virtio_device)?;
 
     // Handle --vhost-user arguments.
     #[cfg(target_os = "linux")]
