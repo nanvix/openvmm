@@ -29,11 +29,28 @@ impl Worker {
         let (vm_rpc, rpc_recv) = mesh::channel();
         let (notify_send, notify_recv) = mesh::channel();
 
+        let hypervisor = crate::openvmm::microvm::choose_hypervisor(
+            cfg.machine_profile,
+            openvmm_helpers::hypervisor::choose_hypervisor,
+            openvmm_helpers::hypervisor::microvm::choose_microvm_hypervisor,
+        )?;
         let params = VmWorkerParameters {
-            hypervisor: openvmm_helpers::hypervisor::choose_hypervisor()?,
+            hypervisor,
             cfg,
             saved_state: None,
             shared_memory,
+            shared_memory_copy_on_write: false,
+            snapshot_restore_guards: None,
+            snapshot_boundary_requests: None,
+            snapshot_ready: None,
+            snapshot_capture_enabled: false,
+            restore_downtime: None,
+            restore_tsc_frequency_hz: None,
+            restore_apic_frequency_hz: None,
+            restore_cpu_contract: None,
+            restore_ready_sink: None,
+            restore_gate_timeout: None,
+            restore_vp_count: None,
             rpc: rpc_recv,
             notify: notify_send,
         };
@@ -52,8 +69,8 @@ impl Worker {
         self.rpc.call(VmRpc::Pause, ()).await
     }
 
-    pub(crate) async fn resume(&self) -> Result<bool, RpcError> {
-        self.rpc.call(VmRpc::Resume, ()).await
+    pub(crate) async fn resume(&self) -> anyhow::Result<bool> {
+        Ok(self.rpc.call_failable(VmRpc::Resume, ()).await?)
     }
 
     pub(crate) async fn save(&self) -> anyhow::Result<mesh::payload::message::ProtobufMessage> {

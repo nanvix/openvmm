@@ -2,13 +2,17 @@
 // Licensed under the MIT License.
 
 mod amd_iommu_wiring;
+mod clock;
 mod dump;
 mod ecam_config_access;
 mod intel_vtd_wiring;
 mod ioapic_iommu_wiring;
+mod microvm;
 mod pcie_topology;
 mod pcie_wiring;
+mod restore;
 mod smmu_wiring;
+mod snapshot_rpc;
 
 use crate::emuplat;
 use crate::partition::BindHvliteVp;
@@ -56,7 +60,6 @@ use membacking::SharedMemoryBacking;
 use memory_range::MemoryRange;
 use mesh::MeshPayload;
 use mesh::error::RemoteError;
-use mesh::payload::Protobuf;
 use mesh::payload::message::ProtobufMessage;
 use mesh_worker::Worker;
 use mesh_worker::WorkerId;
@@ -83,15 +86,17 @@ use openvmm_defs::config::Vtl2BaseAddressType;
 use openvmm_defs::config::Vtl2Config;
 use openvmm_defs::config::X2ApicConfig;
 use openvmm_defs::config::X86TopologyConfig;
+use openvmm_defs::microvm::MachineProfile;
 use openvmm_defs::rpc::PulseSaveRestoreError;
 use openvmm_defs::rpc::VmRpc;
+use openvmm_defs::worker::SavedState;
 use openvmm_defs::worker::VM_WORKER;
 use openvmm_defs::worker::VmWorkerParameters;
 use openvmm_pcat_locator::RomFileLocation;
 use pal_async::DefaultDriver;
 use pal_async::DefaultPool;
+use pal_async::driver::SpawnDriver;
 use pal_async::local::block_with_io;
-use pal_async::task::Spawn;
 use pal_async::task::Task;
 use pal_async::timer::PolledTimer;
 use pci_core::PciInterruptPin;
@@ -100,7 +105,6 @@ use pcie::switch::GenericPcieSwitch;
 use scsi_core::ResolveScsiDeviceHandleParams;
 use scsidisk::atapi_scsi::AtapiScsiDisk;
 use serial_16550_resources::ComPort;
-use state_unit::SavedStateUnit;
 use state_unit::SpawnedUnit;
 use state_unit::StateUnits;
 use std::fs::File;
@@ -131,6 +135,7 @@ use vm_topology::memory::MemoryLayout;
 use vm_topology::pcie::PcieHostBridge;
 use vm_topology::pcie::PcieHostBridgeCxlInfo;
 use vm_topology::processor::ProcessorTopology;
+#[cfg(guest_arch = "aarch64")]
 use vm_topology::processor::TopologyBuilder;
 use vm_topology::processor::aarch64::Aarch64Topology;
 use vm_topology::processor::aarch64::GicVersion;
@@ -139,7 +144,6 @@ use vmbus_channel::channel::VmbusDevice;
 use vmbus_server::HvsockRelayChannel;
 use vmbus_server::VmbusServer;
 use vmbus_server::hvsock::HvsockRelay;
-use vmcore::save_restore::SavedStateRoot;
 use vmcore::vm_task::VmTaskDriverSource;
 use vmcore::vm_task::thread::ThreadDriverBackend;
 use vmcore::vmtime::VmTime;
@@ -206,6 +210,8 @@ pub fn new_device_thread() -> (JoinHandle<()>, DefaultDriver) {
 impl Manifest {
     fn from_config(config: Config) -> Self {
         Self {
+            machine_profile: config.machine_profile,
+            microvm: config.microvm.into(),
             load_mode: config.load_mode,
             floppy_disks: config.floppy_disks,
             ide_disks: config.ide_disks,
@@ -284,13 +290,8 @@ pub struct Manifest {
     chipset_capabilities: VmChipsetCapabilities,
     layout: vmm_core_defs::LayoutConfig,
     rtc_delta_milliseconds: i64,
-}
-
-#[derive(Protobuf, SavedStateRoot)]
-#[mesh(package = "openvmm")]
-pub struct SavedState {
-    #[mesh(1)]
-    pub units: Vec<SavedStateUnit>,
+    machine_profile: MachineProfile,
+    microvm: microvm::MicrovmManifest,
 }
 
 async fn open_simple_disk(
@@ -331,6 +332,8 @@ pub struct VmWorker {
     vm: LoadedVm,
     rpc: mesh::Receiver<VmRpc>,
     device_thread: JoinHandle<()>,
+    /// Restored snapshot handles, dropped when `run` returns after the device thread exits.
+    _snapshot_restore_guards: Option<openvmm_defs::worker::SnapshotRestoreGuards>,
 }
 
 impl Worker for VmWorker {
@@ -338,7 +341,10 @@ impl Worker for VmWorker {
     type State = RestartState;
     const ID: WorkerId<Self::Parameters> = VM_WORKER;
 
-    fn new(parameters: Self::Parameters) -> anyhow::Result<Self> {
+    fn new(mut parameters: Self::Parameters) -> anyhow::Result<Self> {
+        let worker_construct = openvmm_defs::profile::ProfileSpan::start();
+        let restore_params = restore::RestoreParameters::take(&mut parameters)?;
+        let microvm_params = microvm::MicrovmParameters::take(&mut parameters)?;
         let (device_thread, device_driver) = new_device_thread();
 
         let manifest = Manifest::from_config(parameters.cfg);
@@ -348,28 +354,34 @@ impl Worker for VmWorker {
 
         let shared_memory = parameters
             .shared_memory
-            .map(|fd| SharedMemoryBacking::from_mappable(fd.into()));
+            .map(|fd| restore_params.shared_memory_backing(fd));
 
-        let vm = block_on(InitializedVm::new(
+        let mut vm = block_on(InitializedVm::new(
             VmTaskDriverSource::new(ThreadDriverBackend::new(device_driver)),
             hypervisor.0,
             manifest,
             shared_memory,
         ))?;
+        restore::validate_restore_cpu_contract(vm.partition.as_ref(), restore_params.cpu_contract)?;
         let saved_state = parameters
             .saved_state
             .map(|m| m.parse())
             .transpose()
             .context("failed to decode saved state")?;
+        microvm_params.prepare_cold_boot(&mut vm, saved_state.is_some())?;
 
-        let vm = block_with_io(|_| vm.load(saved_state, parameters.notify))?;
+        let mut vm =
+            block_with_io(|_| vm.load(saved_state, parameters.notify, restore_params.state))?;
+        vm.snapshot_boundary = microvm_params.snapshot_boundary;
 
         LOADED_VM.store(&vm);
 
+        worker_construct.complete_milestone("startup", "worker_construct", Default::default());
         Ok(Self {
             vm,
             rpc: parameters.rpc,
             device_thread,
+            _snapshot_restore_guards: restore_params.guards,
         })
     }
 
@@ -395,17 +407,20 @@ impl Worker for VmWorker {
             shared_memory,
         ))?;
         pal_async::local::block_on(async {
-            let mut vm = vm.load(Some(saved_state), notify).await?;
+            let mut vm = vm
+                .load(Some(saved_state), notify, Default::default())
+                .await?;
 
             LOADED_VM.store(&vm);
 
             if running {
-                vm.resume().await;
+                vm.resume().await?;
             }
             Ok(Self {
                 vm,
                 rpc,
                 device_thread,
+                _snapshot_restore_guards: None,
             })
         })
     }
@@ -508,7 +523,10 @@ struct X86TopologyResult {
 }
 
 #[cfg(guest_arch = "x86_64")]
-fn build_x86_topology(config: &ProcessorTopologyConfig) -> anyhow::Result<X86TopologyResult> {
+fn build_x86_topology(
+    config: &ProcessorTopologyConfig,
+    machine_profile: MachineProfile,
+) -> anyhow::Result<X86TopologyResult> {
     use vm_topology::processor::x86::X2ApicState;
 
     let arch = match &config.arch {
@@ -516,7 +534,7 @@ fn build_x86_topology(config: &ProcessorTopologyConfig) -> anyhow::Result<X86Top
         Some(ArchTopologyConfig::X86(arch)) => arch.clone(),
         _ => anyhow::bail!("invalid architecture config"),
     };
-    let mut builder = TopologyBuilder::from_host_topology()?;
+    let mut builder = microvm::x86_topology_builder(machine_profile)?;
     builder.apic_id_offset(arch.apic_id_offset);
     if let Some(smt) = config.enable_smt {
         builder.smt_enabled(smt);
@@ -779,6 +797,8 @@ pub(crate) struct LoadedVm {
     state_units: StateUnits,
     inner: LoadedVmInner,
     running: bool,
+    snapshot_restore: restore::SnapshotRestore,
+    snapshot_boundary: microvm::SnapshotBoundary,
 }
 
 struct DynamicVpciDeviceEntry {
@@ -828,6 +848,7 @@ struct LoadedVmInner {
     pci_legacy_interrupts: Vec<((u8, Option<u8>), u32)>,
     firmware_event_send: Option<mesh::Sender<get_resources::ged::FirmwareEvent>>,
 
+    machine_profile: MachineProfile,
     load_mode: LoadMode,
     igvm_file: Option<IgvmFile>,
     next_igvm_file: Option<IgvmFile>,
@@ -1101,7 +1122,7 @@ impl InitializedVm {
         };
         #[cfg(not(guest_arch = "aarch64"))]
         let mut processor_topology = {
-            let result = build_x86_topology(&cfg.processor_topology)?;
+            let result = build_x86_topology(&cfg.processor_topology, cfg.machine_profile)?;
             result.processor_topology
         };
 
@@ -1138,7 +1159,11 @@ impl InitializedVm {
         #[cfg(guest_arch = "aarch64")]
         let device_assignment_msi_iova_range =
             resolve_device_assignment_msi_iova_range(platform_info.device_assignment_msi_iova);
+        let lazy_memory_registration =
+            microvm::uses_lazy_memory_registration(&cfg, shared_memory.as_ref());
+        let user_mode_memory_faults = !lazy_memory_registration;
 
+        let partition_prototype = openvmm_defs::profile::ProfileSpan::start();
         let proto = hypervisor
             .new_partition(virt::ProtoPartitionConfig {
                 processor_topology: &processor_topology,
@@ -1148,8 +1173,12 @@ impl InitializedVm {
                 nested_virt: cfg.hypervisor.nested_virt,
                 #[cfg(guest_arch = "aarch64")]
                 device_assignment_msi_iova_range,
+                user_mode_memory_faults,
+                lazy_memory_registration,
+                versioned_cpu_contract: microvm::uses_versioned_cpu_contract(cfg.machine_profile),
             })
             .context("failed to create the prototype partition")?;
+        partition_prototype.complete("startup", "partition_prototype", Default::default());
 
         let physical_address_size = proto.max_physical_address_size();
 
@@ -1189,6 +1218,7 @@ impl InitializedVm {
             .iter()
             .filter(|(bus, _)| matches!(bus, VirtioBus::Mmio))
             .count();
+        let virtio_mmio_count = microvm::virtio_mmio_count(cfg.machine_profile, virtio_mmio_count);
 
         // On aarch64 Linux direct boot, start RAM at 1 GiB to avoid the low GPA
         // region (128 MiB–129 MiB) that iommufd reserves for the host MSI
@@ -1219,6 +1249,7 @@ impl InitializedVm {
         };
         let resolved_layout = resolve_memory_layout(MemoryLayoutInput {
             node_mem_sizes: &node_mem_sizes,
+            memory_capacity: cfg.microvm.memory_capacity,
             layout: cfg.layout.clone(),
             pcie_root_complexes: &cfg.pcie_root_complexes,
             virtio_mmio_count,
@@ -1230,6 +1261,10 @@ impl InitializedVm {
         })
         .context("invalid memory configuration")?;
         let mem_layout = resolved_layout.memory_layout;
+        let guest_memory_counters = openvmm_defs::profile::ProfileCounters {
+            logical_bytes: Some(mem_layout.ram().iter().map(|range| range.range.len()).sum()),
+            ..Default::default()
+        };
         let resolved_pcie_root_complex_ranges = resolved_layout.pcie_root_complex_ranges;
         let virtio_mmio_region = resolved_layout.virtio_mmio_region;
         let chipset_mmio = resolved_layout.chipset_mmio;
@@ -1338,7 +1373,7 @@ impl InitializedVm {
                     "shared memory restore not supported with {nodes_with_ranges} memory nodes"
                 );
             }
-            Some(smb.into_mappable())
+            Some(smb.into_parts())
         } else {
             None
         };
@@ -1347,9 +1382,17 @@ impl InitializedVm {
         memory_builder = memory_builder
             .vtl0_alias_map(vtl0_alias_map)
             .supports_memory_fault_resolution(supports_memory_fault_resolution)
+            .track_memory_faults(openvmm_defs::profile::enabled())
             .x86_legacy_support(
                 matches!(cfg.load_mode, LoadMode::Pcat { .. }) || cfg.chipset.with_hyperv_vga,
             );
+        memory_builder = microvm::add_snapshot_restore_backing(
+            memory_builder,
+            &cfg,
+            &mut ranges_by_node,
+            nodes_with_ranges,
+            &mut existing_mappable,
+        )?;
 
         for (vnode, ranges) in ranges_by_node.into_iter().enumerate() {
             if ranges.is_empty() {
@@ -1375,8 +1418,10 @@ impl InitializedVm {
             if mem.hugepages {
                 backing = backing.hugepages(mem.hugepage_size);
             }
-            if let Some(mappable) = existing_mappable.take() {
-                backing = backing.existing_mappable(mappable);
+            if let Some((mappable, file_mapping_mode)) = existing_mappable.take() {
+                backing = backing
+                    .existing_mappable(mappable)
+                    .file_mapping_mode(file_mapping_mode);
             }
 
             memory_builder = memory_builder.add_backing(backing);
@@ -1406,10 +1451,12 @@ impl InitializedVm {
             .end_of_layout()
             .max(mem_layout.vtl2_range().map_or(0, |r| r.end()));
 
+        let cow_map_view = openvmm_defs::profile::ProfileSpan::start();
         let mut memory_manager = memory_builder
             .build(max_addr)
             .await
             .context("failed to build guest memory")?;
+        cow_map_view.complete("startup", "cow_map_view", guest_memory_counters);
 
         let gm = memory_manager
             .client()
@@ -1429,6 +1476,7 @@ impl InitializedVm {
             ));
         }
 
+        let partition_build = openvmm_defs::profile::ProfileSpan::start();
         let (partition, vps) = proto
             .build(virt::PartitionConfig {
                 mem_layout: &mem_layout,
@@ -1439,11 +1487,13 @@ impl InitializedVm {
                     .then(|| memory_manager.memory_fault_resolver()),
             })
             .context("failed to create the partition")?;
+        partition_build.complete("startup", "partition_build", Default::default());
 
         let vps = vps.into_iter().map(|vp| Box::new(vp) as _).collect();
 
         let partition = Arc::new(partition);
 
+        let gpa_registration = openvmm_defs::profile::ProfileSpan::start();
         memory_manager
             .attach_partition(
                 Vtl::Vtl0,
@@ -1465,6 +1515,22 @@ impl InitializedVm {
                 .await
                 .context("failed to attach memory to VTL2")?;
         }
+        gpa_registration.complete("startup", "gpa_registration", guest_memory_counters);
+
+        let partition_finalize = openvmm_defs::profile::ProfileSpan::start();
+        let finalize_result = {
+            let _span = tracing::info_span!("post-memory partition finalization").entered();
+            let started = std::time::Instant::now();
+            let result = partition.finalize_memory();
+            tracing::info!(
+                elapsed_us = started.elapsed().as_micros() as u64,
+                success = result.is_ok(),
+                "post-memory partition finalization completed"
+            );
+            result
+        };
+        finalize_result.context("failed to finalize partition memory")?;
+        partition_finalize.complete("startup", "partition_finalize", Default::default());
 
         Ok(Self {
             partition,
@@ -1494,6 +1560,7 @@ impl InitializedVm {
         self,
         saved_state: Option<SavedState>,
         client_notify_send: mesh::Sender<HaltReason>,
+        snapshot_restore: restore::SnapshotRestore,
     ) -> Result<LoadedVm, anyhow::Error> {
         use vmotherboard::options::dev;
 
@@ -1680,6 +1747,7 @@ impl InitializedVm {
                                 with_psp: cfg.chipset.with_generic_psp,
                                 pm_base: PM_BASE,
                                 acpi_irq: SYSTEM_IRQ_ACPI,
+                                level_triggered_irqs: &[],
                                 iommu: None,
                             },
                         };
@@ -1857,6 +1925,7 @@ impl InitializedVm {
                 .into_resource(),
                 century_reg_idx: 0x32, // TODO: automatically sync with FADT
                 initial_cmos: initial_rtc_cmos,
+                mode: dev::GenericCmosRtcMode::Standard,
             }
         });
 
@@ -2021,7 +2090,7 @@ impl InitializedVm {
         .with_device_handles(cfg.chipset_devices)
         .with_pci_device_handles(cfg.pci_chipset_devices)
         .with_isa_dma_handle(cfg.isa_dma_controller)
-        .with_trace_unknown_pio(true) // todo: add CLI param?
+        .with_trace_unknown_pio(microvm::trace_unknown_pio(cfg.machine_profile))
         .build(&driver_source, &state_units, &resolver)
         .await?;
 
@@ -2932,6 +3001,8 @@ impl InitializedVm {
         // allocation indexed by the order of VirtioBus::Mmio devices.
         let mut pci_device_number = 10;
         let mut virtio_mmio_index = 0;
+        let mut microvm_virtio_slots =
+            microvm::VirtioMmioSlots::new(&cfg.microvm.sandbox_blocks, chipset_mmio);
 
         // Avoid an ISA interrupt to avoid conflicts and to avoid needing to
         // configure the line as level-triggered in the MADT (necessary for
@@ -2956,6 +3027,16 @@ impl InitializedVm {
                 )
                 .await?;
             match bus {
+                VirtioBus::Mmio if cfg.machine_profile == MachineProfile::Microvm => {
+                    microvm_virtio_slots.add_device(
+                        &chipset_builder,
+                        &driver_source,
+                        &gm,
+                        &partition,
+                        &id,
+                        device,
+                    )?;
+                }
                 VirtioBus::Mmio => {
                     let mmio_start = virtio_mmio_region.start() + virtio_mmio_index as u64 * 0x1000;
                     virtio_mmio_index += 1;
@@ -3028,6 +3109,7 @@ impl InitializedVm {
             partition.clone().into_vm_partition(),
             PartitionUnitParams {
                 processor_topology: &processor_topology,
+                active_vp_count: None,
                 halt_vps,
                 halt_request_recv,
                 client_notify_send: halt_send,
@@ -3076,6 +3158,8 @@ impl InitializedVm {
         let mut this = LoadedVm {
             state_units,
             running: false,
+            snapshot_restore,
+            snapshot_boundary: Default::default(),
             inner: LoadedVmInner {
                 driver_source,
                 resolver,
@@ -3104,6 +3188,7 @@ impl InitializedVm {
                 chipset_cfg: cfg.chipset,
                 chipset_capabilities: cfg.chipset_capabilities,
                 firmware_event_send: cfg.firmware_event_send,
+                machine_profile: cfg.machine_profile,
                 load_mode: cfg.load_mode,
                 virtio_mmio_region,
                 virtio_mmio_irq,
@@ -3132,9 +3217,11 @@ impl InitializedVm {
         };
 
         if let Some(saved_state) = saved_state {
+            let saved_state_restore = this.begin_snapshot_restore(&saved_state)?;
             this.restore(saved_state)
                 .await
                 .context("loadedvm restore failed")?;
+            this.finish_snapshot_restore(saved_state_restore).await?;
         } else {
             // Assign PCI bus numbers/BARs before building firmware so that the
             // ACPI tables (specifically the SRAT generic-initiator entries) can
@@ -3208,6 +3295,7 @@ impl LoadedVmInner {
                 with_pit: self.chipset_capabilities.with_pit,
                 pm_base: PM_BASE,
                 acpi_irq: SYSTEM_IRQ_ACPI,
+                level_triggered_irqs: microvm::level_triggered_irqs(self.machine_profile),
                 iommu: match &self.iommu_devices {
                     IommuDevices::AmdVi(devices) => {
                         Some(vmm_core::acpi_builder::X86IommuAcpiConfig::AmdVi(
@@ -3261,6 +3349,16 @@ impl LoadedVmInner {
                 ref kernel,
                 ref initrd,
                 ref cmdline,
+                isolation,
+                boot_mode: openvmm_defs::config::LinuxDirectBootMode::MpTable,
+                ref smbios,
+                ..
+            } => microvm::load_linux_x86_mptable(self, kernel, initrd, cmdline, isolation, smbios)?,
+            #[cfg(guest_arch = "x86_64")]
+            &LoadMode::Linux {
+                ref kernel,
+                ref initrd,
+                ref cmdline,
                 enable_serial,
                 isolation,
                 boot_mode,
@@ -3271,6 +3369,7 @@ impl LoadedVmInner {
                         anyhow::bail!("device tree boot mode is not supported on x86_64");
                     }
                     openvmm_defs::config::LinuxDirectBootMode::Acpi => {}
+                    openvmm_defs::config::LinuxDirectBootMode::MpTable => unreachable!(),
                 }
                 let isolation = match (isolation, self.hypervisor_cfg.with_isolation) {
                     (
@@ -3571,13 +3670,13 @@ impl LoadedVmInner {
 }
 
 impl LoadedVm {
-    async fn resume(&mut self) -> bool {
+    async fn resume(&mut self) -> anyhow::Result<bool> {
         if self.running {
-            return false;
+            return Ok(false);
         }
-        self.state_units.start().await;
+        self.start_state_units().await?;
         self.running = true;
-        true
+        Ok(true)
     }
 
     async fn pause(&mut self) -> bool {
@@ -3616,7 +3715,10 @@ impl LoadedVm {
         let stop_guard = self.inner.partition_unit.temporarily_stop_vps().await;
 
         // Start state units so device config space is accessible.
-        self.state_units.start().await;
+        self.state_units
+            .start()
+            .await
+            .context("failed to start devices for PCI resource assignment")?;
 
         let result = ecam_config_access::assign_pci_resources_for_root_complexes(
             &self.inner.chipset,
@@ -3634,7 +3736,7 @@ impl LoadedVm {
 
     pub async fn run(
         mut self,
-        driver: &impl Spawn,
+        driver: &impl SpawnDriver,
         mut rpc_recv: mesh::Receiver<VmRpc>,
         mut worker_rpc: mesh::Receiver<WorkerRpc<RestartState>>,
     ) {
@@ -3642,6 +3744,8 @@ impl LoadedVm {
             WorkerRpc(Result<WorkerRpc<RestartState>, mesh::RecvError>),
             VmRpc(Result<VmRpc, mesh::RecvError>),
             Halt(Result<HaltReason, mesh::RecvError>),
+            SnapshotBoundary(microvm::SnapshotBoundaryEvent),
+            RestoreGateTimeout,
         }
 
         // Start a task to handle state unit inspections by filtering the worker
@@ -3669,7 +3773,24 @@ impl LoadedVm {
                 let a = rpc_recv.recv().map(Event::VmRpc);
                 let b = worker_rpc.recv().map(Event::WorkerRpc);
                 let c = self.inner.halt_recv.recv().map(Event::Halt);
-                (a, b, c).race().await
+                let d = self.snapshot_boundary.recv().map(Event::SnapshotBoundary);
+                let e = self
+                    .snapshot_restore
+                    .gate_expired(driver)
+                    .map(|()| Event::RestoreGateTimeout);
+                (a, b, c, d, e).race().await
+            };
+
+            let event = match event {
+                Event::VmRpc(Ok(message)) => match self.filter_vm_rpc(message) {
+                    Some(message) => Event::VmRpc(Ok(message)),
+                    None => continue,
+                },
+                Event::WorkerRpc(Ok(message)) => match self.filter_worker_rpc(message) {
+                    Some(message) => Event::WorkerRpc(Ok(message)),
+                    None => continue,
+                },
+                event => event,
             };
 
             match event {
@@ -3702,7 +3823,12 @@ impl LoadedVm {
                             }
                             Err(err) => {
                                 if stopped {
-                                    self.state_units.start().await;
+                                    if let Err(start_error) = self.state_units.start().await {
+                                        rpc.complete(Err(RemoteError::new(start_error.context(
+                                            "worker restart failed and the VM could not resume",
+                                        ))));
+                                        continue;
+                                    }
                                 }
                                 rpc.complete(Err(RemoteError::new(err)));
                             }
@@ -3727,10 +3853,26 @@ impl LoadedVm {
                         rpc.handle(async |()| self.inner.partition_unit.clear_halt().await)
                             .await
                     }
-                    VmRpc::Resume(rpc) => rpc.handle(async |()| self.resume().await).await,
+                    VmRpc::Resume(rpc) => {
+                        rpc.handle_failable(async |()| self.resume().await).await
+                    }
                     VmRpc::Pause(rpc) => rpc.handle(async |()| self.pause().await).await,
                     VmRpc::Save(rpc) => {
                         rpc.handle_failable(async |()| self.save().await.map(ProtobufMessage::new))
+                            .await
+                    }
+                    VmRpc::QuiesceForSnapshot(rpc) => {
+                        rpc.handle(async |timeout| self.quiesce_for_snapshot(timeout).await)
+                            .await;
+                    }
+                    VmRpc::ResumeAfterFailedSnapshot(rpc) => {
+                        rpc.handle_failable(async |timeout| {
+                            self.resume_after_failed_snapshot(timeout).await
+                        })
+                        .await;
+                    }
+                    VmRpc::ReleaseSnapshotBoundary(rpc) => {
+                        rpc.handle_failable(async |()| self.release_snapshot_boundary().await)
                             .await
                     }
                     VmRpc::Nmi(rpc) => rpc.handle_sync(|vpindex| {
@@ -3775,7 +3917,7 @@ impl LoadedVm {
                             )
                             .await?;
                             self.inner.vmbus_devices.push(device);
-                            self.state_units.start_stopped_units().await;
+                            self.state_units.start_stopped_units().await?;
                             anyhow::Ok(())
                         })
                         .await
@@ -3804,7 +3946,7 @@ impl LoadedVm {
                             self.save_reset_restore().await?;
 
                             if paused {
-                                self.resume().await;
+                                self.resume().await?;
                             }
                             Ok(())
                         })
@@ -3921,7 +4063,7 @@ impl LoadedVm {
                             // MSI. The guest may begin probing config space
                             // immediately after receiving the interrupt, so
                             // the device must be ready first.
-                            self.state_units.start_stopped_units().await;
+                            self.state_units.start_stopped_units().await?;
 
                             // Now attach the device and notify the guest.
                             if let Err(e) = rc.lock().hotplug_add_device(
@@ -4083,6 +4225,15 @@ impl LoadedVm {
                 Event::Halt(Ok(reason)) => {
                     self.inner.client_notify_send.send(reason);
                 }
+                Event::SnapshotBoundary(event) => {
+                    if !self.handle_snapshot_boundary(event).await {
+                        break;
+                    }
+                }
+                Event::RestoreGateTimeout => {
+                    self.handle_restore_gate_timeout().await;
+                    break;
+                }
             }
         }
 
@@ -4185,11 +4336,13 @@ impl LoadedVm {
     async fn save(&mut self) -> anyhow::Result<SavedState> {
         Ok(SavedState {
             units: self.state_units.save().await?,
+            inventory: self.state_units.inventory(),
         })
     }
 
     /// Restore state on the VM.
     async fn restore(&mut self, state: SavedState) -> anyhow::Result<()> {
+        restore::validate_inventory(&self.state_units, &state)?;
         self.state_units.restore(state.units).await?;
         Ok(())
     }
@@ -4217,6 +4370,8 @@ impl LoadedVm {
         }
 
         let manifest = Manifest {
+            machine_profile: self.inner.machine_profile,
+            microvm: Default::default(), // TODO
             load_mode: self.inner.load_mode,
             floppy_disks: vec![],            // TODO
             ide_disks: vec![],               // TODO
@@ -4284,7 +4439,7 @@ impl LoadedVm {
         }
 
         if resume {
-            self.resume().await;
+            self.resume().await?;
         }
         Ok(())
     }

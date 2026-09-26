@@ -12,7 +12,10 @@
 #![forbid(unsafe_code)]
 
 mod buffers;
+mod egress;
+mod quiesce;
 pub mod resolver;
+mod saved_state;
 
 #[cfg(test)]
 mod tests;
@@ -36,10 +39,13 @@ use net_backend::TxMetadata;
 use net_backend::TxOffloadSupport;
 use net_backend::TxSegment;
 use net_backend::TxSegmentType;
+use net_backend_resources::egress::EgressDenied;
+use net_backend_resources::egress::EgressPolicy;
 use net_backend_resources::mac_address::MacAddress;
 use pal_async::wait::PolledWait;
 use std::future::pending;
 use std::mem::offset_of;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::task::Poll;
 use task_control::AsyncRun;
@@ -53,10 +59,14 @@ use virtio::QueueResources;
 use virtio::VirtioDevice;
 use virtio::VirtioQueue;
 use virtio::VirtioQueueCallbackWork;
+use virtio::device::saved_state::DeviceStateValidator;
 use virtio::in_order::InOrderCompletion;
 use virtio::queue::QueueCompletion;
 use virtio::queue::QueueState;
 use virtio::spec::VirtioDeviceFeatures;
+use vmcore::save_restore::RestoreError;
+use vmcore::save_restore::SaveError;
+use vmcore::save_restore::SavedStateBlob;
 use vmcore::vm_task::VmTaskDriver;
 use vmcore::vm_task::VmTaskDriverSource;
 use zerocopy::FromBytes;
@@ -226,6 +236,8 @@ struct Adapter {
     tx_fast_completions: bool,
     mac_address: MacAddress,
     tx_offload_support: TxOffloadSupport,
+    egress_policy: Option<EgressPolicy>,
+    save_restore: Option<saved_state::SaveRestoreConfig>,
 }
 
 pub struct Device {
@@ -235,6 +247,7 @@ pub struct Device {
     driver_source: VmTaskDriverSource,
     /// Per-pair state tracking.
     pairs: Vec<QueuePairState>,
+    lifecycle: saved_state::Lifecycle,
 }
 
 /// Tracks the state of a queue pair through the start_queue lifecycle.
@@ -248,9 +261,15 @@ enum QueuePairState {
         queue_size: u16,
         /// true if this is the RX queue (even index), false if TX (odd).
         is_rx: bool,
+        feature_banks: [u32; 2],
     },
     /// Both queues started, worker running.
     Active,
+    /// Both queues stopped; each transport call takes its corresponding state.
+    Stopped {
+        rx: Option<QueueState>,
+        tx: Option<QueueState>,
+    },
 }
 
 impl VirtioDevice for Device {
@@ -342,13 +361,15 @@ impl VirtioDevice for Device {
         let pair_idx = (idx / 2) as usize;
         let is_rx = idx.is_multiple_of(2);
 
+        self.prepare_queue_start(pair_idx, is_rx, features)?;
         match &self.pairs[pair_idx] {
-            QueuePairState::Empty => {
+            QueuePairState::Empty | QueuePairState::Stopped { .. } => {
                 // First queue of the pair — buffer it.
                 self.pairs[pair_idx] = QueuePairState::HalfOpen {
                     queue,
                     queue_size,
                     is_rx,
+                    feature_banks: [features.bank(0), features.bank(1)],
                 };
             }
             QueuePairState::HalfOpen {
@@ -373,6 +394,7 @@ impl VirtioDevice for Device {
                     queue: pending_queue,
                     queue_size: pending_queue_size,
                     is_rx: pending_is_rx,
+                    feature_banks: _,
                 } = prev
                 else {
                     unreachable!()
@@ -416,6 +438,9 @@ impl VirtioDevice for Device {
     }
 
     async fn stop_queue(&mut self, idx: u16) -> Option<QueueState> {
+        if let ControlFlow::Break(state) = self.stop_saved_queue(idx).await {
+            return state;
+        }
         let pair_idx = (idx / 2) as usize;
 
         if pair_idx < self.pairs.len() {
@@ -447,10 +472,31 @@ impl VirtioDevice for Device {
 
     async fn reset(&mut self) {
         self.pairs.fill_with(|| QueuePairState::Empty);
+        self.lifecycle.reset();
+    }
+
+    async fn quiesce_input(&mut self) -> anyhow::Result<()> {
+        self.quiesce_endpoint_input().await
+    }
+
+    async fn resume_input(&mut self) -> anyhow::Result<()> {
+        self.resume_endpoint_input().await
     }
 
     fn supports_save_restore(&self) -> bool {
-        true
+        self.adapter.save_restore.is_some()
+    }
+
+    fn save_device(&mut self) -> Result<Option<SavedStateBlob>, SaveError> {
+        self.save_private_state()
+    }
+
+    fn restore_device(&mut self, state: Option<SavedStateBlob>) -> Result<(), RestoreError> {
+        self.restore_private_state(state)
+    }
+
+    fn device_state_validator(&self) -> DeviceStateValidator {
+        self.private_state_validator()
     }
 }
 
@@ -532,6 +578,8 @@ struct PendingTxPacket {
 
 pub struct NicBuilder {
     max_queue_pairs: u16,
+    egress_policy: Option<EgressPolicy>,
+    save_restore: Option<saved_state::SaveRestoreConfig>,
 }
 
 impl NicBuilder {
@@ -562,6 +610,7 @@ impl NicBuilder {
                 endpoint.endpoint_type()
             );
         }
+        let endpoint = self.configure_egress(endpoint)?;
 
         // TODO: Implement VIRTIO_NET_F_MQ and VIRTIO_NET_F_RSS logic based on mulitqueue support.
         // let multiqueue = endpoint.multiqueue_support();
@@ -576,6 +625,8 @@ impl NicBuilder {
             tx_fast_completions: endpoint.tx_fast_completions(),
             mac_address,
             tx_offload_support,
+            egress_policy: self.egress_policy,
+            save_restore: self.save_restore,
         });
 
         let coordinator = TaskControl::new(CoordinatorState {
@@ -603,6 +654,7 @@ impl NicBuilder {
             pairs: (0..max_queue_pairs)
                 .map(|_| QueuePairState::Empty)
                 .collect(),
+            lifecycle: Default::default(),
         })
     }
 }
@@ -611,6 +663,8 @@ impl Device {
     pub fn builder() -> NicBuilder {
         NicBuilder {
             max_queue_pairs: !0,
+            egress_policy: None,
+            save_restore: None,
         }
     }
 }
@@ -632,6 +686,7 @@ impl Device {
                     .collect(),
                 num_queues,
                 restart: true,
+                input_quiesced: self.lifecycle.input_quiesced,
             },
         );
     }
@@ -667,11 +722,11 @@ impl Device {
             active_state,
             negotiated_features,
             negotiated_features_bank1,
+            egress_policy: self.adapter.egress_policy.clone(),
         };
         let coordinator = self.coordinator.state_mut().unwrap();
         let worker_task = &mut coordinator.workers[idx];
         worker_task.insert(&driver, "virtio-net".to_string(), worker);
-        worker_task.start();
     }
 }
 
@@ -679,6 +734,7 @@ struct Coordinator {
     workers: Vec<TaskControl<NetQueue, Worker>>,
     num_queues: u16,
     restart: bool,
+    input_quiesced: bool,
 }
 
 struct CoordinatorState {
@@ -739,6 +795,7 @@ impl Coordinator {
                         "failed to restart queues"
                     );
                 }
+                self.establish_input_gate(stop).await?;
                 self.restart = false;
             }
             self.start_workers();
@@ -851,8 +908,12 @@ enum TxPacketError {
     Empty,
     #[error("too many segments")]
     TooManySegments,
+    #[error("packet length {0} exceeds the 65535-byte backend bound")]
+    TooLarge(u32),
     #[error("descriptor index {0} already in use")]
     DuplicateIndex(u16),
+    #[error("egress policy denied packet")]
+    EgressDenied(#[source] EgressDenied),
 }
 
 impl From<task_control::Cancelled> for WorkerError {
@@ -869,6 +930,8 @@ struct Worker {
     negotiated_features: NetworkFeaturesBank0,
     #[inspect(skip)]
     negotiated_features_bank1: NetworkFeaturesBank1,
+    #[inspect(skip)]
+    egress_policy: Option<EgressPolicy>,
 }
 
 impl Worker {
@@ -1017,15 +1080,18 @@ impl Worker {
             .checked_sub(header_size())
             .and_then(|len| u32::try_from(len).ok())
             .ok_or(TxPacketError::Empty)?;
+        if packet_len > u16::MAX.into() {
+            return Err(TxPacketError::TooLarge(packet_len));
+        }
 
         // Read the virtio-net header + enough of the Ethernet frame to parse
         // the EtherType (and a potential VLAN tag).
-        const ETH_PEEK: usize = 18; // 14 standard + 4 for VLAN tag
-        let mut peek_buf = [0u8; size_of::<VirtioNetHeader>() + ETH_PEEK];
+        const PACKET_PEEK: usize = 98; // Ethernet + VLAN + max IPv4 + TCP header.
+        let mut peek_buf = [0u8; size_of::<VirtioNetHeader>() + PACKET_PEEK];
         let bytes_read = work
             .read(
                 self.active_state.pending_rx_packets.mem(),
-                &mut peek_buf[..header_size() + ETH_PEEK],
+                &mut peek_buf[..header_size() + PACKET_PEEK],
             )
             .map_err(TxPacketError::ReadHeader)?;
 
@@ -1037,6 +1103,7 @@ impl Worker {
         } else {
             &[]
         };
+        self.authorize_egress(packet_prefix, packet_len)?;
 
         let segments = &mut self.active_state.data.tx_segments;
         let seg_start = segments.len();

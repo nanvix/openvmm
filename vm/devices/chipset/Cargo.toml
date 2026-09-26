@@ -11,6 +11,7 @@ chipset_device.workspace = true
 chipset_device_resources.workspace = true
 chipset_resources.workspace = true
 power_resources.workspace = true
+serial_core.workspace = true
 vm_resource.workspace = true
 
 input_core.workspace = true
@@ -18,6 +19,7 @@ vmcore.workspace = true
 x86defs.workspace = true
 
 async-trait.workspace = true
+anyhow.workspace = true
 bitfield-struct.workspace = true
 futures.workspace = true
 inspect_counters.workspace = true
@@ -32,6 +34,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 pal_async.workspace = true
+parking_lot.workspace = true
 test_with_tracing.workspace = true
 
 [lints]

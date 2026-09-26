@@ -1,6 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+mod egress;
+mod harness;
+mod quiesce;
+mod saved_state;
+
 use async_trait::async_trait;
 use guestmem::GuestMemory;
 use inspect::InspectMut;
@@ -232,6 +237,7 @@ struct MockQueueHandle {
     ready_waker: Arc<Mutex<Option<Waker>>>,
     rx_avail_notify: mesh::Receiver<()>,
     tx_avail_notify: mesh::Receiver<()>,
+    ext: harness::QueueHandleExt,
 }
 
 impl MockQueueHandle {
@@ -353,6 +359,7 @@ fn new_mock_queue() -> (MockQueue, MockQueueHandle) {
         ready_waker,
         rx_avail_notify: rx_avail_rx,
         tx_avail_notify: tx_avail_rx,
+        ext: Default::default(),
     };
     (queue, handle)
 }

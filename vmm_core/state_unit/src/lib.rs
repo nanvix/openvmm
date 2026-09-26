@@ -30,6 +30,11 @@
 
 #![forbid(unsafe_code)]
 
+mod advance_time;
+mod inventory;
+pub mod quiesce;
+mod start;
+
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::future::join_all;
@@ -69,10 +74,16 @@ use vmcore::save_restore::SavedStateBlob;
 #[derive(Debug, MeshPayload)]
 pub enum StateRequest {
     /// Start asynchronous operations.
-    Start(Rpc<(), ()>),
+    Start(FailableRpc<(), ()>),
 
     /// Stop asynchronous operations.
     Stop(Rpc<(), ()>),
+
+    /// Stop accepting new host input before a snapshot vCPU boundary.
+    QuiesceInput(FailableRpc<(), ()>),
+
+    /// Resume host input after a failed snapshot transaction.
+    ResumeInput(FailableRpc<(), ()>),
 
     /// Reset a stopped unit to initial state.
     Reset(FailableRpc<(), ()>),
@@ -82,6 +93,9 @@ pub enum StateRequest {
 
     /// Restore state of a stopped unit.
     Restore(FailableRpc<SavedStateBlob, ()>),
+
+    /// Advance guest-visible time while stopped after snapshot restore.
+    AdvanceTime(FailableRpc<std::time::Duration, ()>),
 
     /// Inspect state.
     Inspect(inspect::Deferred),
@@ -95,10 +109,20 @@ pub enum StateRequest {
 #[expect(async_fn_in_trait)] // Don't need Send bounds
 pub trait StateUnit: InspectMut {
     /// Start asynchronous processing.
-    async fn start(&mut self);
+    async fn start(&mut self) -> anyhow::Result<()>;
 
     /// Stop asynchronous processing.
     async fn stop(&mut self);
+
+    /// Stops accepting new host input while preserving runtime state.
+    async fn quiesce_input(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Resumes host input after a failed snapshot transaction.
+    async fn resume_input(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Reset to initial state.
     ///
@@ -114,6 +138,12 @@ pub trait StateUnit: InspectMut {
     ///
     /// Must only be called while stopped.
     async fn restore(&mut self, buffer: SavedStateBlob) -> Result<(), RestoreError>;
+
+    /// Advance guest-visible time after restore. Most units derive their
+    /// deadlines from VM time and need no direct adjustment.
+    async fn advance_time(&mut self, _duration: std::time::Duration) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Runs a simple unit that only needs to respond to state requests.
@@ -163,6 +193,9 @@ impl StateRequest {
 
             StateRequest::Start(_)
             | StateRequest::Stop(_)
+            | StateRequest::QuiesceInput(_)
+            | StateRequest::ResumeInput(_)
+            | StateRequest::AdvanceTime(_)
             | StateRequest::Reset(_)
             | StateRequest::Save(_)
             | StateRequest::Restore(_) => {
@@ -189,12 +222,24 @@ impl StateRequest {
     /// Runs this state request against `unit`.
     pub async fn apply(self, unit: &mut impl StateUnit) {
         match self {
-            StateRequest::Start(rpc) => rpc.handle(async |()| unit.start().await).await,
+            StateRequest::Start(rpc) => rpc.handle_failable(async |()| unit.start().await).await,
             StateRequest::Stop(rpc) => rpc.handle(async |()| unit.stop().await).await,
+            StateRequest::QuiesceInput(rpc) => {
+                rpc.handle_failable(async |()| unit.quiesce_input().await)
+                    .await
+            }
+            StateRequest::ResumeInput(rpc) => {
+                rpc.handle_failable(async |()| unit.resume_input().await)
+                    .await
+            }
             StateRequest::Reset(rpc) => rpc.handle_failable(async |()| unit.reset().await).await,
             StateRequest::Save(rpc) => rpc.handle_failable(async |()| unit.save().await).await,
             StateRequest::Restore(rpc) => {
                 rpc.handle_failable(async |buffer| unit.restore(buffer).await)
+                    .await
+            }
+            StateRequest::AdvanceTime(rpc) => {
+                rpc.handle_failable(async |duration| unit.advance_time(duration).await)
                     .await
             }
             StateRequest::Inspect(req) => req.inspect(unit),
@@ -218,6 +263,8 @@ enum State {
     Resetting,
     Saving,
     Restoring,
+    AdvancingTime,
+    QuiesceUncertain,
 }
 
 #[derive(Debug)]
@@ -462,26 +509,16 @@ impl StateUnits {
     /// via [`StateUnits::add`] while the VM was running.
     ///
     /// Does nothing if all units are stopped, via [`StateUnits::stop`].
-    pub async fn start_stopped_units(&mut self) {
+    pub async fn start_stopped_units(&mut self) -> anyhow::Result<()> {
         if self.is_running() {
-            self.start().await;
+            self.start().await?;
         }
+        Ok(())
     }
 
     /// Starts all the state units.
-    pub async fn start(&mut self) {
-        self.run_op(
-            "start",
-            None,
-            State::Stopped,
-            State::Starting,
-            State::Running,
-            StateRequest::Start,
-            |_, _| Some(()),
-            |unit| &unit.dependencies,
-        )
-        .await;
-        self.running = true;
+    pub async fn start(&mut self) -> anyhow::Result<()> {
+        self.start_with_rollback().await
     }
 
     /// Stops all the state units.
@@ -1007,6 +1044,10 @@ impl Ready {
 
 #[cfg(test)]
 mod tests {
+    mod inventory;
+    mod quiesce;
+    mod start;
+
     use super::StateUnit;
     use super::StateUnits;
     use crate::run_unit;
@@ -1037,7 +1078,9 @@ mod tests {
     struct SavedState(bool);
 
     impl StateUnit for TestUnit {
-        async fn start(&mut self) {}
+        async fn start(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
 
         async fn stop(&mut self) {}
 
@@ -1079,7 +1122,9 @@ mod tests {
     }
 
     impl StateUnit for TestUnitSetDep {
-        async fn start(&mut self) {}
+        async fn start(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
 
         async fn stop(&mut self) {}
 
@@ -1131,13 +1176,13 @@ mod tests {
             .add("b")
             .spawn(&driver, |recv| run_unit(TestUnit::default(), recv))
             .unwrap();
-        units.start().await;
+        units.start().await.unwrap();
 
         let _c = units
             .add("c")
             .spawn(&driver, |recv| run_unit(TestUnit::default(), recv));
         units.stop().await;
-        units.start().await;
+        units.start().await.unwrap();
 
         units.stop().await;
 
@@ -1184,7 +1229,7 @@ mod tests {
                 )
             })
             .unwrap();
-        units.start().await;
+        units.start().await.unwrap();
         units.stop().await;
 
         let state = units.save().await.unwrap();

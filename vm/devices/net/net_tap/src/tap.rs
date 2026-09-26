@@ -6,6 +6,9 @@
 // UNSAFETY: Interacting with a union in bindgen-generated code and calling an ioctl.
 #![expect(unsafe_code)]
 
+mod async_write;
+pub mod persist;
+
 use crate::VirtioNetHdr;
 use futures::AsyncRead;
 use linux_net_bindings::gen_if;
@@ -45,6 +48,8 @@ pub enum Error {
     SetVnetHdrSize(#[source] io::Error),
     #[error("TUNSETOFFLOAD ioctl failed")]
     SetOffload(#[source] io::Error),
+    #[error("TUNSETPERSIST ioctl failed")]
+    SetPersistent(#[source] io::Error),
     #[error("TAP name conversion to C string failed")]
     TapNameConversion(#[source] std::ffi::NulError),
     #[error("TAP interface does not have IFF_VNET_HDR set")]

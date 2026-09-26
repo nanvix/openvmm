@@ -18,6 +18,7 @@ use mesh::rpc::Rpc;
 use mesh::rpc::RpcSend;
 use mesh_worker::WorkerEvent;
 use mesh_worker::WorkerHandle;
+use microvm::GuestSnapshotAction;
 use openvmm_defs::rpc::VmRpc;
 use std::path::Path;
 use std::path::PathBuf;
@@ -25,6 +26,12 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::time::Instant;
 use vmm_core_defs::HaltReason;
+
+mod microvm;
+
+pub(crate) use microvm::MicrovmController;
+pub(crate) use microvm::MicrovmTeardownError;
+pub(crate) use microvm::MicrovmTeardownStatus;
 
 /// Inspection target: host-side workers or the paravisor.
 #[derive(Clone, Copy, mesh::MeshPayload)]
@@ -107,6 +114,8 @@ pub enum VmControllerEvent {
     /// The controller requests that the process exit with this code, because the
     /// guest drove a power event the user opted into exiting on.
     ExitRequested { code: i32 },
+    /// A guest-requested process exit failed and must terminate the runner.
+    ExitFailed { error: String },
 }
 
 /// Owns exclusive VM resources and services RPCs from the REPL.
@@ -126,6 +135,7 @@ pub struct VmController {
     pub(crate) processors: u32,
     pub(crate) log_file: Option<PathBuf>,
     pub(crate) crash_dump_path: Option<PathBuf>,
+    pub(crate) microvm: MicrovmController,
     pub(crate) guest_power_actions: GuestPowerActions,
 }
 
@@ -158,7 +168,9 @@ impl Default for GuestPowerActions {
 /// Decide what to do for a guest halt, given the per-event actions.
 fn action_for(reason: &HaltReason, actions: &GuestPowerActions) -> GuestPowerAction {
     match reason {
-        HaltReason::PowerOff | HaltReason::Hibernate => actions.shutdown,
+        HaltReason::PowerOff | HaltReason::PowerOffWithStatus { .. } | HaltReason::Hibernate => {
+            actions.shutdown
+        }
         HaltReason::Reset => actions.reset,
         HaltReason::TripleFault { .. } => actions.crash,
         HaltReason::Watchdog => actions.watchdog,
@@ -175,13 +187,14 @@ impl VmController {
         mut rpc_recv: mesh::Receiver<VmControllerRpc>,
         event_send: mesh::Sender<VmControllerEvent>,
         mut notify_recv: mesh::Receiver<HaltReason>,
-    ) {
+    ) -> MicrovmTeardownStatus {
         enum Event {
             Rpc(VmControllerRpc),
             RpcClosed,
             Worker(WorkerEvent),
             VncWorker(WorkerEvent),
             Halt(HaltReason),
+            SnapshotRequest(chipset_resources::microvm::MicrovmSnapshotScratchPolicy),
         }
 
         let mut quit = false;
@@ -203,8 +216,12 @@ impl VmController {
                     .flatten()
                     .map(Event::VncWorker);
                 let halt = (&mut notify_recv).map(Event::Halt);
+                let snapshot_request =
+                    futures::stream::iter(self.microvm.snapshot_requests.as_mut())
+                        .flatten()
+                        .map(Event::SnapshotRequest);
 
-                (rpc.into_stream(), vm, vnc, halt)
+                (rpc.into_stream(), vm, vnc, halt, snapshot_request)
                     .merge()
                     .next()
                     .await
@@ -230,7 +247,9 @@ impl VmController {
                         } else {
                             tracing::error!("vm worker unexpectedly stopped");
                         }
-                        event_send.send(VmControllerEvent::WorkerStopped { error: None });
+                        event_send.send(VmControllerEvent::WorkerStopped {
+                            error: (!quit).then(|| "VM worker unexpectedly stopped".to_owned()),
+                        });
                         break;
                     }
                     WorkerEvent::Failed(err) => {
@@ -276,6 +295,13 @@ impl VmController {
                 },
                 Event::Halt(reason) => {
                     tracing::info!(?reason, "guest halted");
+                    if let HaltReason::PowerOffWithStatus { code } = reason {
+                        self.request_exit(i32::from(code), &event_send).await;
+                        return MicrovmTeardownStatus {
+                            vm_worker_stopped: true,
+                            auxiliary_workers_stopped: true,
+                        };
+                    }
                     // On a guest crash, write a `.vmrs` dump (if configured)
                     // before applying the crash action, since a `Reset` action
                     // would wipe the guest state we want to capture.
@@ -302,10 +328,11 @@ impl VmController {
                             // are parked, so don't stop it here; signal the runner to
                             // exit instead.
                             tracing::info!(exit_code = code, "requesting exit on guest halt");
-                            event_send.send(VmControllerEvent::ExitRequested {
-                                code: i32::from(code),
-                            });
-                            return;
+                            self.request_exit(i32::from(code), &event_send).await;
+                            return MicrovmTeardownStatus {
+                                vm_worker_stopped: true,
+                                auxiliary_workers_stopped: true,
+                            };
                         }
                         GuestPowerAction::Reset => {
                             // Reboot the VM in place.
@@ -324,18 +351,30 @@ impl VmController {
                         }
                     }
                 }
+                Event::SnapshotRequest(scratch_policy) => {
+                    let action = self.handle_guest_snapshot_request(scratch_policy).await;
+                    if let GuestSnapshotAction::Terminate { exit_code } = action {
+                        event_send.send(VmControllerEvent::ExitRequested { code: exit_code });
+                        break;
+                    }
+                }
             }
         }
 
         // Ensure all workers are cleaned up before shutting down the mesh.
         self.vm_worker.stop();
-        if let Err(err) = self.vm_worker.join().await {
-            tracing::error!(
-                error = err.as_ref() as &dyn std::error::Error,
-                "vm worker join failed"
-            );
-        }
+        let vm_worker_stopped = match self.vm_worker.join().await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::error!(
+                    error = err.as_ref() as &dyn std::error::Error,
+                    "vm worker join failed"
+                );
+                false
+            }
+        };
 
+        let mut auxiliary_workers_stopped = true;
         if let Some(mut vnc) = self.vnc_worker.take() {
             vnc.stop();
             if let Err(err) = vnc.join().await {
@@ -343,6 +382,7 @@ impl VmController {
                     error = err.as_ref() as &dyn std::error::Error,
                     "vnc worker join failed"
                 );
+                auxiliary_workers_stopped = false;
             }
         }
 
@@ -353,10 +393,15 @@ impl VmController {
                     error = err.as_ref() as &dyn std::error::Error,
                     "gdb worker join failed"
                 );
+                auxiliary_workers_stopped = false;
             }
         }
 
         self.mesh.shutdown().await;
+        MicrovmTeardownStatus {
+            vm_worker_stopped,
+            auxiliary_workers_stopped,
+        }
     }
 
     async fn handle_rpc(&mut self, rpc: VmControllerRpc, quit: &mut bool) {
@@ -418,6 +463,9 @@ impl VmController {
     }
 
     async fn handle_restart(&mut self) -> anyhow::Result<()> {
+        if self.microvm.active {
+            anyhow::bail!("worker restart is unavailable for microVM");
+        }
         let vm_host = self
             .mesh
             .make_host("vm", self.log_file.clone())
@@ -460,6 +508,9 @@ impl VmController {
     }
 
     async fn handle_save_snapshot(&self, dir: &Path) -> anyhow::Result<()> {
+        if self.microvm.active {
+            anyhow::bail!("disk snapshots are unavailable for microVM");
+        }
         let memory_file_path = self
             .memory_backing_file
             .as_ref()
@@ -496,6 +547,7 @@ impl VmController {
             vp_count: self.processors,
             page_size: crate::system_page_size(),
             architecture: crate::GUEST_ARCH.to_string(),
+            ..Default::default()
         };
 
         // Write snapshot directory.

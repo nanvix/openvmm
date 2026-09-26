@@ -18,6 +18,8 @@
 //       anything else on this file though.
 #![warn(missing_docs)]
 
+pub mod microvm;
+
 use anyhow::Context;
 use clap::Parser;
 use clap::ValueEnum;
@@ -149,6 +151,10 @@ pub struct NumaDistanceCli {
     long_version = openvmm_build_info::get().long_version(),
 )]
 pub struct Options {
+    /// guest machine profile
+    #[clap(long, value_enum, default_value = "standard")]
+    pub machine: microvm::MachineProfileCli,
+
     /// processor count
     #[clap(short = 'p', long, value_name = "COUNT", default_value = "1")]
     pub processors: u32,
@@ -158,7 +164,7 @@ pub struct Options {
         short = 'm',
         long,
         value_name = "PARAMS",
-        default_value = "1GB",
+        default_value = "",
         value_parser = parse_memory_config,
         conflicts_with = "numa",
         long_help = r#"Configure guest RAM.
@@ -252,9 +258,14 @@ Examples:
     #[clap(
         long,
         value_name = "DIR",
-        conflicts_with_all = ["deprecated_memory_backing_file", "numa"]
+        conflicts_with_all = ["deprecated_memory_backing_file", "numa", "kernel", "initrd"]
     )]
     pub restore_snapshot: Option<PathBuf>,
+
+    /// Write OPENVMM_RESTORE_READY_V1 to this Unix socket or Windows named pipe
+    /// after restore startup completes and before guest execution begins.
+    #[clap(long, value_name = "PATH", requires = "restore_snapshot")]
+    pub restore_ready_path: Option<PathBuf>,
 
     /// use private anonymous memory for guest RAM
     #[clap(long = "private-memory", hide = true, conflicts_with_all = ["deprecated_memory_backing_file", "restore_snapshot", "numa"])]
@@ -819,7 +830,7 @@ options:
 
     /// virtio console device backed by a serial backend (/dev/hvc0 in guest)
     ///
-    /// Accepts serial config (console | stderr | listen=\<path\> |
+    /// Accepts serial config (console | stderr | listen=\<path\> | connect=\<path\> |
     /// file=\<path\> (overwrites) | listen=tcp:\<ip\>:\<port\> |
     /// term[=\<program\>]\[,name=\<windowtitle\>\] | none)
     #[clap(long)]
@@ -1391,6 +1402,10 @@ Syntax: id=<name>
     #[cfg(target_os = "linux")]
     #[clap(long, conflicts_with("pcat"))]
     pub iommu: Vec<IommuCli>,
+
+    /// microVM machine profile options.
+    #[clap(flatten)]
+    pub microvm: microvm::MicrovmCli,
 }
 
 impl Options {
@@ -1913,7 +1928,9 @@ fn parse_smbios(s: &str) -> anyhow::Result<SmbiosCli> {
 
 fn parse_memory_config(s: &str) -> anyhow::Result<MemoryCli> {
     // Bare shortcut: `--memory 64G` sets only the size.
-    let memory = if !s.contains('=') && !s.contains(',') {
+    let memory = if s.is_empty() {
+        MemoryCli::default()
+    } else if !s.contains('=') && !s.contains(',') {
         MemoryCli {
             size: Some(s.parse::<vmm_cli::MemorySize>()?),
             ..Default::default()
@@ -2136,6 +2153,13 @@ impl FromStr for DiskCliKind {
                     Self::parse_autocache(arg, std::env::var("OPENVMM_AUTO_CACHE_PATH"))?
                 }
                 "prwrap" => DiskCliKind::PersistentReservationsWrapper(Box::new(arg.parse()?)),
+                "delay" => {
+                    let (delay_ms, kind) = arg.split_once(':').context("expected delay_ms:kind")?;
+                    DiskCliKind::DelayDiskWrapper {
+                        delay_ms: delay_ms.parse().context("invalid disk delay")?,
+                        disk: Box::new(kind.parse()?),
+                    }
+                }
                 "file" => {
                     let FileOpts {
                         path,
@@ -2694,7 +2718,7 @@ impl FromStr for ComSerialConfigCli {
     }
 }
 
-/// (console | stderr | listen=\<path\> | file=\<path\> (overwrites) | listen=tcp:\<ip\>:\<port\> | term[=\<program\>]\[,name=\<windowtitle\>\] | none)
+/// (console | stderr | listen=\<path\> | connect=\<path\> | file=\<path\> (overwrites) | listen=tcp:\<ip\>:\<port\> | connect=tcp:\<ip\>:\<port\> | term[=\<program\>]\[,name=\<windowtitle\>\] | none)
 #[derive(Clone, Debug, PartialEq)]
 pub enum SerialConfigCli {
     None,
@@ -2703,6 +2727,8 @@ pub enum SerialConfigCli {
     Stderr,
     Pipe(PathBuf),
     Tcp(SocketAddr),
+    ConnectPipe(PathBuf),
+    ConnectTcp(SocketAddr),
     File(PathBuf),
 }
 
@@ -2749,6 +2775,21 @@ impl FromStr for SerialConfigCli {
                 }
                 None => Err(
                     "invalid serial configuration: listen requires a value of tcp:addr or pipe",
+                )?,
+            },
+            "connect" => match first_value {
+                Some(path) => {
+                    if let Some(tcp) = path.strip_prefix("tcp:") {
+                        let addr = tcp
+                            .parse()
+                            .map_err(|err| format!("invalid tcp address: {err}"))?;
+                        SerialConfigCli::ConnectTcp(addr)
+                    } else {
+                        SerialConfigCli::ConnectPipe(path.into())
+                    }
+                }
+                None => Err(
+                    "invalid serial configuration: connect requires a value of tcp:addr or pipe",
                 )?,
             },
             _ => {
@@ -2801,6 +2842,7 @@ pub enum EndpointConfigCli {
     Tap {
         name: String,
     },
+    Microvm(openvmm_defs::microvm::MicrovmNetworkConfig),
 }
 
 /// Parsed host port forwarding configuration from the CLI.
@@ -2921,6 +2963,7 @@ impl FromStr for EndpointConfigCli {
             ["tap", name] => EndpointConfigCli::Tap {
                 name: (*name).to_owned(),
             },
+            [network] if network.contains('/') => microvm::parse_endpoint(network)?,
             _ => return Err("invalid network backend".into()),
         };
 
@@ -4167,11 +4210,26 @@ mod tests {
             _ => panic!("Expected Pipe variant"),
         }
 
+        match SerialConfigCli::from_str("connect=tcp:127.0.0.1:1234").unwrap() {
+            SerialConfigCli::ConnectTcp(addr) => {
+                assert_eq!(addr.to_string(), "127.0.0.1:1234");
+            }
+            _ => panic!("Expected ConnectTcp variant"),
+        }
+
+        match SerialConfigCli::from_str("connect=/path/to/pipe").unwrap() {
+            SerialConfigCli::ConnectPipe(path) => {
+                assert_eq!(path.to_str().unwrap(), "/path/to/pipe");
+            }
+            _ => panic!("Expected ConnectPipe variant"),
+        }
+
         // Test error cases
         assert!(SerialConfigCli::from_str("").is_err());
         assert!(SerialConfigCli::from_str("unknown").is_err());
         assert!(SerialConfigCli::from_str("file").is_err());
         assert!(SerialConfigCli::from_str("listen").is_err());
+        assert!(SerialConfigCli::from_str("connect").is_err());
     }
 
     #[test]

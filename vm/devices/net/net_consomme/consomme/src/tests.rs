@@ -1,6 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+mod fragments;
+mod limits;
+mod static_ipv4;
+
 use super::*;
 use pal_async::DefaultDriver;
 use smoltcp::phy::ChecksumCapabilities;

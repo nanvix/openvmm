@@ -68,6 +68,10 @@ use tracing_helpers::AnyhowValueExt;
 use vm_resource::IntoResource;
 use vm_resource::Resource;
 
+mod headless;
+pub(crate) mod launch;
+mod restore_ready;
+
 fn maybe_with_radix_u64(s: &str) -> Result<u64, String> {
     let (radix, prefix_len) = if s.starts_with("0x") || s.starts_with("0X") {
         (16, 2)
@@ -438,6 +442,7 @@ pub(crate) struct ReplResources {
     pub kvp_ic: Option<mesh::Sender<hyperv_ic_resources::kvp::KvpConnectRpc>>,
     pub console_in: Option<Box<dyn AsyncWrite + Send + Unpin>>,
     pub has_vtl2: bool,
+    pub launch: launch::ReplLaunch,
 }
 
 /// Run the interactive REPL.
@@ -456,7 +461,12 @@ pub(crate) async fn run_repl(
         kvp_ic,
         console_in,
         has_vtl2,
+        mut launch,
     } = resources;
+
+    if !launch.stdin_enabled {
+        return headless::run(&mut vm_controller_events).await;
+    }
 
     let (console_command_send, console_command_recv) = mesh::channel();
     let (inspect_completion_engine_send, inspect_completion_engine_recv) = mesh::channel();
@@ -526,7 +536,8 @@ pub(crate) async fn run_repl(
             let mut stdin = io::stdin();
             loop {
                 // Raw console text until Ctrl-Q.
-                crossterm::terminal::enable_raw_mode().expect("failed to enable raw console mode");
+                let terminal =
+                    headless::enable_raw_mode(&stdin).expect("failed to enable raw console mode");
 
                 if let Some(input) = console_in.as_mut() {
                     let mut buf = [0; 32];
@@ -546,8 +557,7 @@ pub(crate) async fn run_repl(
                     }
                 }
 
-                crossterm::terminal::disable_raw_mode()
-                    .expect("failed to disable raw console mode");
+                headless::disable_raw_mode(terminal).expect("failed to disable raw console mode");
 
                 loop {
                     let line = rl.readline("openvmm> ");
@@ -604,7 +614,7 @@ pub(crate) async fn run_repl(
 
     enum StateChange {
         Pause(bool),
-        Resume(bool),
+        Resume(Result<bool, RemoteError>),
         Reset(Result<(), RemoteError>),
         PulseSaveRestore(Result<(), PulseSaveRestoreError>),
         ServiceVtl2(anyhow::Result<Duration>),
@@ -706,12 +716,16 @@ pub(crate) async fn run_repl(
                                 tracing::warn!("already paused");
                             }
                         }
-                        StateChange::Resume(success) => {
+                        StateChange::Resume(Ok(success)) => {
                             if success {
+                                launch.restore_ready_pending = false;
                                 tracing::info!("resumed complete");
                             } else {
                                 tracing::warn!("already running");
                             }
+                        }
+                        StateChange::Resume(Err(err)) => {
+                            restore_ready::resume_failed(err, launch.restore_ready_pending)?
                         }
                         StateChange::Reset(r) => match r {
                             Ok(()) => tracing::info!("reset complete"),
@@ -792,6 +806,7 @@ pub(crate) async fn run_repl(
                         tracing::info!(reason = reason.as_str(), "guest halted");
                     }
                     VmControllerEvent::ExitRequested { code } => break code,
+                    VmControllerEvent::ExitFailed { error } => return Err(anyhow::anyhow!(error)),
                 }
                 continue;
             }

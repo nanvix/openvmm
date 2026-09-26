@@ -3,13 +3,19 @@
 
 //! Snapshot manifest types and I/O functions for saving/restoring VM snapshots.
 
-use anyhow::Context;
 use mesh::payload::Protobuf;
 use mesh::payload::Timestamp;
-use std::path::Path;
+
+pub mod format;
+pub mod fs;
+pub mod microvm;
+pub mod publish;
+pub mod restore;
+
+pub use publish::write_snapshot;
 
 /// Current manifest format version. Bump when making incompatible changes.
-pub const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 5;
 
 /// Manifest describing a VM snapshot.
 #[derive(Clone, Protobuf)]
@@ -36,86 +42,36 @@ pub struct SnapshotManifest {
     /// Architecture string ("x86_64" or "aarch64").
     #[mesh(7)]
     pub architecture: String,
-}
-
-/// Write a snapshot to the given directory.
-///
-/// The directory is created if it does not exist. The snapshot consists of:
-/// - `manifest.bin` — protobuf-encoded [`SnapshotManifest`]
-/// - `state.bin` — raw device saved-state bytes
-/// - `memory.bin` — hard link to the memory backing file
-pub fn write_snapshot(
-    dir: &Path,
-    manifest: &SnapshotManifest,
-    saved_state_bytes: &[u8],
-    memory_file_path: &Path,
-) -> anyhow::Result<()> {
-    fs_err::create_dir_all(dir)?;
-
-    // Write manifest.
-    let manifest_bytes = mesh::payload::encode(manifest.clone());
-    fs_err::write(dir.join("manifest.bin"), &manifest_bytes)?;
-
-    // Write device state.
-    fs_err::write(dir.join("state.bin"), saved_state_bytes)?;
-
-    // Handle memory.bin: hard-link from the backing file.
-    let memory_bin_path = dir.join("memory.bin");
-    let canonical_source = fs_err::canonicalize(memory_file_path)?;
-
-    // Check whether source and target are already the same file (e.g.,
-    // the user pointed --memory-backing-file at <dir>/memory.bin directly).
-    let needs_link = if memory_bin_path.exists() {
-        let canonical_target = fs_err::canonicalize(&memory_bin_path)?;
-        if canonical_source == canonical_target {
-            false
-        } else {
-            // Different file at the target path — remove it so the hard
-            // link can be created.
-            fs_err::remove_file(&memory_bin_path)?;
-            true
-        }
-    } else {
-        true
-    };
-
-    if needs_link {
-        if let Err(err) = std::fs::hard_link(&canonical_source, &memory_bin_path) {
-            if err.kind() == std::io::ErrorKind::CrossesDevices {
-                anyhow::bail!(
-                    "memory backing file ({}) must be on the same filesystem as the snapshot \
-                     directory ({}); consider placing the backing file inside the snapshot \
-                     directory",
-                    memory_file_path.display(),
-                    dir.display(),
-                );
-            }
-            return Err(err).with_context(|| {
-                format!(
-                    "failed to hard-link {} -> {}",
-                    canonical_source.display(),
-                    memory_bin_path.display()
-                )
-            });
-        }
-    }
-
-    Ok(())
-}
-
-/// Read a snapshot from the given directory.
-///
-/// Returns the decoded manifest and the raw saved-state bytes.
-/// The caller is responsible for opening `memory.bin` separately.
-pub fn read_snapshot(dir: &Path) -> anyhow::Result<(SnapshotManifest, Vec<u8>)> {
-    let manifest_bytes =
-        fs_err::read(dir.join("manifest.bin")).context("failed to read manifest.bin")?;
-    let manifest: SnapshotManifest =
-        mesh::payload::decode(&manifest_bytes).context("failed to decode snapshot manifest")?;
-
-    let state_bytes = fs_err::read(dir.join("state.bin")).context("failed to read state.bin")?;
-
-    Ok((manifest, state_bytes))
+    /// Length of `state.bin` in bytes.
+    #[mesh(8)]
+    pub state_size_bytes: u64,
+    /// Legacy v2 SHA-256 digest of `state.bin`; empty in v3 through v5.
+    #[mesh(9)]
+    pub state_sha256: Vec<u8>,
+    /// Legacy v2 SHA-256 digest of `memory.bin`; empty in v3 through v5.
+    #[mesh(10)]
+    pub memory_sha256: Vec<u8>,
+    /// Authoritative machine composition for versioned machine profiles.
+    #[mesh(11)]
+    pub machine_contract: Option<microvm::SnapshotMachineContract>,
+    /// Snapshot format magic.
+    #[mesh(12)]
+    pub format_magic: Vec<u8>,
+    /// Version of the serialized VM saved-state schema.
+    #[mesh(13)]
+    pub saved_state_schema_version: u32,
+    /// Fully qualified protobuf root type stored in `state.bin`.
+    #[mesh(14)]
+    pub saved_state_root_type: String,
+    /// Sandbox capture tier. Empty for blockless microVM snapshots.
+    #[mesh(15)]
+    pub snapshot_tier: String,
+    /// `clone` for reusable artifacts or `resume` for single-use artifacts.
+    #[mesh(16)]
+    pub restore_policy: String,
+    /// Bitmask of configuration sections consumed before capture.
+    #[mesh(17)]
+    pub consumed_config_sections: u32,
 }
 
 /// Validate that a snapshot manifest is compatible with the running VM config.
@@ -130,13 +86,8 @@ pub fn validate_manifest(
     expected_vp_count: u32,
     expected_page_size: u32,
 ) -> anyhow::Result<()> {
-    if manifest.version != MANIFEST_VERSION {
-        anyhow::bail!(
-            "snapshot manifest version {} is not supported (expected {})",
-            manifest.version,
-            MANIFEST_VERSION,
-        );
-    }
+    format::validate_manifest_header(manifest)?;
+    format::validate_manifest_version(manifest)?;
 
     if manifest.architecture != expected_arch {
         anyhow::bail!(
@@ -175,10 +126,11 @@ pub fn validate_manifest(
 
 #[cfg(test)]
 mod tests {
+    use super::restore::read_snapshot;
     use super::*;
 
     /// Helper: build a test manifest with sensible defaults.
-    fn test_manifest() -> SnapshotManifest {
+    pub(super) fn test_manifest() -> SnapshotManifest {
         SnapshotManifest {
             version: MANIFEST_VERSION,
             created_at: Timestamp {
@@ -190,6 +142,7 @@ mod tests {
             vp_count: 2,
             page_size: 4096,
             architecture: "x86_64".to_string(),
+            ..Default::default()
         }
     }
 
@@ -200,18 +153,21 @@ mod tests {
 
         // Create a fake memory backing file in the same directory (same fs).
         let mem_path = dir.path().join("memory.bin");
-        std::fs::write(&mem_path, b"FAKEMEM").unwrap();
+        std::fs::write(&mem_path, vec![0_u8; 1024]).unwrap();
 
         let manifest = test_manifest();
         let state = b"saved-state-data";
 
         write_snapshot(&snap_dir, &manifest, state, &mem_path).unwrap();
 
-        let (read_manifest, read_state) = read_snapshot(&snap_dir).unwrap();
+        let (read_manifest, read_state) = read_snapshot(&snap_dir, 1024).unwrap();
         assert_eq!(read_manifest.version, manifest.version);
         assert_eq!(read_manifest.memory_size_bytes, manifest.memory_size_bytes);
         assert_eq!(read_manifest.vp_count, manifest.vp_count);
         assert_eq!(read_manifest.architecture, manifest.architecture);
+        assert_eq!(read_manifest.state_size_bytes, state.len() as u64);
+        assert!(read_manifest.state_sha256.is_empty());
+        assert!(read_manifest.memory_sha256.is_empty());
         assert_eq!(read_state, state);
 
         // memory.bin should exist in the snapshot directory.
@@ -219,43 +175,10 @@ mod tests {
     }
 
     #[test]
-    fn write_snapshot_creates_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let snap_dir = dir.path().join("a").join("b").join("c");
-
-        let mem_path = dir.path().join("memory.bin");
-        std::fs::write(&mem_path, b"MEM").unwrap();
-
-        write_snapshot(&snap_dir, &test_manifest(), b"state", &mem_path).unwrap();
-
-        assert!(snap_dir.join("manifest.bin").exists());
-        assert!(snap_dir.join("state.bin").exists());
-        assert!(snap_dir.join("memory.bin").exists());
-    }
-
-    #[test]
-    fn write_snapshot_same_memory_path() {
-        // When the memory backing file IS <snap_dir>/memory.bin, the function
-        // should detect the collision and skip the hard-link.
-        let dir = tempfile::tempdir().unwrap();
-        let snap_dir = dir.path().join("snap");
-        std::fs::create_dir_all(&snap_dir).unwrap();
-
-        let mem_path = snap_dir.join("memory.bin");
-        std::fs::write(&mem_path, b"SAMEFILE").unwrap();
-
-        // Should succeed without error.
-        write_snapshot(&snap_dir, &test_manifest(), b"state", &mem_path).unwrap();
-
-        // The file content should be unchanged.
-        assert_eq!(std::fs::read(&mem_path).unwrap(), b"SAMEFILE");
-    }
-
-    #[test]
     fn read_snapshot_missing_file() {
         let dir = tempfile::tempdir().unwrap();
         // No files written — read should fail.
-        let result = read_snapshot(dir.path());
+        let result = read_snapshot(dir.path(), 1024);
         assert!(result.is_err());
     }
 

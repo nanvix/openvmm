@@ -37,6 +37,7 @@
 
 pub mod loopback;
 pub mod null;
+pub mod quiesce;
 pub mod resolve;
 pub mod tests;
 
@@ -53,6 +54,7 @@ use inspect::InspectMut;
 use inspect_counters::Counter;
 use mesh::rpc::Rpc;
 use mesh::rpc::RpcSend;
+use net_backend_resources::egress::EgressPolicy;
 use null::NullEndpoint;
 use pal_async::driver::Driver;
 use std::future::pending;
@@ -91,6 +93,19 @@ pub trait Endpoint: Send + Sync + InspectMut {
         rss: Option<&RssConfig<'_>>,
         queues: &mut Vec<Box<dyn Queue>>,
     ) -> anyhow::Result<()>;
+
+    /// Configures a run-scoped egress policy before queues are created.
+    ///
+    /// Backends that accept an active policy must apply it to the immutable
+    /// packet bytes immediately before externally visible transmission.
+    fn set_egress_policy(&mut self, policy: EgressPolicy) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !policy.is_active(),
+            "network backend '{}' does not support active egress policy",
+            self.endpoint_type()
+        );
+        Ok(())
+    }
 
     /// Stops the endpoint.
     ///
@@ -245,6 +260,23 @@ pub trait Queue: Send + InspectMut {
     fn tx_poll(&mut self, pool: &mut dyn BufferAccess, done: &mut [TxId])
     -> Result<usize, TxError>;
 
+    /// Finishes work already accepted by this queue without accepting new work.
+    ///
+    /// On success, all resulting RX and TX completions must be available through
+    /// [`Queue::rx_poll`] and [`Queue::tx_poll`]. Implementations must not retain
+    /// any buffer IDs or guest-memory segments after returning.
+    async fn quiesce(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+    ) -> anyhow::Result<quiesce::QueueQuiesceResult> {
+        anyhow::bail!("network queue does not support quiesce")
+    }
+
+    /// Resumes host RX admission after a rolled-back quiesce transaction.
+    fn resume(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Get queue statistics
     fn queue_stats(&self) -> Option<&dyn BackendQueueStats> {
         None // Default implementation - not all queues implement stats
@@ -261,7 +293,7 @@ pub trait Queue: Send + InspectMut {
 /// to [`Queue`] methods. This means no `Arc`/`Mutex` is needed
 /// between the frontend and backend for buffer access—the borrow
 /// checker enforces exclusive access statically.
-pub trait BufferAccess {
+pub trait BufferAccess: Send {
     /// The associated guest memory accessor.
     fn guest_memory(&self) -> &GuestMemory;
 

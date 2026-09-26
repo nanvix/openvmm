@@ -38,6 +38,48 @@ flowchart TB
     NIC --> Internet((Internet))
 ```
 
+## microVM portable profile
+
+OpenVMM microVMs select this backend with
+`--net <IPv4/PREFIX> --network-profile portable`. This is the sole microVM
+network profile and has the same Consomme behavior on Linux/KVM, Linux/MSHV,
+and Windows/WHP. It provides gateway DNS over UDP and TCP, ICMP echo, and
+outbound TCP/UDP subject to the microVM egress policy. IPv4 fragments are
+rejected deterministically. `--net-tap` is incompatible.
+
+The portable profile accepts directional network defaults through
+`--network-egress <allow|deny>` and `--network-ingress <allow|deny>`. It
+supports both egress actions and ingress `deny`. Stateful replies to an
+allowed guest-initiated flow are not treated as new inbound connections.
+Ingress `allow` is rejected before VM resources are opened because portable
+NAT does not expose arbitrary guest listeners.
+
+The generic egress rule form accepts destination IPv4 addresses or CIDRs with
+an optional TCP or UDP destination port. Deny rules take precedence over allow
+rules, and the explicit directional default handles traffic that matches
+neither list. Filtering and malformed-packet rejection occur before Consomme
+creates a host socket. Port-specific policies reject IPv4 fragments rather
+than allowing later fragments to bypass transport checks.
+
+The portable profile does not provide generic bidirectional host-loopback
+connectivity. Explicit `--host-loopback allow` without any
+`--host-loopback-forward` is rejected before VM resources are opened.
+With deliberate TCP/UDP forwards, `allow` maps the guest-visible gateway to
+host loopback, permits host-local destinations subject to egress policy, and
+publishes only the specified localhost-to-guest ports. This is port publishing,
+not a generic bidirectional allow contract.
+
+Omitting `--host-loopback` preserves the existing guest-to-host mapping but
+does not publish guest ports. `deny` rejects general gateway socket traffic
+and all host-to-guest forwards. One exact gateway TCP port may remain mapped
+as a proxy exception; UDP on that same port and other host service ports stay
+blocked even when ordinary egress is allowed.
+
+Snapshot restore creates a fresh endpoint generation. Host sockets and NAT
+flow tables are not saved. Virtio-net capture drains descriptor ownership
+before state is saved, and restored guest software must establish new
+host-side flows.
+
 ## Default network topology
 
 | Role | IPv4 Address |
@@ -161,6 +203,10 @@ host-side UDP socket bound to an ephemeral port. Datagrams are
 forwarded in both directions. Idle bindings are cleaned up after a
 configurable timeout (5 minutes by default, per RFC 4787).
 
+Consomme admits at most 256 active guest UDP flows, 128 active guest TCP flows,
+and 16 guest ICMP source flows by default. It rejects an excess flow before
+creating its host socket; it never evicts an active flow to make room.
+
 UDP packets to the gateway on well-known ports are intercepted:
 
 - **Port 67** — handled by the built-in DHCP server
@@ -193,8 +239,11 @@ are not relayed — see limitations).
 
 ### ARP and NDP
 
-- **ARP** — Responds to requests for the gateway MAC address. All other
-  ARP traffic is dropped.
+- **ARP** — Responds to requests for the gateway and for on-link next hops
+  admitted by exact endpoint policy, using the gateway MAC as the proxy
+  address. The shared egress policy accepts only guest-identity requests for
+  its canonical next-hop set, so resolving an endpoint does not authorize
+  unrelated IPv4 traffic.
 - **NDP** — Responds to Router Solicitations (advertising the IPv6
   prefix and DNS servers) and Neighbor Solicitations for the gateway's
   link-local address. DAD is silently ignored.

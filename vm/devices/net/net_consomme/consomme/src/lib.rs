@@ -22,8 +22,10 @@ mod dhcpv6;
 mod dns;
 mod dns_resolver;
 mod icmp;
+pub mod limits;
 mod local_addr_map;
 mod ndp;
+pub mod static_ipv4;
 mod tcp;
 mod udp;
 
@@ -190,6 +192,11 @@ pub struct ConsommeParams {
     /// If true, allow guest traffic destined for host-local addresses
     /// (loopback, unspecified, link-local).
     pub allow_host_local_access: bool,
+    /// If true, translate guest traffic to the IPv4 gateway onto host loopback.
+    pub map_gateway_to_host_loopback: bool,
+    /// Exact gateway TCP port translated to host loopback independently of the
+    /// general gateway mapping.
+    pub gateway_loopback_proxy_port: Option<u16>,
     /// Per-connection TCP receive ring buffer bounds (guest-to-host).
     pub tcp_rx_buffer: TcpBufferBounds,
     /// Per-connection TCP transmit ring buffer bounds (host-to-guest).
@@ -257,6 +264,8 @@ impl ConsommeParams {
             tcp_close_timeout: Duration::from_secs(60),
             skip_ipv6_checks: false,
             allow_host_local_access: false,
+            map_gateway_to_host_loopback: false,
+            gateway_loopback_proxy_port: None,
             tcp_rx_buffer: DEFAULT_TCP_BUFFER_BOUNDS,
             tcp_tx_buffer: DEFAULT_TCP_BUFFER_BOUNDS,
         })
@@ -669,6 +678,15 @@ pub enum DropReason {
     /// The send buffer is invalid.
     #[error("send buffer full")]
     SendBufferFull,
+    /// The active TCP flow limit was reached before a host socket was created.
+    #[error("active TCP flow limit reached")]
+    TcpConnectionLimit,
+    /// The active UDP flow limit was reached before a host socket was bound.
+    #[error("active UDP flow limit reached")]
+    UdpConnectionLimit,
+    /// The active ICMP flow limit was reached before a host socket was opened.
+    #[error("active ICMP flow limit reached")]
+    IcmpConnectionLimit,
     /// There was an IO error.
     #[error("io error")]
     Io(#[source] std::io::Error),

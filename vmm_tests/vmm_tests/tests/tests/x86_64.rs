@@ -3,6 +3,7 @@
 
 //! Integration tests for x86_64 guests.
 
+mod microvm;
 mod openhcl_linux_direct;
 mod openhcl_uefi;
 mod storage;
@@ -251,6 +252,10 @@ async fn vpci_filter(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Res
                                 max_queues: None,
                                 mac_address: MacAddress::new([0x00, 0x15, 0x5D, 0x12, 0x12, 0x12]),
                                 endpoint: NullHandle.into_resource(),
+                                egress_policy: None,
+                                save_restore: false,
+                                static_ipv4: None,
+                                effective_features: None,
                             }
                             .into_resource(),
                         )
@@ -334,10 +339,7 @@ async fn vpci_relay_tdisp_device(
 }
 
 /// Boot with a virtio-blk disk via virtio-mmio and verify the device appears in the guest.
-#[openvmm_test(unstable(
-    reason = "virtio-blk over virtio-mmio boot test fails frequently in CI; root cause unknown",
-    linux_direct_x64
-))]
+#[openvmm_test(linux_direct_x64)]
 async fn virtio_blk_device(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
     use disk_backend_resources::LayeredDiskHandle;
     use disk_backend_resources::layer::RamDiskLayerHandle;
@@ -444,7 +446,12 @@ async fn virtio_blk_device(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyho
         "post-restore write/read mismatch: {readback}"
     );
 
-    agent.power_off().await?;
+    drop(sh);
+    drop(agent);
+    // Avoid the pipette shutdown delay after the pulse, since that delay
+    // depends on the guest timer state the test just restored.
+    vm.send_enlightened_shutdown(petri::ShutdownKind::Shutdown)
+        .await?;
     vm.wait_for_clean_teardown().await?;
     Ok(())
 }
@@ -607,6 +614,7 @@ async fn snapshot_save_to_disk(
         vp_count: 2,
         page_size: 4096,
         architecture: "x86_64".to_string(),
+        ..Default::default()
     };
     openvmm_helpers::snapshot::write_snapshot(&snap_dir, &manifest, &saved_state_bytes, &mem_path)?;
 
@@ -614,7 +622,8 @@ async fn snapshot_save_to_disk(
     assert!(snap_dir.join("manifest.bin").exists());
     assert!(snap_dir.join("state.bin").exists());
     assert!(snap_dir.join("memory.bin").exists());
-    let (read_manifest, read_state) = openvmm_helpers::snapshot::read_snapshot(&snap_dir)?;
+    let (read_manifest, read_state) =
+        openvmm_helpers::snapshot::restore::read_snapshot(&snap_dir, mem_size)?;
     assert_eq!(
         read_state, saved_state_bytes,
         "state roundtrip through disk should match"

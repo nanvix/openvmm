@@ -2724,6 +2724,7 @@ async fn new_underhill_vm(
                     with_psp: dps.general.psp_enabled,
                     pm_base: DEFAULT_PM_PIO_BASE,
                     acpi_irq: DEFAULT_ACPI_IRQ,
+                    level_triggered_irqs: &[],
                     iommu: None,
                 },
             };
@@ -3034,6 +3035,7 @@ async fn new_underhill_vm(
             time_source: PlatformResource.into_resource(),
             century_reg_idx: 0x32,
             initial_cmos: None,
+            mode: dev::GenericCmosRtcMode::Standard,
         });
 
     if dps.general.tpm_enabled {
@@ -3901,6 +3903,7 @@ async fn new_underhill_vm(
         WrappedPartition(partition.clone()),
         PartitionUnitParams {
             processor_topology: &processor_topology,
+            active_vp_count: None,
             halt_vps,
             halt_request_recv,
             client_notify_send: halt_notify_send,
@@ -4153,7 +4156,7 @@ async fn halt_task(
 
     while let Ok(reason) = halt_notify_recv.recv().await {
         let halt_request = match reason {
-            HaltReason::PowerOff => HaltRequest::PowerOff,
+            HaltReason::PowerOff | HaltReason::PowerOffWithStatus { .. } => HaltRequest::PowerOff,
             // The paravisor's own watchdog raises Reset, so Watchdog never reaches
             // this arm today; it is folded into Reset to stay exhaustive. Honoring a
             // configurable paravisor watchdog action would mean raising Watchdog here.
