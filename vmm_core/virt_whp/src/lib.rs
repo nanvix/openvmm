@@ -1236,7 +1236,10 @@ impl WhpPartitionInner {
             )
             .map_err(Error::TopologyCpuid)?;
 
-            let cpuid = tsc::add_frequency_leaves(cpuid, tsc_frequency, &vtl0)?;
+            let mut cpuid = tsc::add_frequency_leaves(cpuid, tsc_frequency, &vtl0)?;
+            if proto_config.versioned_cpu_contract {
+                cpuid.push(cpu_contract::hide_tsc_deadline_timer());
+            }
             virt::CpuidLeafSet::new(cpuid)
         };
 

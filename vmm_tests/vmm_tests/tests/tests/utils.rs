@@ -148,3 +148,41 @@ pub(crate) async fn get_device_paths(
 
     Ok(device_paths)
 }
+
+/// Returns shell functions that a microVM Linux guest runs before it requests
+/// a snapshot by writing port `0x605` directly.
+///
+/// Restore coalesces the periods that a periodic LAPIC timer missed during the
+/// snapshot downtime into one interrupt, so OpenVMM rejects a capture while a
+/// vCPU has one armed. `wait_for_capture_clock` waits up to 10 seconds until
+/// the clocksource is `tsc` or `kvm-clock` and every online CPU runs a one-shot
+/// tick, which is the capture contract of NVX's `nvx-snapshot`. It uses neither
+/// `awk` nor fractional `sleep`, which a minimal busybox may lack.
+pub(crate) fn microvm_capture_clock_script() -> &'static str {
+    r#"capture_clock_ready() {
+    case "$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource)" in
+    tsc | kvm-clock) ;;
+    *) return 1 ;;
+    esac
+    cpus=0
+    while read -r line; do
+        case "$line" in
+        "Tick Device: mode:"*) mode=${line##* } ;;
+        "Per CPU device:"*)
+            [ "$mode" = 1 ] || return 1
+            cpus=$((cpus + 1))
+            ;;
+        esac
+    done </proc/timer_list
+    [ "$cpus" -gt 0 ]
+}
+wait_for_capture_clock() {
+    tries=0
+    until capture_clock_ready; do
+        tries=$((tries + 1))
+        [ "$tries" -lt 10 ] || return 1
+        sleep 1
+    done
+}
+"#
+}

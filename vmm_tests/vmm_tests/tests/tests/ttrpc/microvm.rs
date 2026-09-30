@@ -341,6 +341,8 @@ pub(super) async fn test_ttrpc_microvm_linux_direct_lifecycle_and_snapshot(
     let script = format!(
         r#"#!/bin/busybox sh
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
 read_port() {{
     dd if=/dev/port bs=1 skip="$1" count=1 2>/dev/null | od -An -tu1 | tr -d ' '
 }}
@@ -348,13 +350,23 @@ write_port() {{
     octal=$(printf '%03o' "$2")
     printf "\\$octal" | dd of=/dev/port bs=1 seek="$1" count=1 conv=notrunc 2>/dev/null
 }}
-stty -F /dev/hvc0 raw -echo
+{}stty -F /dev/hvc0 raw -echo
 next_byte() {{
     dd if=/dev/hvc0 bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d ' '
 }}
 generation=0
+if ! wait_for_capture_clock; then
+{}
+    write_port 1540 255
+    while :; do sleep 1; done
+fi
 {}
 write_port 1541 0
+if [ "$(read_port 1541)" != 0 ]; then
+{}
+    write_port 1540 255
+    while :; do sleep 1; done
+fi
 generation=$((generation + 1))
 {}
 status=$(read_port 234)
@@ -417,7 +429,10 @@ while :; do
     esac
 done
 "#,
+        crate::utils::microvm_capture_clock_script(),
+        portb_output(b"CAPTURE-CLOCK-TIMEOUT")?,
         portb_output(READY_MARKER)?,
+        portb_output(b"SNAPSHOT-REJECTED")?,
         portb_output(SNAPSHOT_CONTINUED_MARKER)?,
         portb_output(b"RESTORE-PACKET-MISSING")?,
         portb_output(b"RESTORE-TARGET-INVALID")?,

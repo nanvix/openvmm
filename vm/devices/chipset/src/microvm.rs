@@ -486,6 +486,9 @@ impl SaveRestore for MicrovmShutdown {
 }
 
 /// Snapshot-request port with at most one unacknowledged notification.
+///
+/// Reads report the outcome of the last completed transaction; see
+/// [`chipset_resources::microvm::MicrovmSnapshotRequestHandle`].
 #[derive(InspectMut)]
 pub struct MicrovmSnapshotRequest {
     #[inspect(skip)]
@@ -497,14 +500,43 @@ pub struct MicrovmSnapshotRequest {
     pending: Option<PendingSnapshotWrite>,
     #[inspect(skip)]
     poll_waker: Option<Waker>,
+    #[inspect(debug)]
+    rejection: Option<chipset_resources::microvm::MicrovmSnapshotRejection>,
 }
 
 struct PendingSnapshotWrite {
     release_write: mesh::OneshotReceiver<()>,
     deferred_write: Option<DeferredWrite>,
     write_completed: Option<mesh::OneshotSender<()>>,
-    transaction_complete: mesh::rpc::PendingRpc<()>,
+    transaction_complete:
+        mesh::rpc::PendingRpc<Option<chipset_resources::microvm::MicrovmSnapshotRejection>>,
     write_released: bool,
+    /// Cleared by a reset, after which the outcome belongs to an earlier boot.
+    report_outcome: bool,
+}
+
+impl PendingSnapshotWrite {
+    /// Completes the deferred write, which lets the requesting vCPU continue.
+    fn release(&mut self) {
+        self.write_released = true;
+        if let Some(deferred_write) = self.deferred_write.take() {
+            deferred_write.complete();
+        }
+        if let Some(write_completed) = self.write_completed.take() {
+            write_completed.send(());
+        }
+    }
+}
+
+/// Returns the snapshot-request port value that reports `rejection`.
+fn snapshot_status(rejection: Option<chipset_resources::microvm::MicrovmSnapshotRejection>) -> u8 {
+    use chipset_resources::microvm::MicrovmSnapshotRejection;
+
+    match rejection {
+        None => 0,
+        Some(MicrovmSnapshotRejection::PeriodicLapicTimer) => 1,
+        Some(MicrovmSnapshotRejection::Other) => 2,
+    }
 }
 
 impl MicrovmSnapshotRequest {
@@ -519,6 +551,7 @@ impl MicrovmSnapshotRequest {
             input_gate_timeout,
             pending: None,
             poll_waker: None,
+            rejection: None,
         }
     }
 
@@ -534,18 +567,23 @@ impl MicrovmSnapshotRequest {
                 .poll(&mut cx)
                 .is_ready()
         {
-            pending.write_released = true;
-            if let Some(deferred_write) = pending.deferred_write.take() {
-                deferred_write.complete();
-            }
-            if let Some(write_completed) = pending.write_completed.take() {
-                write_completed.send(());
-            }
+            pending.release();
         }
-        if Pin::new(&mut pending.transaction_complete)
-            .poll(&mut cx)
-            .is_ready()
-        {
+        if let Poll::Ready(outcome) = Pin::new(&mut pending.transaction_complete).poll(&mut cx) {
+            let rejection = match &outcome {
+                Ok(rejection) => *rejection,
+                // A transaction closed without an outcome did not capture either.
+                Err(_) => Some(chipset_resources::microvm::MicrovmSnapshotRejection::Other),
+            };
+            if pending.report_outcome {
+                self.rejection = rejection;
+            }
+            // The worker can end a transaction without establishing a boundary.
+            // Its outcome is now latched, so release a write that is still
+            // deferred; the guest then reads that outcome.
+            if outcome.is_ok() {
+                pending.release();
+            }
             self.pending = None;
         }
     }
@@ -572,6 +610,10 @@ impl ChangeDeviceState for MicrovmSnapshotRequest {
     }
     async fn reset(&mut self) {
         self.stop().await;
+        if let Some(pending) = &mut self.pending {
+            pending.report_outcome = false;
+        }
+        self.rejection = None;
     }
 }
 
@@ -597,7 +639,13 @@ impl PortIoIntercept for MicrovmSnapshotRequest {
         if io_port != SNAPSHOT_PORT {
             return IoResult::Err(IoError::InvalidRegister);
         }
-        data.fill(0xff);
+        // A completed transaction can resume the vCPUs before the device's
+        // poll task runs. Reap it so the guest reads its outcome.
+        self.poll_pending();
+        data.fill(0);
+        if let Some(status) = data.first_mut() {
+            *status = snapshot_status(self.rejection);
+        }
         IoResult::Ok
     }
 
@@ -639,6 +687,7 @@ impl PortIoIntercept for MicrovmSnapshotRequest {
                 write_completed: Some(write_completed),
                 transaction_complete,
                 write_released: false,
+                report_outcome: true,
             });
             if let Some(waker) = &self.poll_waker {
                 waker.wake_by_ref();
@@ -661,6 +710,8 @@ impl SaveRestore for MicrovmSnapshotRequest {
     }
 
     fn restore(&mut self, NoSavedState: Self::SavedState) -> Result<(), RestoreError> {
+        // The capture that produced the saved state was not rejected.
+        self.rejection = None;
         Ok(())
     }
 }
@@ -1215,12 +1266,12 @@ mod tests {
         );
 
         let mut snapshot = MicrovmSnapshotRequest::new(None, std::time::Duration::from_secs(1));
-        let mut data = [0; 4];
+        let mut data = [0xff; 4];
         assert!(matches!(
             snapshot.io_read(SNAPSHOT_PORT, &mut data),
             IoResult::Ok
         ));
-        assert_eq!(data, [0xff; 4]);
+        assert_eq!(data, [0; 4]);
         assert!(matches!(
             snapshot.io_write(SNAPSHOT_PORT, &[1]),
             IoResult::Ok
@@ -1271,7 +1322,7 @@ mod tests {
         ));
         assert!(recv.try_recv().is_err());
 
-        first.transaction_complete.complete(());
+        first.transaction_complete.complete(None);
         snapshot.poll_device(&mut Context::from_waker(Waker::noop()));
         assert!(matches!(
             snapshot.io_write(SNAPSHOT_PORT, &[]),
@@ -1305,7 +1356,7 @@ mod tests {
             Poll::Ready(Ok(()))
         ));
 
-        first.transaction_complete.complete(());
+        first.transaction_complete.complete(None);
         // The next write can acquire the device before its poll task runs.
         assert!(matches!(
             snapshot.io_write(SNAPSHOT_PORT, &[0]),
@@ -1329,7 +1380,7 @@ mod tests {
         };
         let mut first = recv.try_recv().unwrap();
         first.release_write.send(());
-        first.transaction_complete.complete(());
+        first.transaction_complete.complete(None);
 
         assert!(matches!(
             snapshot.io_write(SNAPSHOT_PORT, &[1]),
@@ -1421,7 +1472,7 @@ mod tests {
             IoResult::Ok
         ));
         wakes.0.store(0, Ordering::Relaxed);
-        first.transaction_complete.complete(());
+        first.transaction_complete.complete(None);
         assert_ne!(wakes.0.load(Ordering::Relaxed), 0);
         snapshot.poll_device(&mut cx);
         assert!(snapshot.pending.is_none());
@@ -1492,7 +1543,7 @@ mod tests {
                 IoResult::Ok
             ));
             assert!(recv.try_recv().is_err());
-            first.transaction_complete.complete(());
+            first.transaction_complete.complete(None);
             assert!(matches!(
                 snapshot.io_write(SNAPSHOT_PORT, &[0]),
                 IoResult::Defer(_)
@@ -1501,6 +1552,191 @@ mod tests {
                 recv.try_recv().unwrap().scratch_policy,
                 chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Fresh
             );
+        }
+    }
+
+    fn read_snapshot_status(snapshot: &mut MicrovmSnapshotRequest) -> [u8; 2] {
+        let mut data = [0xff; 2];
+        assert!(matches!(
+            snapshot.io_read(SNAPSHOT_PORT, &mut data),
+            IoResult::Ok
+        ));
+        data
+    }
+
+    /// How a test ends a released snapshot transaction.
+    enum TransactionEnd {
+        Complete(Option<chipset_resources::microvm::MicrovmSnapshotRejection>),
+        Drop,
+    }
+
+    /// Ends one released snapshot transaction as `end` specifies.
+    fn complete_snapshot_transaction(
+        snapshot: &mut MicrovmSnapshotRequest,
+        requests: &mut mesh::Receiver<chipset_resources::microvm::MicrovmSnapshotBoundaryRequest>,
+        end: TransactionEnd,
+    ) {
+        let mut cx = Context::from_waker(Waker::noop());
+        let IoResult::Defer(mut deferred_write) = snapshot.io_write(SNAPSHOT_PORT, &[1]) else {
+            panic!("snapshot write was not deferred");
+        };
+        let request = requests.try_recv().unwrap();
+        request.release_write.send(());
+        snapshot.poll_device(&mut cx);
+        assert!(matches!(
+            deferred_write.poll_write(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        match end {
+            TransactionEnd::Complete(rejection) => request.transaction_complete.complete(rejection),
+            TransactionEnd::Drop => drop(request.transaction_complete),
+        }
+    }
+
+    #[test]
+    fn snapshot_status_reports_last_transaction_outcome() {
+        use chipset_resources::microvm::MicrovmSnapshotRejection;
+
+        let (send, mut recv) = mesh::channel();
+        let mut snapshot =
+            MicrovmSnapshotRequest::new(Some(send), std::time::Duration::from_secs(1));
+        assert_eq!(read_snapshot_status(&mut snapshot), [0, 0]);
+
+        for (end, status) in [
+            (
+                TransactionEnd::Complete(Some(MicrovmSnapshotRejection::PeriodicLapicTimer)),
+                1,
+            ),
+            (TransactionEnd::Complete(None), 0),
+            (
+                TransactionEnd::Complete(Some(MicrovmSnapshotRejection::Other)),
+                2,
+            ),
+            // A transaction that closes without an outcome did not capture.
+            (TransactionEnd::Drop, 2),
+        ] {
+            complete_snapshot_transaction(&mut snapshot, &mut recv, end);
+            // The released vCPU can read the port before the poll task runs.
+            assert_eq!(read_snapshot_status(&mut snapshot), [status, 0]);
+            assert!(snapshot.pending.is_none());
+        }
+    }
+
+    #[test]
+    fn snapshot_status_is_unchanged_while_a_transaction_is_pending() {
+        use chipset_resources::microvm::MicrovmSnapshotRejection;
+
+        let (send, mut recv) = mesh::channel();
+        let mut snapshot =
+            MicrovmSnapshotRequest::new(Some(send), std::time::Duration::from_secs(1));
+        complete_snapshot_transaction(
+            &mut snapshot,
+            &mut recv,
+            TransactionEnd::Complete(Some(MicrovmSnapshotRejection::PeriodicLapicTimer)),
+        );
+
+        assert!(matches!(
+            snapshot.io_write(SNAPSHOT_PORT, &[1]),
+            IoResult::Defer(_)
+        ));
+        let request = recv.try_recv().unwrap();
+        assert_eq!(read_snapshot_status(&mut snapshot), [1, 0]);
+        request.release_write.send(());
+        snapshot.poll_device(&mut Context::from_waker(Waker::noop()));
+        assert_eq!(read_snapshot_status(&mut snapshot), [1, 0]);
+        request.transaction_complete.complete(None);
+        assert_eq!(read_snapshot_status(&mut snapshot), [0, 0]);
+    }
+
+    #[test]
+    fn snapshot_status_starts_at_zero_after_restore_or_reset() {
+        use chipset_resources::microvm::MicrovmSnapshotRejection;
+
+        for reset in [false, true] {
+            let (send, mut recv) = mesh::channel();
+            let mut snapshot =
+                MicrovmSnapshotRequest::new(Some(send), std::time::Duration::from_secs(1));
+            complete_snapshot_transaction(
+                &mut snapshot,
+                &mut recv,
+                TransactionEnd::Complete(Some(MicrovmSnapshotRejection::Other)),
+            );
+            assert_eq!(read_snapshot_status(&mut snapshot), [2, 0]);
+
+            if reset {
+                futures::executor::block_on(snapshot.reset());
+            } else {
+                snapshot.restore(NoSavedState).unwrap();
+            }
+            assert_eq!(read_snapshot_status(&mut snapshot), [0, 0]);
+        }
+    }
+
+    #[test]
+    fn snapshot_outcome_is_latched_before_an_unreleased_write_completes() {
+        use chipset_resources::microvm::MicrovmSnapshotRejection;
+
+        let (send, mut recv) = mesh::channel();
+        let mut snapshot =
+            MicrovmSnapshotRequest::new(Some(send), std::time::Duration::from_secs(1));
+        let mut cx = Context::from_waker(Waker::noop());
+        let IoResult::Defer(mut deferred_write) = snapshot.io_write(SNAPSHOT_PORT, &[1]) else {
+            panic!("snapshot write was not deferred");
+        };
+        let mut request = recv.try_recv().unwrap();
+
+        // The worker ends a request without a boundary by completing the
+        // transaction before it releases the write.
+        request
+            .transaction_complete
+            .complete(Some(MicrovmSnapshotRejection::Other));
+        assert!(deferred_write.poll_write(&mut cx).is_pending());
+        snapshot.poll_device(&mut cx);
+        assert!(matches!(
+            deferred_write.poll_write(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            Pin::new(&mut request.write_completed).poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(snapshot.pending.is_none());
+        assert_eq!(read_snapshot_status(&mut snapshot), [2, 0]);
+        request.release_write.send(());
+        assert_eq!(read_snapshot_status(&mut snapshot), [2, 0]);
+    }
+
+    #[test]
+    fn snapshot_reset_discards_outcome_of_released_transaction() {
+        use chipset_resources::microvm::MicrovmSnapshotRejection;
+
+        for completed_before_reset in [false, true] {
+            let (send, mut recv) = mesh::channel();
+            let mut snapshot =
+                MicrovmSnapshotRequest::new(Some(send), std::time::Duration::from_secs(1));
+            let mut cx = Context::from_waker(Waker::noop());
+            let IoResult::Defer(mut deferred_write) = snapshot.io_write(SNAPSHOT_PORT, &[1]) else {
+                panic!("snapshot write was not deferred");
+            };
+            let request = recv.try_recv().unwrap();
+            request.release_write.send(());
+            snapshot.poll_device(&mut cx);
+            assert!(matches!(
+                deferred_write.poll_write(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
+
+            let transaction_complete = request.transaction_complete;
+            if completed_before_reset {
+                transaction_complete.complete(Some(MicrovmSnapshotRejection::PeriodicLapicTimer));
+                futures::executor::block_on(snapshot.reset());
+            } else {
+                futures::executor::block_on(snapshot.reset());
+                assert!(snapshot.pending.is_some());
+                transaction_complete.complete(Some(MicrovmSnapshotRejection::PeriodicLapicTimer));
+            }
+            assert_eq!(read_snapshot_status(&mut snapshot), [0, 0]);
+            assert!(snapshot.pending.is_none());
         }
     }
 }

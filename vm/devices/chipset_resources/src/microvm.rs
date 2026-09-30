@@ -29,8 +29,21 @@ pub struct MicrovmSnapshotBoundaryRequest {
     pub write_completed: mesh::OneshotReceiver<()>,
     /// Maximum time allowed to gate host input before stopping vCPUs.
     pub input_gate_timeout: std::time::Duration,
-    /// Completed only after the final transaction outcome is known.
-    pub transaction_complete: mesh::rpc::Rpc<(), ()>,
+    /// Completed only after the final transaction outcome is known, with the
+    /// reason that the VMM continued the guest without a capture, if any.
+    pub transaction_complete: mesh::rpc::Rpc<(), Option<MicrovmSnapshotRejection>>,
+}
+
+/// Reason that a guest-requested microVM snapshot was not captured and the
+/// guest continued. The snapshot-request port reports it to the guest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, MeshPayload)]
+pub enum MicrovmSnapshotRejection {
+    /// A vCPU had an armed periodic LAPIC timer. Restore would coalesce the
+    /// periods that the timer missed during the snapshot downtime into one
+    /// interrupt, so a guest tick counted from them would fall behind.
+    PeriodicLapicTimer,
+    /// Capture was rejected or rolled back for any other reason.
+    Other,
 }
 
 /// The microVM bidirectional portb console at ports `0xe9` and `0xea`.
@@ -59,6 +72,11 @@ impl ResourceId<ChipsetDeviceHandleKind> for MicrovmShutdownHandle {
 }
 
 /// microVM snapshot-request port at `0x605`.
+///
+/// Writes request a capture. Reads return the outcome of the last completed
+/// request in the first byte: `0` when it was not rejected, `1` for
+/// [`MicrovmSnapshotRejection::PeriodicLapicTimer`], and `2` for
+/// [`MicrovmSnapshotRejection::Other`]. A new or restored VM reads `0`.
 #[derive(MeshPayload)]
 pub struct MicrovmSnapshotRequestHandle {
     /// Optional worker-local boundary coordination target.

@@ -225,7 +225,11 @@ describes the source definitions.
 
   `--snapshot-quiesce-timeout-ms <MILLISECONDS>` sets the bounded quiesce
   timeout and defaults to 5000. A request with no configured destination is
-  ignored and the guest continues. Capture requires 1, 2, 4, or 8 vCPUs,
+  ignored and the guest continues. OpenVMM rejects a capture while any vCPU
+  has an armed periodic LAPIC timer, and the guest continues; see
+  [capture clock contract](../../../user_guide/openvmm/snapshots.md#capture-clock-contract).
+  Reads of port `0x605` report why the last request was rejected.
+  Capture requires 1, 2, 4, or 8 vCPUs,
   KVM, MSHV, or WHP, and shared file-backed RAM. Sandbox block media must
   be cached regular raw files with nonzero 512-byte-aligned geometry. An
   attached virtio console saves accepted but undelivered input and the offset

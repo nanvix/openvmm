@@ -124,7 +124,7 @@ mod tests {
                 Poll::Ready(Ok(()))
             ));
             block_on(request.write_completed).unwrap();
-            request.transaction_complete.complete(());
+            request.transaction_complete.complete(None);
             assert!(requests.try_recv().is_err());
         }
     }
@@ -144,7 +144,7 @@ mod tests {
         device.poll_device(&mut cx);
         assert!(matches!(write.poll_write(&mut cx), Poll::Ready(Ok(()))));
         block_on(request.write_completed).unwrap();
-        request.transaction_complete.complete(());
+        request.transaction_complete.complete(None);
     }
 
     #[test]
@@ -176,7 +176,7 @@ mod tests {
         for message in [
             VmRpc::QuiesceForSnapshot(Rpc::detached(Duration::from_secs(1))),
             VmRpc::ResumeAfterFailedSnapshot(Rpc::detached(Duration::from_secs(1))),
-            VmRpc::ReleaseSnapshotBoundary(Rpc::detached(())),
+            VmRpc::ReleaseSnapshotBoundary(Rpc::detached(None)),
             VmRpc::ReadMemory(Rpc::detached((0, 1))),
         ] {
             assert!(filter(message, true).is_some());
@@ -200,7 +200,7 @@ mod tests {
         }
         assert!(block_on(resume).unwrap().is_err());
 
-        let release = send.call(VmRpc::ReleaseSnapshotBoundary, ());
+        let release = send.call(VmRpc::ReleaseSnapshotBoundary, None);
         let Some(VmRpc::ReleaseSnapshotBoundary(rpc)) = filter(recv.try_recv().unwrap(), true)
         else {
             panic!("snapshot release was blocked");

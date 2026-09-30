@@ -14,6 +14,7 @@ use crate::worker::memory_layout::ChipsetMmioRanges;
 use anyhow::Context;
 use chipset_device_resources::IRQ_LINE_SET;
 use chipset_resources::microvm::MicrovmSnapshotBoundaryRequest;
+use chipset_resources::microvm::MicrovmSnapshotRejection;
 use chipset_resources::microvm::MicrovmSnapshotScratchPolicy;
 use guestmem::GuestMemory;
 use hvdef::Vtl;
@@ -128,7 +129,7 @@ pub(super) struct SnapshotBoundary {
     /// Holds the vCPUs stopped while a boundary is active.
     stop_guard: Option<StopGuard>,
     /// Completes the guest's snapshot transaction when the boundary is released.
-    transaction_complete: Option<Rpc<(), ()>>,
+    transaction_complete: Option<Rpc<(), Option<MicrovmSnapshotRejection>>>,
     /// Host wall time at the stopped capture boundary.
     capture_wall_clock: Option<mesh::payload::Timestamp>,
     /// Input-gate timeout of the active boundary.
@@ -201,13 +202,12 @@ impl LoadedVm {
         };
         if self.snapshot_boundary.stop_guard.is_some() {
             tracelimit::warn_ratelimited!("dropping duplicate microVM snapshot boundary request");
-            request.release_write.send(());
-            request.transaction_complete.complete(());
+            end_without_boundary(request, Some(MicrovmSnapshotRejection::Other));
             return true;
         }
+        // Without a capture controller, no capture is configured to reject.
         let Some(snapshot_ready) = self.snapshot_boundary.ready.clone() else {
-            request.release_write.send(());
-            request.transaction_complete.complete(());
+            end_without_boundary(request, None);
             return true;
         };
 
@@ -231,11 +231,12 @@ impl LoadedVm {
                         error = resume_error.as_ref() as &dyn std::error::Error,
                         "host-input gate rollback is uncertain; terminating VM worker"
                     );
-                    request.transaction_complete.complete(());
+                    request
+                        .transaction_complete
+                        .complete(Some(MicrovmSnapshotRejection::Other));
                     return false;
                 }
-                request.release_write.send(());
-                request.transaction_complete.complete(());
+                end_without_boundary(request, Some(MicrovmSnapshotRejection::Other));
                 return true;
             }
             input_gate.complete("capture", "input_gate", Default::default());
@@ -267,13 +268,20 @@ impl LoadedVm {
                     error = error.as_ref() as &dyn std::error::Error,
                     "failed to establish snapshot PMIO boundary; terminating VM worker"
                 );
-                request.transaction_complete.complete(());
+                request
+                    .transaction_complete
+                    .complete(Some(MicrovmSnapshotRejection::Other));
                 false
             }
         }
     }
 
-    pub(super) async fn release_snapshot_boundary(&mut self) -> anyhow::Result<()> {
+    /// Releases the snapshot boundary and lets the guest continue, reporting
+    /// `rejection` as the reason that it continues without a capture.
+    pub(super) async fn release_snapshot_boundary(
+        &mut self,
+        rejection: Option<MicrovmSnapshotRejection>,
+    ) -> anyhow::Result<()> {
         let input_gate_timeout = self
             .snapshot_boundary
             .input_gate_timeout
@@ -297,7 +305,7 @@ impl LoadedVm {
         self.snapshot_restore.gate_timeout = None;
         self.snapshot_restore.gate_deadline = None;
         self.snapshot_restore.input_gated = false;
-        transaction_complete.complete(());
+        transaction_complete.complete(rejection);
         drop(stop_guard);
         if let Some(profile) = restore_gate_profile {
             profile.complete_milestone("restore", "guest_repair_gate", Default::default());
@@ -314,6 +322,7 @@ impl LoadedVm {
 
         if self.inner.machine_profile != MachineProfile::Microvm {
             return Err(openvmm_defs::rpc::SnapshotQuiesceError::Rejected(
+                MicrovmSnapshotRejection::Other,
                 RemoteError::new(anyhow::anyhow!(
                     "guest-requested snapshot quiesce requires the microVM profile"
                 )),
@@ -321,9 +330,12 @@ impl LoadedVm {
         }
         if !self.running {
             return Err(openvmm_defs::rpc::SnapshotQuiesceError::Rejected(
+                MicrovmSnapshotRejection::Other,
                 RemoteError::new(anyhow::anyhow!("VM is already stopped")),
             ));
         }
+        #[cfg(guest_arch = "x86_64")]
+        self.reject_periodic_lapic_timers().await?;
 
         let quiesce = openvmm_defs::profile::ProfileSpan::start();
         if let Err(error) = self.state_units.quiesce_for_save(timeout).await {
@@ -404,6 +416,26 @@ impl LoadedVm {
         })
     }
 
+    /// Rejects a capture while a stopped vCPU has an armed periodic LAPIC
+    /// timer, before any state unit transitions.
+    #[cfg(guest_arch = "x86_64")]
+    async fn reject_periodic_lapic_timers(
+        &mut self,
+    ) -> Result<(), openvmm_defs::rpc::SnapshotQuiesceError> {
+        let vps = self
+            .inner
+            .partition_unit
+            .periodic_lapic_timers()
+            .await
+            .map_err(|error| {
+                openvmm_defs::rpc::SnapshotQuiesceError::Rejected(
+                    MicrovmSnapshotRejection::Other,
+                    RemoteError::new(error),
+                )
+            })?;
+        periodic_lapic_timer_rejection(&vps)
+    }
+
     /// Resumes the VM after a rollback-safe snapshot failure and releases the
     /// snapshot boundary.
     pub(super) async fn resume_after_failed_snapshot(
@@ -412,7 +444,8 @@ impl LoadedVm {
     ) -> anyhow::Result<()> {
         self.state_units.resume_after_failed_save(timeout).await?;
         self.running = true;
-        self.release_snapshot_boundary().await?;
+        self.release_snapshot_boundary(Some(MicrovmSnapshotRejection::Other))
+            .await?;
         Ok(())
     }
 
@@ -473,6 +506,48 @@ impl LoadedVm {
             message => Some(message),
         }
     }
+}
+
+/// Ends a snapshot request without establishing a boundary, and lets the guest
+/// continue.
+///
+/// The outcome is completed before the write is released, so the vCPU that the
+/// release resumes reads this outcome from the snapshot port, not a stale one.
+fn end_without_boundary(
+    request: MicrovmSnapshotBoundaryRequest,
+    rejection: Option<MicrovmSnapshotRejection>,
+) {
+    request.transaction_complete.complete(rejection);
+    request.release_write.send(());
+}
+
+/// Rejects a capture when any of `vps` has an armed periodic LAPIC timer.
+///
+/// Restore advances each vCPU's TSC by the snapshot downtime, but coalesces
+/// the periods that a periodic LAPIC timer missed into one interrupt. A guest
+/// whose tick counts those interrupts would fall behind its TSC, and Linux's
+/// clocksource watchdog could then mark the TSC unstable. Such a guest
+/// continues, and it can capture once every CPU runs a one-shot tick.
+#[cfg(guest_arch = "x86_64")]
+fn periodic_lapic_timer_rejection(
+    vps: &[virt::VpIndex],
+) -> Result<(), openvmm_defs::rpc::SnapshotQuiesceError> {
+    if vps.is_empty() {
+        return Ok(());
+    }
+    let vps = vps
+        .iter()
+        .map(|vp| vp.index().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(openvmm_defs::rpc::SnapshotQuiesceError::Rejected(
+        MicrovmSnapshotRejection::PeriodicLapicTimer,
+        RemoteError::new(anyhow::anyhow!(
+            "vCPUs {vps} have an armed periodic LAPIC timer, whose periods missed during the \
+             snapshot downtime restore would coalesce into one interrupt; capture after every \
+             guest CPU runs a one-shot tick"
+        )),
+    ))
 }
 
 fn virtio_mmio_config(
@@ -789,5 +864,35 @@ pub(super) fn x86_topology_builder(
         Ok(vm_topology::processor::TopologyBuilder::new_x86())
     } else {
         Ok(vm_topology::processor::TopologyBuilder::from_host_topology()?)
+    }
+}
+
+#[cfg(all(test, guest_arch = "x86_64"))]
+mod tests {
+    use super::periodic_lapic_timer_rejection;
+    use chipset_resources::microvm::MicrovmSnapshotRejection;
+    use openvmm_defs::rpc::SnapshotQuiesceError;
+    use test_with_tracing::test;
+    use virt::VpIndex;
+
+    #[test]
+    fn capture_proceeds_without_periodic_lapic_timers() {
+        periodic_lapic_timer_rejection(&[]).unwrap();
+    }
+
+    #[test]
+    fn capture_rejects_periodic_lapic_timers_so_the_guest_continues() {
+        let error = periodic_lapic_timer_rejection(&[VpIndex::new(0), VpIndex::new(3)])
+            .expect_err("a periodic LAPIC timer must reject capture");
+        let SnapshotQuiesceError::Rejected(rejection, error) = error else {
+            panic!("capture must be rejected before any state transition: {error:?}");
+        };
+        assert_eq!(rejection, MicrovmSnapshotRejection::PeriodicLapicTimer);
+        assert!(
+            error
+                .to_string()
+                .starts_with("vCPUs 0, 3 have an armed periodic LAPIC timer"),
+            "{error}"
+        );
     }
 }

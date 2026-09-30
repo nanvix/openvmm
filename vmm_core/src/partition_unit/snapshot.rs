@@ -2,8 +2,8 @@
 // Licensed under the MIT License.
 
 //! Partition unit support for snapshots: validating the instantiated VP prefix,
-//! stopping VPs at a deferred I/O boundary for capture, and advancing TSC after
-//! restore downtime.
+//! stopping VPs at a deferred I/O boundary for capture, finding periodic LAPIC
+//! timers that capture must reject, and advancing TSC after restore downtime.
 
 use super::Error;
 use super::PartitionRequest;
@@ -17,6 +17,8 @@ use mesh::rpc::RpcSend;
 /// Snapshot requests handled by the partition unit runner.
 pub(super) enum SnapshotRequest {
     StopVpsAtIoBoundary(FailableRpc<(mesh::OneshotSender<()>, mesh::OneshotReceiver<()>), ()>),
+    #[cfg(guest_arch = "x86_64")]
+    PeriodicLapicTimers(FailableRpc<(), Vec<virt::VpIndex>>),
     #[cfg(guest_arch = "x86_64")]
     AdvanceTsc(FailableRpc<(std::time::Duration, u64, Option<u64>), ()>),
 }
@@ -54,6 +56,22 @@ impl PartitionUnit {
         Ok(StopGuard(self.req_send.clone()))
     }
 
+    /// Returns the VPs whose LAPIC timer is armed in periodic mode.
+    ///
+    /// The VPs must already be stopped, as they are at a snapshot I/O
+    /// boundary. Restore coalesces the periods that such a timer misses during
+    /// the snapshot downtime into one interrupt, so capture must reject them.
+    #[cfg(guest_arch = "x86_64")]
+    pub async fn periodic_lapic_timers(&mut self) -> anyhow::Result<Vec<virt::VpIndex>> {
+        Ok(self
+            .req_send
+            .call_failable(
+                |rpc| PartitionRequest::Snapshot(SnapshotRequest::PeriodicLapicTimers(rpc)),
+                (),
+            )
+            .await?)
+    }
+
     /// Advances TSC state on all stopped vCPUs.
     #[cfg(guest_arch = "x86_64")]
     pub async fn advance_tsc(
@@ -86,6 +104,11 @@ impl PartitionUnitRunner {
                         .await
                 })
                 .await
+            }
+            #[cfg(guest_arch = "x86_64")]
+            SnapshotRequest::PeriodicLapicTimers(rpc) => {
+                rpc.handle_failable(async |()| self.vp_set.periodic_lapic_timers().await)
+                    .await
             }
             #[cfg(guest_arch = "x86_64")]
             SnapshotRequest::AdvanceTsc(rpc) => {

@@ -4,6 +4,7 @@
 //! RPC types for communicating with the VM worker.
 
 use crate::config::DeviceVtl;
+use chipset_resources::microvm::MicrovmSnapshotRejection;
 use guid::Guid;
 use mesh::CancelContext;
 use mesh::MeshPayload;
@@ -25,8 +26,10 @@ pub enum VmRpc {
     QuiesceForSnapshot(Rpc<Duration, Result<SnapshotSaveResponse, SnapshotQuiesceError>>),
     /// Resume a VM after a rollback-safe snapshot failure before commit.
     ResumeAfterFailedSnapshot(FailableRpc<Duration, ()>),
-    /// Release a post-OUT boundary without starting a snapshot transaction.
-    ReleaseSnapshotBoundary(FailableRpc<(), ()>),
+    /// Release a post-OUT boundary without starting a snapshot transaction,
+    /// reporting to the guest why it continues without a capture, if it was
+    /// rejected.
+    ReleaseSnapshotBoundary(FailableRpc<Option<MicrovmSnapshotRejection>, ()>),
     Resume(FailableRpc<(), bool>),
     Pause(Rpc<(), bool>),
     ClearHalt(Rpc<(), bool>),
@@ -82,9 +85,10 @@ pub struct SnapshotSaveResponse {
 /// Failure classification for a bounded snapshot quiesce/save operation.
 #[derive(Debug, MeshPayload, thiserror::Error)]
 pub enum SnapshotQuiesceError {
-    /// The request was rejected before any state transition began.
+    /// The request was rejected before any state transition began. The guest
+    /// continues and observes the rejection reason.
     #[error("snapshot quiesce request was rejected")]
-    Rejected(#[source] RemoteError),
+    Rejected(MicrovmSnapshotRejection, #[source] RemoteError),
     /// No uncertain transition occurred; the controller may request rollback.
     #[error("snapshot quiesce failed without uncertain state")]
     RollbackSafe(#[source] RemoteError),

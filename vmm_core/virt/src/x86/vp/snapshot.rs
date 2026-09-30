@@ -55,6 +55,18 @@ impl Apic {
         }
     }
 
+    /// Returns whether the LAPIC timer is armed in periodic mode: its LVT entry
+    /// is unmasked and periodic, and its initial count is nonzero.
+    ///
+    /// This is the state whose missed periods [`Self::advance_timer`]
+    /// coalesces into a single interrupt, so a guest whose periodic tick counts
+    /// timer interrupts falls behind by the snapshot downtime.
+    pub fn periodic_timer_armed(&self) -> bool {
+        let registers = self.registers();
+        let timer_mode = (registers.lvt_timer >> 17) & 0x3;
+        registers.lvt_timer & (1 << 16) == 0 && timer_mode == 1 && registers.timer_icr != 0
+    }
+
     /// Advances the LAPIC timer by host downtime using the interrupt clock.
     pub fn advance_timer(
         &mut self,
@@ -217,6 +229,23 @@ mod tests {
 
         assert_eq!(apic.registers().timer_ccr, 75);
         assert!(timer_pending(&apic));
+    }
+
+    #[test]
+    fn periodic_timer_is_armed_only_when_unmasked_periodic_and_counting() {
+        assert!(apic(TIMER_VECTOR | TIMER_PERIODIC, 100, 25).periodic_timer_armed());
+        // The initial count, not the current count, arms a periodic timer.
+        assert!(apic(TIMER_VECTOR | TIMER_PERIODIC, 100, 0).periodic_timer_armed());
+
+        for timer in [
+            apic(TIMER_VECTOR | TIMER_PERIODIC | TIMER_MASKED, 100, 25),
+            apic(TIMER_VECTOR | TIMER_PERIODIC, 0, 0),
+            apic(TIMER_VECTOR, 100, 25),
+            apic(TIMER_VECTOR | TIMER_TSC_DEADLINE, 0, 0),
+            apic(TIMER_VECTOR | TIMER_TSC_DEADLINE, 100, 25),
+        ] {
+            assert!(!timer.periodic_timer_armed(), "{timer:?}");
+        }
     }
 
     #[test]

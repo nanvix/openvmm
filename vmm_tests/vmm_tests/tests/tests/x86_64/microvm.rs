@@ -38,9 +38,12 @@ async fn phase_1_lifecycle(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyho
     let script = format!(
         "#!/bin/busybox sh\n\
          mount -t devtmpfs devtmpfs /dev 2>/dev/null || true\n\
+         mount -t proc proc /proc 2>/dev/null || true\n\
+         mount -t sysfs sysfs /sys 2>/dev/null || true\n\
          read_port() {{\n\
              dd if=/dev/port bs=1 skip=\"$1\" count=1 2>/dev/null | od -An -tu1 | tr -d ' '\n\
          }}\n\
+         {}\
          next_byte() {{\n\
              while :; do\n\
                  status=$(read_port 234)\n\
@@ -64,9 +67,17 @@ async fn phase_1_lifecycle(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyho
                      ;;\n\
                  {COMMAND_SNAPSHOT})\n\
                      {}\
-                     printf '\\x00' | dd of=/dev/port bs=1 seek=1541 count=1 conv=notrunc 2>/dev/null\n\
-                     generation=$((generation + 1))\n\
-                     {}\
+                     if wait_for_capture_clock; then\n\
+                         printf '\\x00' | dd of=/dev/port bs=1 seek=1541 count=1 conv=notrunc 2>/dev/null\n\
+                         generation=$((generation + 1))\n\
+                         if [ \"$(read_port 1541)\" = 0 ]; then\n\
+                             {}\
+                         else\n\
+                             {}\
+                         fi\n\
+                     else\n\
+                         {}\
+                     fi\n\
                      ;;\n\
                  {COMMAND_STATE})\n\
                      if [ \"$generation\" = 1 ]; then\n\
@@ -86,11 +97,14 @@ async fn phase_1_lifecycle(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyho
                      ;;\n\
              esac\n\
          done\n",
+        crate::utils::microvm_capture_clock_script(),
         portb_output(BOOT_MARKER)?,
         portb_output(b"PONG\n")?,
         portb_output(RAW_MARKER)?,
         portb_output(b"SNAPSHOT-REQUESTED\n")?,
         portb_output(b"SNAPSHOT-CONTINUED=1\n")?,
+        portb_output(b"SNAPSHOT-STATUS-INVALID\n")?,
+        portb_output(b"CAPTURE-CLOCK-TIMEOUT\n")?,
         portb_output(b"STATE=1\n")?,
         portb_output(b"STATE-INVALID\n")?,
         portb_output(b"UNKNOWN-COMMAND\n")?,
@@ -154,6 +168,8 @@ async fn phase_1_lifecycle(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyho
     vm.backend()
         .write_microvm_portb_input(&[COMMAND_SNAPSHOT])
         .await?;
+    // No destination is configured, so OpenVMM releases the request without a
+    // capture, and the guest reads a zero snapshot-request status.
     CancelContext::new()
         .with_timeout(TIMEOUT)
         .until_cancelled(

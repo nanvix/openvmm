@@ -7,6 +7,7 @@ use super::VmController;
 use super::VmControllerEvent;
 use crate::microvm::MicrovmResources;
 use anyhow::Context;
+use chipset_resources::microvm::MicrovmSnapshotRejection;
 use mesh::rpc::RpcSend;
 use openvmm_defs::rpc::SnapshotQuiesceError;
 use openvmm_defs::rpc::VmRpc;
@@ -124,7 +125,7 @@ impl VmController {
             tracelimit::warn_ratelimited!(
                 "ignoring microVM snapshot request because no destination is configured"
             );
-            return self.release_snapshot_boundary_without_capture().await;
+            return self.release_snapshot_boundary_without_capture(None).await;
         };
 
         let preflight = (|| -> anyhow::Result<()> {
@@ -216,7 +217,9 @@ impl VmController {
                 error = error.as_ref() as &dyn std::error::Error,
                 "microVM snapshot preflight failed; guest continues"
             );
-            return self.release_snapshot_boundary_without_capture().await;
+            return self
+                .release_snapshot_boundary_without_capture(Some(MicrovmSnapshotRejection::Other))
+                .await;
         }
 
         let response = match self
@@ -228,12 +231,15 @@ impl VmController {
             .await
         {
             Ok(Ok(response)) => response,
-            Ok(Err(SnapshotQuiesceError::Rejected(error))) => {
+            Ok(Err(SnapshotQuiesceError::Rejected(rejection, error))) => {
                 tracing::error!(
                     error = &error as &dyn std::error::Error,
+                    ?rejection,
                     "microVM snapshot request was rejected; guest continues"
                 );
-                return self.release_snapshot_boundary_without_capture().await;
+                return self
+                    .release_snapshot_boundary_without_capture(Some(rejection))
+                    .await;
             }
             Ok(Err(SnapshotQuiesceError::RollbackSafe(error))) => {
                 return self.rollback_failed_guest_snapshot(error.into()).await;
@@ -505,10 +511,15 @@ impl VmController {
         }
     }
 
-    async fn release_snapshot_boundary_without_capture(&mut self) -> GuestSnapshotAction {
+    /// Releases the snapshot boundary and lets the guest continue, reporting
+    /// `rejection` to the guest as the reason that nothing was captured.
+    async fn release_snapshot_boundary_without_capture(
+        &mut self,
+        rejection: Option<MicrovmSnapshotRejection>,
+    ) -> GuestSnapshotAction {
         match self
             .vm_rpc
-            .call_failable(VmRpc::ReleaseSnapshotBoundary, ())
+            .call_failable(VmRpc::ReleaseSnapshotBoundary, rejection)
             .await
         {
             Ok(()) => GuestSnapshotAction::Continue,

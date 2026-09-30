@@ -105,6 +105,43 @@ requests report a reply-channel error because their result types cannot carry
 an application error. Retry a rejected operation after the boundary is
 released; ordinary paused VMs are not subject to this restriction.
 
+### Capture clock contract
+
+Restore advances every vCPU's TSC by the host downtime, but it delivers the
+periods that a periodic LAPIC timer missed during the downtime as a single
+interrupt. A guest whose periodic tick counts timer interrupts therefore falls
+behind its TSC after restore. While Linux's transitional `tsc-early`
+clocksource is current, its clocksource watchdog compares exactly those two and
+can mark the TSC unstable. A Linux guest must therefore request a microVM
+capture only when its current clocksource is `tsc` or `kvm-clock` and every
+online CPU runs a one-shot tick (mode 1 of each per-CPU tick device in
+`/proc/timer_list`). The guest has to wait for this itself: the vCPU that
+requests a capture stays blocked in its `out` until OpenVMM completes the
+write, so a guest with one online CPU could not reach a one-shot tick while
+OpenVMM held it.
+
+OpenVMM enforces the part of the contract that it can observe. After it stops
+the vCPUs at the capture boundary, and before any state unit quiesces, it
+rejects the capture if a vCPU's LAPIC timer is unmasked, periodic, and has a
+nonzero initial count. The boundary is released, and the guest continues.
+Versioned MSHV and WHP CPU contracts hide the TSC-deadline timer, so Linux
+drives a periodic tick with the LAPIC timer's periodic mode, which OpenVMM
+detects, rather than with deadline one-shots. WHP snapshots captured before the
+TSC-deadline timer was hidden have a different CPU contract and must be
+recaptured.
+
+Reads of the snapshot port (`0x605`) report the outcome of the last completed
+request in the first byte and read the remaining bytes as zero:
+
+| Value | Outcome |
+| ---: | --- |
+| `0` | Not rejected, including a request without a configured destination. A new or restored VM also reads `0`. |
+| `1` | Rejected because a vCPU had an armed periodic LAPIC timer. |
+| `2` | Rejected for any other reason, or rolled back after a failed capture. |
+
+A committed capture terminates the source, so only a guest that continues after
+its request reads a nonzero value.
+
 ## Restoring a snapshot
 
 To restore, pass the snapshot directory with `--restore-snapshot`:

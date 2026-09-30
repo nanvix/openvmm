@@ -3998,8 +3998,10 @@ impl LoadedVm {
                         .await;
                     }
                     VmRpc::ReleaseSnapshotBoundary(rpc) => {
-                        rpc.handle_failable(async |()| self.release_snapshot_boundary().await)
-                            .await
+                        rpc.handle_failable(async |rejection| {
+                            self.release_snapshot_boundary(rejection).await
+                        })
+                        .await
                     }
                     VmRpc::Nmi(rpc) => rpc.handle_sync(|vpindex| {
                         if vpindex < self.inner.processor_topology.vp_count() {

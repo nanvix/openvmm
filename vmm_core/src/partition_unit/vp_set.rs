@@ -87,6 +87,10 @@ trait ControlVp: ProtobufSaveRestore {
     #[cfg(guest_arch = "x86_64")]
     fn advance_tsc(&mut self, advance: tsc::TscAdvance) -> anyhow::Result<()>;
 
+    /// Returns whether the stopped vCPU's LAPIC timer is armed in periodic mode.
+    #[cfg(guest_arch = "x86_64")]
+    fn periodic_lapic_timer_armed(&mut self) -> anyhow::Result<bool>;
+
     #[cfg(feature = "gdb")]
     fn debug(&mut self) -> &mut dyn DebugVp;
 
@@ -187,6 +191,11 @@ where
     #[cfg(guest_arch = "x86_64")]
     fn advance_tsc(&mut self, advance: tsc::TscAdvance) -> anyhow::Result<()> {
         advance.apply(self.vp)
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn periodic_lapic_timer_armed(&mut self) -> anyhow::Result<bool> {
+        tsc::periodic_lapic_timer_armed(self.vp)
     }
 
     fn inspect_vp(
@@ -1126,6 +1135,8 @@ enum StateEvent {
     Scrub(mesh::rpc::FailableRpc<Vtl, ()>),
     #[cfg(guest_arch = "x86_64")]
     AdvanceTsc(mesh::rpc::FailableRpc<tsc::TscAdvance, ()>),
+    #[cfg(guest_arch = "x86_64")]
+    PeriodicLapicTimerArmed(mesh::rpc::FailableRpc<(), bool>),
     #[cfg(feature = "dump")]
     GetDumpVpState(Rpc<Vtl, anyhow::Result<hyperv_dump::VpState>>),
     #[cfg(feature = "gdb")]
@@ -1374,6 +1385,10 @@ impl RunnerInner {
             StateEvent::Scrub(rpc) => rpc.handle_failable_sync(|vtl| vp.scrub(vtl)),
             #[cfg(guest_arch = "x86_64")]
             StateEvent::AdvanceTsc(rpc) => rpc.handle_failable_sync(|tsc| vp.advance_tsc(tsc)),
+            #[cfg(guest_arch = "x86_64")]
+            StateEvent::PeriodicLapicTimerArmed(rpc) => {
+                rpc.handle_failable_sync(|()| vp.periodic_lapic_timer_armed())
+            }
             #[cfg(feature = "dump")]
             StateEvent::GetDumpVpState(rpc) => rpc.handle_sync(|vtl| vp.get_dump_vp_state(vtl)),
             #[cfg(feature = "gdb")]
