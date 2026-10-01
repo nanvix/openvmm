@@ -56,6 +56,8 @@ pub(crate) struct WorkerRestore {
     pub(crate) guards: Option<SnapshotRestoreGuards>,
     /// Host downtime to apply before starting a restored microVM.
     pub(crate) downtime: Option<Duration>,
+    /// SPIKE (time ABI v1): host wall time at the snapshot's capture boundary.
+    pub(crate) capture_wall_clock: Option<mesh::payload::Timestamp>,
     /// Saved effective TSC frequency of a restored microVM.
     pub(crate) tsc_frequency_hz: Option<u64>,
     /// Saved local APIC timer frequency of a restored microVM.
@@ -124,10 +126,16 @@ impl SnapshotRestore {
         )?;
         self.worker.shared_memory_copy_on_write = true;
         self.worker.guards = Some(prepared.guards);
-        if let Some((downtime, tsc_frequency_hz, apic_frequency_hz, cpu_contract)) =
-            prepared.restore_time
+        if let Some((
+            downtime,
+            tsc_frequency_hz,
+            apic_frequency_hz,
+            cpu_contract,
+            capture_wall_clock,
+        )) = prepared.restore_time
         {
             self.worker.downtime = Some(downtime);
+            self.worker.capture_wall_clock = Some(capture_wall_clock);
             self.worker.tsc_frequency_hz = Some(tsc_frequency_hz);
             self.worker.apic_frequency_hz = apic_frequency_hz;
             self.worker.cpu_contract = Some(cpu_contract);

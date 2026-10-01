@@ -20,6 +20,9 @@ pub(super) struct TscAdvance {
     duration: Duration,
     frequency_hz: u64,
     apic_frequency_hz: Option<u64>,
+    /// SPIKE (time ABI v1): the backend already set every VP's TSC at the
+    /// partition level; only re-arm the LAPIC timer.
+    tsc_synchronized: bool,
 }
 
 struct AdvancedTsc {
@@ -64,7 +67,26 @@ impl TscAdvance {
             duration,
             frequency_hz,
             apic_frequency_hz,
+            tsc_synchronized,
         } = self;
+        if tsc_synchronized {
+            // The TSC already holds its restored value, so re-arming the LAPIC
+            // now computes any TSC-based timer deadline from the final TSC.
+            let mut access = vp.access_state(Vtl::Vtl0);
+            if let Some(frequency) = apic_frequency_hz {
+                let mut apic = access
+                    .apic()
+                    .context("failed to read stopped LAPIC timer")?;
+                apic.advance_timer(duration, frequency)?;
+                access
+                    .set_apic(&apic)
+                    .context("failed to reprogram stopped LAPIC timer")?;
+            }
+            access
+                .commit()
+                .context("failed to commit restored LAPIC timer")?;
+            return Ok(());
+        }
         let mut access = vp.access_state(Vtl::Vtl0);
         let tsc = access.tsc().context("failed to read stopped vCPU TSC")?;
         let mut tsc_deadline = access
@@ -130,6 +152,7 @@ impl VpSet {
         duration: Duration,
         frequency_hz: u64,
         apic_frequency_hz: Option<u64>,
+        tsc_synchronized: bool,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(!self.started, "vCPUs must be stopped before adjusting TSC");
         self.vps
@@ -143,6 +166,7 @@ impl VpSet {
                             duration,
                             frequency_hz,
                             apic_frequency_hz,
+                            tsc_synchronized,
                         },
                     )
                     .await

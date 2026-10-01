@@ -558,6 +558,22 @@ pub trait Partition: 'static + Hv1 + Inspect + Send + Sync {
         Ok(())
     }
 
+    /// SPIKE (time ABI v1): sets the guest TSC of every VP, before any VP
+    /// runs, to the saved BSP TSC advanced by the downtime since
+    /// `capture_time` at `frequency_hz`, at a single host instant.
+    ///
+    /// Returns the downtime used, or `None` when the backend does not
+    /// synchronize the TSC at the partition level (the caller then advances
+    /// each VP's TSC).
+    #[cfg(guest_arch = "x86_64")]
+    fn synchronize_restored_tsc(
+        &self,
+        _frequency_hz: u64,
+        _capture_time: std::time::SystemTime,
+    ) -> Result<Option<std::time::Duration>, Self::Error> {
+        Ok(None)
+    }
+
     /// Returns the effective LAPIC interrupt clock frequency when available.
     fn apic_frequency_hz(&self) -> Result<Option<u64>, Self::Error> {
         Ok(None)

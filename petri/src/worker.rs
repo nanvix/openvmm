@@ -45,6 +45,7 @@ impl Worker {
             snapshot_ready: None,
             snapshot_capture_enabled: false,
             restore_downtime: None,
+            restore_capture_wall_clock: None,
             restore_tsc_frequency_hz: None,
             restore_apic_frequency_hz: None,
             restore_cpu_contract: None,

@@ -37,11 +37,20 @@ pub(super) fn add_frequency_leaves(
 
 impl KvmPartitionInner {
     pub(super) fn tsc_frequency_hz(&self) -> Result<Option<u64>, KvmError> {
+        if let Some(time) = &self.time_abi {
+            return Ok(Some(time.declared_tsc_hz()));
+        }
         let bsp_vcpu_id = kvm_vcpu_id(&self.bsp().vp_info);
         Ok(Some(self.kvm.vp(bsp_vcpu_id).tsc_frequency_hz()?))
     }
 
     pub(super) fn set_tsc_frequency_hz(&self, frequency_hz: u64) -> Result<(), KvmError> {
+        if let Some(time) = &self.time_abi {
+            // SPIKE: the guest keeps the snapshot's declared rate; the TSC
+            // itself runs at the host-native rate and is never scaled.
+            time.set_declared_tsc_hz(frequency_hz);
+            return Ok(());
+        }
         for vp in &self.vps {
             self.kvm
                 .vp(kvm_vcpu_id(&vp.vp_info))
@@ -51,6 +60,10 @@ impl KvmPartitionInner {
     }
 
     pub(super) fn advance_snapshot_time(&self, duration: Duration) -> Result<(), KvmError> {
+        if self.time_abi.is_some() {
+            // SPIKE: no kvmclock, so no KVM_SET_CLOCK.
+            return Ok(());
+        }
         let clock = self.kvm.get_clock_ns()?;
         let delta =
             u64::try_from(duration.as_nanos()).map_err(|_| KvmError::SnapshotClockOverflow)?;

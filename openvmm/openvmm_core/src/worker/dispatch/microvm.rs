@@ -77,6 +77,9 @@ pub(super) struct MicrovmParameters {
     pub(super) snapshot_boundary: SnapshotBoundary,
     /// Whether this cold boot can publish a microVM snapshot.
     snapshot_capture_enabled: bool,
+    /// SPIKE (time ABI v1): the KVM backend serves the Hyper-V frequency
+    /// identity, so its cold boots get no clock command-line tokens.
+    time_abi_identity: bool,
 }
 
 impl MicrovmParameters {
@@ -93,9 +96,15 @@ impl MicrovmParameters {
             &parameters.cfg,
             Some(parameters.hypervisor.id()),
         )?;
+        let time_abi_identity = cfg!(guest_arch = "x86_64")
+            && parameters.hypervisor.id()
+                == <hypervisor_resources::KvmHandle as vm_resource::ResourceId<
+                    hypervisor_resources::HypervisorKind,
+                >>::ID;
         Ok(Self {
             snapshot_boundary,
             snapshot_capture_enabled,
+            time_abi_identity,
         })
     }
 
@@ -106,6 +115,9 @@ impl MicrovmParameters {
         vm: &mut InitializedVm,
         restored_from_snapshot: bool,
     ) -> anyhow::Result<()> {
+        if self.time_abi_identity {
+            return reject_cold_boot_clock_tokens(&vm.cfg, restored_from_snapshot);
+        }
         prepare_cold_boot_command_line(
             &mut vm.cfg,
             vm.partition.as_ref(),
@@ -113,6 +125,28 @@ impl MicrovmParameters {
             self.snapshot_capture_enabled,
         )
     }
+}
+
+/// SPIKE (time ABI v1): the guest learns its TSC and LAPIC rates from the
+/// Hyper-V frequency MSRs, so cold boots carry no clock tokens, and a
+/// caller-supplied `tsc_early_khz` or `lapic_timer_hz` is rejected.
+fn reject_cold_boot_clock_tokens(
+    cfg: &Manifest,
+    restored_from_snapshot: bool,
+) -> anyhow::Result<()> {
+    if restored_from_snapshot || cfg.machine_profile != MachineProfile::Microvm {
+        return Ok(());
+    }
+    if let openvmm_defs::config::LoadMode::Linux {
+        cmdline,
+        boot_mode: openvmm_defs::config::LinuxDirectBootMode::MpTable,
+        ..
+    } = &cfg.load_mode
+    {
+        crate::worker::vm_loaders::microvm::reject_clock_parameters(cmdline)
+            .context("time ABI v1 cold boots take no clock command-line tokens")?;
+    }
+    Ok(())
 }
 
 /// A guest snapshot-boundary request, or the closure of the request channel.

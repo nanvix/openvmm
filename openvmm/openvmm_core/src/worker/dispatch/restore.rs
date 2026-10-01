@@ -56,6 +56,12 @@ impl RestoreParameters {
             parameters.restore_downtime,
             parameters.restore_tsc_frequency_hz,
             parameters.restore_apic_frequency_hz,
+            parameters
+                .restore_capture_wall_clock
+                .take()
+                .map(std::time::SystemTime::try_from)
+                .transpose()
+                .context("invalid snapshot capture wall clock")?,
         )?;
         tracing::debug!(?restore_time, "received snapshot restore time contract");
         let restore_vp_count = parameters.restore_vp_count.take();

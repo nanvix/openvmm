@@ -77,6 +77,10 @@ pub struct VmWorkerParameters {
     pub snapshot_capture_enabled: bool,
     /// Host downtime to apply before starting a restored VM.
     pub restore_downtime: Option<std::time::Duration>,
+    /// SPIKE (time ABI v1): host wall time at the snapshot's capture
+    /// boundary, so the restore can measure the downtime at the instant it
+    /// sets the guest TSC.
+    pub restore_capture_wall_clock: Option<mesh::payload::Timestamp>,
     /// Saved effective TSC frequency required by restore.
     pub restore_tsc_frequency_hz: Option<u64>,
     /// Saved local APIC timer frequency required by restore.

@@ -526,6 +526,10 @@ impl AccessVpState for KvmVpStateAccess<'_, '_> {
     }
 
     fn set_tsc(&mut self, tsc: &vp::Tsc) -> Result<(), Self::Error> {
+        // SPIKE: remember the value; on a time ABI restore the common TSC
+        // offset is derived from the BSP's saved TSC instead of from what
+        // KVM's IA32_TSC write heuristics made of this write.
+        *self.vp.inner.restored_tsc.lock() = tsc.value;
         self.set_register_state(tsc)
     }
 

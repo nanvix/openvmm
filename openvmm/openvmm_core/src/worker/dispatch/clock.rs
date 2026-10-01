@@ -11,19 +11,24 @@ use anyhow::Context;
 use std::time::Duration;
 
 /// Saved guest-clock contract of a restore: the host downtime to apply, the
-/// saved guest TSC frequency, and the saved local APIC timer frequency, when
-/// the snapshot recorded one.
-pub(super) type RestoreTime = (Duration, u64, Option<u64>);
+/// saved guest TSC frequency, the saved local APIC timer frequency, when the
+/// snapshot recorded one, and (SPIKE) the capture wall clock, which lets the
+/// backend measure the downtime at the instant it sets the TSC.
+pub(super) type RestoreTime = (Duration, u64, Option<u64>, Option<std::time::SystemTime>);
 
 pub(super) fn restore_time_contract(
     downtime: Option<Duration>,
     tsc_frequency_hz: Option<u64>,
     apic_frequency_hz: Option<u64>,
+    capture_wall_clock: Option<std::time::SystemTime>,
 ) -> anyhow::Result<Option<RestoreTime>> {
     match (downtime, tsc_frequency_hz, apic_frequency_hz) {
-        (Some(downtime), Some(tsc_frequency), apic_frequency) => {
-            Ok(Some((downtime, tsc_frequency, apic_frequency)))
-        }
+        (Some(downtime), Some(tsc_frequency), apic_frequency) => Ok(Some((
+            downtime,
+            tsc_frequency,
+            apic_frequency,
+            capture_wall_clock,
+        ))),
         (None, None, None) => Ok(None),
         _ => anyhow::bail!("restore downtime and TSC frequency must be provided together"),
     }
@@ -53,7 +58,7 @@ impl LoadedVm {
         &self,
         restore_time: Option<RestoreTime>,
     ) -> anyhow::Result<()> {
-        if let Some((_, saved_frequency, saved_apic_frequency)) = restore_time {
+        if let Some((_, saved_frequency, saved_apic_frequency, _)) = restore_time {
             let destination_frequency = self
                 .inner
                 .partition
@@ -85,7 +90,33 @@ impl LoadedVm {
         &mut self,
         restore_time: Option<RestoreTime>,
     ) -> anyhow::Result<()> {
-        if let Some((downtime, frequency, saved_apic_frequency)) = restore_time {
+        if let Some((downtime, frequency, saved_apic_frequency, capture_wall_clock)) = restore_time
+        {
+            // SPIKE (time ABI v1): a backend that synchronizes the TSC at the
+            // partition level measures the downtime at the instant it sets
+            // the TSC; every other clock then advances by that downtime.
+            #[cfg(guest_arch = "x86_64")]
+            let synchronized_downtime = match capture_wall_clock {
+                Some(capture_time) => self
+                    .inner
+                    .partition
+                    .synchronize_restored_tsc(frequency, capture_time)
+                    .context("failed to synchronize restored vCPU TSC")?,
+                None => None,
+            };
+            #[cfg(not(guest_arch = "x86_64"))]
+            let synchronized_downtime: Option<Duration> = {
+                let _ = capture_wall_clock;
+                None
+            };
+            if let Some(synchronized) = synchronized_downtime {
+                tracing::info!(
+                    early_downtime_ns = downtime.as_nanos() as u64,
+                    synchronized_downtime_ns = synchronized.as_nanos() as u64,
+                    "time abi: restore downtime measured at the TSC synchronization"
+                );
+            }
+            let downtime = synchronized_downtime.unwrap_or(downtime);
             self.state_units
                 .advance_time(downtime)
                 .await
@@ -101,7 +132,12 @@ impl LoadedVm {
                     };
                 self.inner
                     .partition_unit
-                    .advance_tsc(downtime, frequency, Some(apic_frequency))
+                    .advance_tsc(
+                        downtime,
+                        frequency,
+                        Some(apic_frequency),
+                        synchronized_downtime.is_some(),
+                    )
                     .await
                     .context("failed to advance restored vCPU TSC")?;
             }
@@ -145,7 +181,7 @@ mod tests {
     fn time_adjusted_restore_allows_partition_state() {
         validate_snapshot_restore_partition_presence(
             &saved_state(&["partition"]),
-            Some((Duration::ZERO, 1, None)),
+            Some((Duration::ZERO, 1, None, None)),
         )
         .unwrap();
     }
@@ -154,7 +190,7 @@ mod tests {
     fn time_adjusted_restore_rejects_missing_partition_state() {
         let error = validate_snapshot_restore_partition_presence(
             &saved_state(&["other"]),
-            Some((Duration::ZERO, 1, None)),
+            Some((Duration::ZERO, 1, None, None)),
         )
         .unwrap_err();
 
@@ -169,7 +205,10 @@ mod tests {
         let mut saved_state = saved_state(&[]);
         saved_state.inventory.push("partition".to_owned());
 
-        validate_snapshot_restore_partition_presence(&saved_state, Some((Duration::ZERO, 1, None)))
-            .unwrap_err();
+        validate_snapshot_restore_partition_presence(
+            &saved_state,
+            Some((Duration::ZERO, 1, None, None)),
+        )
+        .unwrap_err();
     }
 }

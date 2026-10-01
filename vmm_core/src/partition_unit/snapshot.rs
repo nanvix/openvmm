@@ -18,7 +18,7 @@ use mesh::rpc::RpcSend;
 pub(super) enum SnapshotRequest {
     StopVpsAtIoBoundary(FailableRpc<(mesh::OneshotSender<()>, mesh::OneshotReceiver<()>), ()>),
     #[cfg(guest_arch = "x86_64")]
-    AdvanceTsc(FailableRpc<(std::time::Duration, u64, Option<u64>), ()>),
+    AdvanceTsc(FailableRpc<(std::time::Duration, u64, Option<u64>, bool), ()>),
 }
 
 /// Returns the number of VPs to instantiate, validated against the topology's
@@ -54,18 +54,20 @@ impl PartitionUnit {
         Ok(StopGuard(self.req_send.clone()))
     }
 
-    /// Advances TSC state on all stopped vCPUs.
+    /// Advances TSC state on all stopped vCPUs. With `tsc_synchronized`, the
+    /// backend already set the TSC and only the LAPIC timers are advanced.
     #[cfg(guest_arch = "x86_64")]
     pub async fn advance_tsc(
         &mut self,
         duration: std::time::Duration,
         frequency_hz: u64,
         apic_frequency_hz: Option<u64>,
+        tsc_synchronized: bool,
     ) -> anyhow::Result<()> {
         self.req_send
             .call_failable(
                 |rpc| PartitionRequest::Snapshot(SnapshotRequest::AdvanceTsc(rpc)),
-                (duration, frequency_hz, apic_frequency_hz),
+                (duration, frequency_hz, apic_frequency_hz, tsc_synchronized),
             )
             .await?;
         Ok(())
@@ -89,11 +91,18 @@ impl PartitionUnitRunner {
             }
             #[cfg(guest_arch = "x86_64")]
             SnapshotRequest::AdvanceTsc(rpc) => {
-                rpc.handle_failable(async |(duration, frequency_hz, apic_frequency_hz)| {
-                    self.vp_set
-                        .advance_tsc(duration, frequency_hz, apic_frequency_hz)
-                        .await
-                })
+                rpc.handle_failable(
+                    async |(duration, frequency_hz, apic_frequency_hz, tsc_synchronized)| {
+                        self.vp_set
+                            .advance_tsc(
+                                duration,
+                                frequency_hz,
+                                apic_frequency_hz,
+                                tsc_synchronized,
+                            )
+                            .await
+                    },
+                )
                 .await
             }
         }

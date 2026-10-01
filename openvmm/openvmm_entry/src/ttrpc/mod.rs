@@ -1371,18 +1371,22 @@ impl VmService {
                     restore_downtime: worker_fields
                         .restore_time
                         .as_ref()
-                        .map(|(downtime, _, _, _)| *downtime),
+                        .map(|(downtime, _, _, _, _)| *downtime),
+                    restore_capture_wall_clock: worker_fields
+                        .restore_time
+                        .as_ref()
+                        .map(|(_, _, _, _, capture_wall_clock)| *capture_wall_clock),
                     restore_tsc_frequency_hz: worker_fields
                         .restore_time
                         .as_ref()
-                        .map(|(_, frequency, _, _)| *frequency),
+                        .map(|(_, frequency, _, _, _)| *frequency),
                     restore_apic_frequency_hz: worker_fields
                         .restore_time
                         .as_ref()
-                        .and_then(|(_, _, frequency, _)| *frequency),
+                        .and_then(|(_, _, frequency, _, _)| *frequency),
                     restore_cpu_contract: worker_fields
                         .restore_time
-                        .map(|(_, _, _, cpu_contract)| cpu_contract),
+                        .map(|(_, _, _, cpu_contract, _)| cpu_contract),
                     restore_ready_sink,
                     restore_gate_timeout: worker_fields.restore_gate_timeout,
                     restore_vp_count: worker_fields.restore_vp_count,

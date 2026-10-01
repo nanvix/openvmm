@@ -15,7 +15,13 @@ pub(crate) struct PreparedSnapshotRestore {
     pub(crate) shared_memory: openvmm_defs::worker::SharedMemoryFd,
     pub(crate) guards: openvmm_defs::worker::SnapshotRestoreGuards,
     pub(crate) saved_state: mesh::payload::message::ProtobufMessage,
-    pub(crate) restore_time: Option<(Duration, u64, Option<u64>, Vec<u8>)>,
+    pub(crate) restore_time: Option<(
+        Duration,
+        u64,
+        Option<u64>,
+        Vec<u8>,
+        mesh::payload::Timestamp,
+    )>,
 }
 
 /// Validate an opened snapshot generation against the current VM config.

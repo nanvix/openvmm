@@ -166,6 +166,10 @@ struct KvmPartitionInner {
     gic_nr_irqs: u32,
     #[cfg(guest_arch = "x86_64")]
     synic_ports: virt::synic::SynicPortMap,
+    /// SPIKE: time ABI v1 identity state, when the identity is exposed.
+    #[cfg(guest_arch = "x86_64")]
+    #[inspect(skip)]
+    time_abi: Option<arch::TimeAbi>,
 }
 
 // TODO: Chunk this up into smaller types.

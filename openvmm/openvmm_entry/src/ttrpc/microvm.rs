@@ -45,7 +45,13 @@ use vm_resource::kind::SerialBackendHandle;
 use vm_resource::kind::VirtioDeviceHandle;
 use vmotherboard::ChipsetDeviceHandle;
 
-type RestoreTime = (Duration, u64, Option<u64>, Vec<u8>);
+type RestoreTime = (
+    Duration,
+    u64,
+    Option<u64>,
+    Vec<u8>,
+    mesh::payload::Timestamp,
+);
 type SerialPorts = [Option<Resource<SerialBackendHandle>>; 4];
 
 struct AuthoritativeRestore {

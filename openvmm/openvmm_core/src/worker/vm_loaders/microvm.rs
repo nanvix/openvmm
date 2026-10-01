@@ -296,6 +296,31 @@ pub(crate) fn propagate_snapshot_tsc_frequency(
     propagate_tsc_frequency(cmdline, frequency_hz)
 }
 
+/// SPIKE (time ABI v1): a clock token that the Hyper-V frequency identity
+/// replaces.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("kernel command line parameter {0} is replaced by the time ABI identity")]
+pub(crate) struct RemovedClockParameter(String);
+
+/// SPIKE (time ABI v1): rejects the clock tokens that the Hyper-V frequency
+/// identity replaces. Tokens after a `--` belong to init and are ignored.
+pub(crate) fn reject_clock_parameters(cmdline: &str) -> Result<(), RemovedClockParameter> {
+    let (tokens, _) = command_line_tokens(cmdline);
+    for (_, raw_token) in tokens {
+        let token = raw_token.trim_matches('"');
+        if token == "--" {
+            break;
+        }
+        let name = token.split_once('=').map_or(token, |(name, _value)| name);
+        if linux_parameter_name_matches(name, TSC_EARLY_KHZ)
+            || linux_parameter_name_matches(name, LAPIC_TIMER_HZ)
+        {
+            return Err(RemovedClockParameter(token.to_owned()));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

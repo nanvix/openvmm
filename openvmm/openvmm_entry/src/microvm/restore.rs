@@ -371,7 +371,13 @@ pub(crate) type ExpectedRestoreContract<'a> = (
 
 /// Clock and CPU state recorded at the capture boundary of a restored
 /// microVM: host downtime, TSC and APIC frequencies, and the CPU contract.
-pub(crate) type RestoreTime = (Duration, u64, Option<u64>, Vec<u8>);
+pub(crate) type RestoreTime = (
+    Duration,
+    u64,
+    Option<u64>,
+    Vec<u8>,
+    mesh::payload::Timestamp,
+);
 
 /// Validates the authoritative machine contract of a microVM snapshot against
 /// the restore-time configuration.
@@ -436,6 +442,7 @@ pub(crate) fn validate_restore_contract(
         saved_contract.tsc_frequency_hz,
         saved_contract.apic_frequency_hz,
         saved_contract.cpu_contract.clone(),
+        saved_contract.capture_wall_clock,
     ))
 }
 

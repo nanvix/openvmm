@@ -3000,6 +3000,7 @@ async fn run_control_inner(
             snapshot_ready,
             snapshot_capture_enabled: microvm.snapshot_capture_enabled(),
             restore_downtime: restore.downtime,
+            restore_capture_wall_clock: restore.capture_wall_clock,
             restore_tsc_frequency_hz: restore.tsc_frequency_hz,
             restore_apic_frequency_hz: restore.apic_frequency_hz,
             restore_cpu_contract: restore.cpu_contract,
