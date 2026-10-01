@@ -1842,8 +1842,11 @@ pub(super) fn validate_snapshot_tier(manifest: &SnapshotManifest) -> anyhow::Res
             .split_ascii_whitespace()
             .filter(|token| token.starts_with("tsc_early_khz="))
             .collect::<Vec<_>>();
+        // SPIKE (time ABI v1): identity boots carry no clock tokens.
+        let time_abi_spike = std::env::var("NVX_SPIKE_TIME_ABI").as_deref() == Ok("1");
         anyhow::ensure!(
-            tsc_frequency_tokens == [expected_tsc_frequency.as_str()],
+            tsc_frequency_tokens == [expected_tsc_frequency.as_str()]
+                || (time_abi_spike && tsc_frequency_tokens.is_empty()),
             "platform snapshot command line TSC frequency does not match its machine contract"
         );
         let control_tty_count = contract

@@ -17,6 +17,8 @@ mod emu;
 mod hypercalls;
 mod memory;
 mod regs;
+#[cfg(guest_arch = "x86_64")]
+mod spike;
 mod synic;
 #[cfg(guest_arch = "x86_64")]
 mod tsc;
@@ -1156,6 +1158,20 @@ impl WhpPartitionInner {
         #[cfg(guest_arch = "x86_64")]
         let tsc_frequency = vtl0.whp.tsc_frequency().for_op("get tsc frequency")?;
 
+        // SPIKE: the time ABI identity on the microVM path.
+        #[cfg(guest_arch = "x86_64")]
+        let time_identity = proto_config.versioned_cpu_contract
+            && proto_config.hv_config.is_none()
+            && spike::identity_enabled();
+        #[cfg(guest_arch = "x86_64")]
+        if time_identity {
+            tracing::info!(
+                tsc_frequency,
+                apic_frequency = ?vtl0.whp.apic_frequency(),
+                "spike: time ABI partition clocks"
+            );
+        }
+
         // FUTURE: register cpuid results with the hypervisor, and register
         // appropriate per-VP results where necessary (or tell the hypervisor
         // the AMD topology information so that it can provide per-VP results
@@ -1227,6 +1243,12 @@ impl WhpPartitionInner {
             }
 
             cpuid.extend(config.cpuid);
+
+            if time_identity {
+                cpuid.extend(spike::identity_cpuid_leaves(
+                    proto_config.processor_topology.vp_count(),
+                ));
+            }
 
             // Add topology CPUID leaves.
             virt::x86::topology::topology_cpuid(
@@ -1309,6 +1331,12 @@ impl WhpPartitionInner {
             caps.xsaves_state_bv_broken = true;
             caps.dr6_tsx_broken = true;
             caps.nested_virt = nested_virt;
+            if time_identity {
+                // The identity leaves are not the hv1 enlightenments; keep the
+                // hv1 saved-state elements absent.
+                caps.hv1 = false;
+                caps.hv1_reference_tsc_page = false;
+            }
             caps
         };
         let vendor = match whp::capabilities::processor_vendor().for_op("get processor vendor")? {
@@ -1531,7 +1559,10 @@ impl VtlPartition {
             .for_op("set processor count")?;
 
         #[cfg(guest_arch = "x86_64")]
-        if config.versioned_cpu_contract {
+        if config.versioned_cpu_contract && config.hv_config.is_none() && spike::identity_enabled()
+        {
+            spike::configure_identity_partition(&mut whp_config, &mut extended_exits)?;
+        } else if config.versioned_cpu_contract {
             cpu_contract::configure_versioned_contract(&mut whp_config, &mut extended_exits)?;
         }
 

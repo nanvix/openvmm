@@ -1328,6 +1328,8 @@ mod x86 {
                                 v,
                                 &mut crate::WhpNoVtlProtections(&self.vp.partition.gm),
                             )
+                        } else if let Some(result) = crate::spike::identity_msr_write(msr, v) {
+                            result
                         } else {
                             match msr {
                                 hvdef::HV_X64_MSR_VP_ASSIST_PAGE
@@ -1417,6 +1419,12 @@ mod x86 {
                     0x40000000..=0x4fffffff => {
                         if let Some(hv) = &mut self.state.vtls[self.state.active_vtl].hv {
                             hv.msr_read(msr)
+                        } else if let Some(result) = crate::spike::identity_msr_read(
+                            msr,
+                            self.vp.index.index(),
+                            self.vp.partition.clock.tsc_frequency_hz,
+                        ) {
+                            result
                         } else {
                             match msr {
                                 hvdef::HV_X64_MSR_VP_ASSIST_PAGE

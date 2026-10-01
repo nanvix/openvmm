@@ -76,6 +76,9 @@ impl WhpPartitionInner {
 
     /// Aligns the restored VP counters with partition time suspended, and
     /// enables the restored-TSC clock.
+    ///
+    /// SPIKE: `NVX_SPIKE_WHP_TSC` selects whether the restored-TSC clock is
+    /// enabled at all, and whether time resumes before the first VP run.
     pub(crate) fn advance_snapshot_time(&self) -> Result<(), Error> {
         if self.vps.len() <= 1 {
             return Ok(());
@@ -86,6 +89,17 @@ impl WhpPartitionInner {
             .suspend_time()
             .for_op("suspend restored partition time")?;
         let tsc = synchronize_restored_tscs(partition, self.vps.len())?;
+        crate::spike::check_frozen_tscs(partition, self.vps.len(), tsc);
+        match crate::spike::tsc_mode() {
+            crate::spike::TscMode::Emulate => {}
+            crate::spike::TscMode::Native => return Ok(()),
+            crate::spike::TscMode::NativeResume => {
+                partition
+                    .resume_time()
+                    .for_op("resume restored partition time")?;
+                return Ok(());
+            }
+        }
         if self.caps.nested_virt {
             return Ok(());
         }
@@ -114,6 +128,9 @@ impl WhpPartitionInner {
                 .apic_frequency()
                 .for_op("get APIC clock frequency")?,
         };
+        if crate::spike::identity_enabled() && frequency != crate::spike::APIC_FREQUENCY_HZ {
+            tracing::error!(frequency, "spike: time ABI APIC frequency is not 200 MHz");
+        }
         Ok(Some(frequency))
     }
 }

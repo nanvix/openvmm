@@ -727,6 +727,12 @@ fn prepare_cold_boot_command_line(
     if restored_from_snapshot || cfg.machine_profile != MachineProfile::Microvm {
         return Ok(());
     }
+    // SPIKE (time ABI v1): the guest learns the TSC and LAPIC rates from the
+    // backend's Hyper-V frequency identity instead of command-line tokens.
+    if std::env::var("NVX_SPIKE_TIME_ABI").as_deref() == Ok("1") {
+        tracing::info!("spike: time ABI identity; not injecting clock command-line tokens");
+        return Ok(());
+    }
 
     let cmdline = match &mut cfg.load_mode {
         openvmm_defs::config::LoadMode::Linux {
