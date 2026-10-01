@@ -77,6 +77,9 @@ pub(super) struct MicrovmParameters {
     pub(super) snapshot_boundary: SnapshotBoundary,
     /// Whether this cold boot can publish a microVM snapshot.
     snapshot_capture_enabled: bool,
+    /// SPIKE: whether the backend presents the NVX time ABI v1 identity, so
+    /// the guest needs no clock command-line tokens.
+    time_abi_v1: bool,
 }
 
 impl MicrovmParameters {
@@ -93,9 +96,15 @@ impl MicrovmParameters {
             &parameters.cfg,
             Some(parameters.hypervisor.id()),
         )?;
+        let time_abi_v1 = parameters.hypervisor.id()
+            == <hypervisor_resources::MshvHandle as vm_resource::ResourceId<
+                hypervisor_resources::HypervisorKind,
+            >>::ID
+            && std::env::var("OPENVMM_MSHV_TIME_ABI").as_deref() != Ok("off");
         Ok(Self {
             snapshot_boundary,
             snapshot_capture_enabled,
+            time_abi_v1,
         })
     }
 
@@ -106,6 +115,9 @@ impl MicrovmParameters {
         vm: &mut InitializedVm,
         restored_from_snapshot: bool,
     ) -> anyhow::Result<()> {
+        if self.time_abi_v1 {
+            return reject_clock_command_line_tokens(&vm.cfg, restored_from_snapshot);
+        }
         prepare_cold_boot_command_line(
             &mut vm.cfg,
             vm.partition.as_ref(),
@@ -113,6 +125,22 @@ impl MicrovmParameters {
             self.snapshot_capture_enabled,
         )
     }
+}
+
+/// SPIKE (time ABI v1): the guest learns its TSC and LAPIC rates from the
+/// Hyper-V frequency MSRs, so a cold boot gets no `tsc_early_khz` or
+/// `lapic_timer_hz`, and a supplied one is an explicit error.
+fn reject_clock_command_line_tokens(
+    cfg: &Manifest,
+    restored_from_snapshot: bool,
+) -> anyhow::Result<()> {
+    if restored_from_snapshot || cfg.machine_profile != MachineProfile::Microvm {
+        return Ok(());
+    }
+    if let openvmm_defs::config::LoadMode::Linux { cmdline, .. } = &cfg.load_mode {
+        crate::worker::vm_loaders::microvm::reject_clock_tokens(cmdline)?;
+    }
+    Ok(())
 }
 
 /// A guest snapshot-boundary request, or the closure of the request channel.

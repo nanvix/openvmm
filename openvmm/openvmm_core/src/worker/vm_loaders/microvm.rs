@@ -210,6 +210,26 @@ pub(crate) fn propagate_apic_frequency(
     )?)
 }
 
+/// SPIKE (time ABI v1): rejects the clock tokens that the time ABI removes.
+/// Tokens after `--` belong to init and are ignored.
+pub(crate) fn reject_clock_tokens(cmdline: &str) -> anyhow::Result<()> {
+    let (tokens, _) = command_line_tokens(cmdline);
+    for (_, raw_token) in tokens {
+        let token = raw_token.trim_matches('"');
+        if token == "--" {
+            break;
+        }
+        let name = token.split_once('=').map_or(token, |(name, _value)| name);
+        for removed in [TSC_EARLY_KHZ, LAPIC_TIMER_HZ] {
+            anyhow::ensure!(
+                !linux_parameter_name_matches(name, removed),
+                "kernel command line contains {removed}, which the NVX time ABI v1 removes"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn propagate_frequency_parameter(
     cmdline: &mut String,
     parameter_name: &str,
@@ -302,6 +322,19 @@ mod tests {
     use test_with_tracing::test;
 
     const TSC_FREQUENCY_HZ: u64 = 2_500_000_999;
+
+    #[test]
+    fn time_abi_rejects_clock_tokens_before_init_arguments() {
+        reject_clock_tokens("console=hvc0 quiet -- tsc_early_khz=1 lapic_timer_hz=1").unwrap();
+        for cmdline in [
+            "console=hvc0 tsc_early_khz=2500000",
+            "lapic_timer_hz=200000000 quiet",
+            "lapic-timer-hz=200000000",
+            r#""tsc_early_khz=2500000""#,
+        ] {
+            reject_clock_tokens(cmdline).unwrap_err();
+        }
+    }
 
     #[test]
     fn propagates_backend_apic_frequency_without_changing_tsc_policy() {

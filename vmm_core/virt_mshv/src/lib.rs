@@ -207,6 +207,8 @@ impl<'a> MshvProtoPartition<'a> {
             config,
             #[cfg(guest_arch = "x86_64")]
             isolation: arch::MshvProtoPartitionIsolation::None,
+            #[cfg(guest_arch = "x86_64")]
+            time_abi: None,
             vmfd,
             vps,
             #[cfg(guest_arch = "aarch64")]
@@ -229,6 +231,9 @@ pub struct MshvProtoPartition<'a> {
     config: ProtoPartitionConfig<'a>,
     #[cfg(guest_arch = "x86_64")]
     isolation: arch::MshvProtoPartitionIsolation,
+    /// SPIKE: the NVX time ABI v1 guest view, when selected.
+    #[cfg(guest_arch = "x86_64")]
+    time_abi: Option<arch::time_abi::TimeAbiMode>,
     vmfd: VmFd,
     vps: Vec<MshvVpInner>,
     #[cfg(guest_arch = "aarch64")]
@@ -330,6 +335,10 @@ struct MshvPartitionInner {
     software_devices: virt::x86::apic_software_device::ApicSoftwareDevices,
     #[inspect(skip)]
     isolation: MshvIsolationState,
+    /// SPIKE: NVX time ABI v1 state, when the partition presents it.
+    #[cfg(guest_arch = "x86_64")]
+    #[inspect(skip)]
+    time_abi: Option<arch::time_abi::TimeAbiState>,
     /// Set to `true` when partition time is frozen (e.g. during reset).
     /// The first VP to enter `run_vp` after a freeze will thaw time.
     time_frozen: Mutex<bool>,
@@ -823,6 +832,15 @@ enum ErrorInner {
         vp_index: u32,
         #[source]
         error: KernelError,
+    },
+    #[cfg(guest_arch = "x86_64")]
+    #[error(
+        "restored VP {vp_index} TSC read back {observed:#x} instead of the frozen target {expected:#x}"
+    )]
+    TscReadback {
+        vp_index: u32,
+        expected: u64,
+        observed: u64,
     },
     #[cfg(guest_arch = "x86_64")]
     #[error("failed to get VP state {ty}")]

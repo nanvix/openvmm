@@ -20,10 +20,13 @@ use x86defs::cpuid::CpuidFunction;
 /// Returns the processor features (bank 1) to expose: the supported features
 /// without the TSC deadline timer, and without TSC_ADJUST for a versioned CPU
 /// contract.
+///
+/// SPIKE (time ABI v1): a versioned CPU contract also hides APERF/MPERF.
 fn supported_features1(versioned_cpu_contract: bool) -> hvdef::HvX64PartitionProcessorFeatures1 {
     super::supported_processor_features1()
         .with_tsc_deadline_tmr_support(false)
         .with_tsc_adjust_support(!versioned_cpu_contract)
+        .with_a_count_m_count_support(!versioned_cpu_contract)
 }
 
 /// Applies [`supported_features1`] to the partition creation arguments.
@@ -85,12 +88,22 @@ impl MshvPartitionInner {
             }
             .into());
         }
+        if let Some(time_abi) = &self.time_abi {
+            // TSC_FREQUENCY returns the snapshot's rate, never the
+            // destination's.
+            time_abi
+                .tsc_frequency_hz
+                .store(frequency_hz, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(())
     }
 
     /// Aligns the restored counters of the created application processors to
     /// the advanced BSP counter.
     pub(super) fn advance_snapshot_time(&self) -> Result<(), Error> {
+        if self.time_abi.is_some() {
+            return self.synchronize_time_abi_tscs();
+        }
         let aps = created_aps(
             self.vps
                 .iter()
@@ -118,6 +131,58 @@ impl MshvPartitionInner {
                 .get_partition_property(HvPartitionPropertyCode::ApicFrequency.0)
                 .map_err(|error| ErrorInner::GetPartitionProperty(error.into()))?,
         ))
+    }
+
+    /// SPIKE (time ABI v1): freezes partition time, writes one TSC value to
+    /// every created VP, and verifies it by read-back. The first VP run thaws
+    /// time, so every VP resumes from the same counter at one host instant.
+    ///
+    /// The target is the BSP counter, which the common restore path has
+    /// already advanced to `TSC_capture_bsp + D * F_s / 1e9`. VPs past a
+    /// restore-time prefix are never created by this process, so they are
+    /// neither written nor run.
+    fn synchronize_time_abi_tscs(&self) -> Result<(), Error> {
+        let started = std::time::Instant::now();
+        self.freeze_time()?;
+        let frozen = started.elapsed();
+        let created: Vec<u32> = self
+            .vps
+            .iter()
+            .enumerate()
+            .filter(|(_, vp)| vp.created.load(std::sync::atomic::Ordering::Acquire))
+            .map(|(vp_index, _)| vp_index as u32)
+            .collect();
+        let target = get_vp_tsc(&self.vmfd, 0)?;
+        for &vp_index in &created {
+            set_vp_tsc(&self.vmfd, vp_index, target)?;
+        }
+        let written = started.elapsed();
+        let mut mismatch = None;
+        for &vp_index in &created {
+            let observed = get_vp_tsc(&self.vmfd, vp_index)?;
+            if observed != target && mismatch.is_none() {
+                mismatch = Some((vp_index, observed));
+            }
+        }
+        tracing::info!(
+            created_vps = created.len(),
+            vp_capacity = self.vps.len(),
+            target_tsc = target,
+            readback_equal = mismatch.is_none(),
+            freeze_us = frozen.as_micros() as u64,
+            write_us = (written - frozen).as_micros() as u64,
+            total_us = started.elapsed().as_micros() as u64,
+            "time ABI: restored TSCs written and read back while partition time is frozen"
+        );
+        if let Some((vp_index, observed)) = mismatch {
+            return Err(ErrorInner::TscReadback {
+                vp_index,
+                expected: target,
+                observed,
+            }
+            .into());
+        }
+        Ok(())
     }
 }
 
@@ -177,6 +242,89 @@ fn synchronize_restored_tscs(vmfd: &VmFd, bsp: &VcpuFd, aps: &[u32]) -> Result<(
         }
     }
     Ok(())
+}
+
+/// Writes the TSC of a created VP through `HvCallSetVpRegisters`.
+fn set_vp_tsc(vmfd: &VmFd, vp_index: u32, tsc: u64) -> Result<(), Error> {
+    #[repr(C)]
+    struct SetTsc {
+        header: hvdef::hypercall::GetSetVpRegisters,
+        register: HvRegisterAssoc,
+    }
+
+    let input = SetTsc {
+        header: hvdef::hypercall::GetSetVpRegisters {
+            partition_id: 0,
+            vp_index,
+            target_vtl: hvdef::hypercall::HvInputVtl::CURRENT_VTL,
+            rsvd: [0; 3],
+        },
+        register: HvRegisterAssoc::from((HvX64RegisterName::Tsc, tsc)),
+    };
+    let mut args = mshv_bindings::mshv_root_hvcall {
+        code: hvdef::HypercallCode::HvCallSetVpRegisters.0,
+        in_sz: size_of::<SetTsc>() as u16,
+        in_ptr: std::ptr::addr_of!(input) as u64,
+        reps: 1,
+        ..Default::default()
+    };
+    vmfd.hvcall(&mut args)
+        .map_err(|error| ErrorInner::SynchronizeTsc {
+            vp_index,
+            error: error.into(),
+        })?;
+    if args.reps != 1 {
+        return Err(ErrorInner::SynchronizeTsc {
+            vp_index,
+            error: KernelError::Kernel(std::io::Error::from_raw_os_error(libc::EINTR)),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Reads the TSC of a created VP through `HvCallGetVpRegisters`.
+fn get_vp_tsc(vmfd: &VmFd, vp_index: u32) -> Result<u64, Error> {
+    #[repr(C)]
+    struct GetTsc {
+        header: hvdef::hypercall::GetSetVpRegisters,
+        name: u32,
+        pad: u32,
+    }
+
+    let input = GetTsc {
+        header: hvdef::hypercall::GetSetVpRegisters {
+            partition_id: 0,
+            vp_index,
+            target_vtl: hvdef::hypercall::HvInputVtl::CURRENT_VTL,
+            rsvd: [0; 3],
+        },
+        name: hvdef::HvRegisterName::from(HvX64RegisterName::Tsc).0,
+        pad: 0,
+    };
+    let mut output = [0u64; 2];
+    let mut args = mshv_bindings::mshv_root_hvcall {
+        code: hvdef::HypercallCode::HvCallGetVpRegisters.0,
+        in_sz: (size_of::<hvdef::hypercall::GetSetVpRegisters>() + size_of::<u32>()) as u16,
+        in_ptr: std::ptr::addr_of!(input) as u64,
+        out_sz: size_of_val(&output) as u16,
+        out_ptr: output.as_mut_ptr() as u64,
+        reps: 1,
+        ..Default::default()
+    };
+    vmfd.hvcall(&mut args)
+        .map_err(|error| ErrorInner::SynchronizeTsc {
+            vp_index,
+            error: error.into(),
+        })?;
+    if args.reps != 1 {
+        return Err(ErrorInner::SynchronizeTsc {
+            vp_index,
+            error: KernelError::Kernel(std::io::Error::from_raw_os_error(libc::EINTR)),
+        }
+        .into());
+    }
+    Ok(output[0])
 }
 
 #[cfg(test)]

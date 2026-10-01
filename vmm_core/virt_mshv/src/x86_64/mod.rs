@@ -5,6 +5,7 @@
 
 mod extint;
 pub(crate) mod finalize;
+pub(crate) mod time_abi;
 mod tsc;
 mod vm_state;
 mod vp_state;
@@ -134,6 +135,14 @@ impl virt::Hypervisor for LinuxMshv {
 
         let vmfd = create_vm_with_retry(&self.mshv, &create_args)?;
 
+        // SPIKE: NVX time ABI v1 for non-isolated microVM partitions.
+        let time_abi = time_abi::TimeAbiMode::select(
+            config.versioned_cpu_contract,
+            config.hv_config.is_some(),
+            snp,
+        );
+        tracing::info!(?time_abi, "MSHV time ABI selection");
+
         // Set synthetic processor features before initialization when the
         // guest interface is configured. SNP partitions require the smaller
         // early-property feature set accepted by the hypervisor.
@@ -153,10 +162,22 @@ impl virt::Hypervisor for LinuxMshv {
                 u64::from(synthetic_features),
             )
             .map_err(|e| ErrorInner::SetPartitionProperty(e.into()))?;
+        } else if let Some(synthetic_features) =
+            time_abi.as_ref().and_then(|mode| mode.synthetic_features())
+        {
+            vmfd.set_partition_property(
+                HvPartitionPropertyCode::SyntheticProcFeatures.0,
+                u64::from(synthetic_features),
+            )
+            .map_err(|e| ErrorInner::SetPartitionProperty(e.into()))?;
         }
 
         vmfd.initialize()
             .map_err(|e| ErrorInner::CreateVMInitFailed(e.into()))?;
+
+        if let Some(mode) = &time_abi {
+            time_abi::install_msr_intercepts(&vmfd, mode)?;
+        }
 
         if snp {
             let snp_policy = igvm_snp_config.as_ref().map_or_else(
@@ -218,6 +239,7 @@ impl virt::Hypervisor for LinuxMshv {
         };
         let mut proto = MshvProtoPartition::new(config, vmfd)?;
         proto.isolation = isolation;
+        proto.time_abi = time_abi;
         Ok(proto)
     }
 }
@@ -482,10 +504,33 @@ impl ProtoPartition for MshvProtoPartition<'_> {
                 cpuid.extend(snp_hv_cpuid_overrides(native_max_leaf));
             }
         }
-        let cpuid = tsc::add_cpuid_leaves(&self.vmfd, cpuid)?;
+        let mut cpuid = tsc::add_cpuid_leaves(&self.vmfd, cpuid)?;
+        let time_abi_state = match self.time_abi {
+            Some(mode) => {
+                cpuid.extend(time_abi::cpuid_leaves(
+                    self.config.processor_topology.vp_count(),
+                    mode.leaves,
+                ));
+                let tsc_frequency_hz = self
+                    .vmfd
+                    .get_partition_property(HvPartitionPropertyCode::ProcessorClockFrequency.0)
+                    .map_err(|e| ErrorInner::GetPartitionProperty(e.into()))?;
+                let apic_frequency_hz = self
+                    .vmfd
+                    .get_partition_property(HvPartitionPropertyCode::ApicFrequency.0)
+                    .map_err(|e| ErrorInner::GetPartitionProperty(e.into()))?;
+                Some(time_abi::TimeAbiState::new(
+                    mode,
+                    tsc_frequency_hz,
+                    apic_frequency_hz,
+                ))
+            }
+            None => None,
+        };
         let cpuid = virt::CpuidLeafSet::new(cpuid);
 
         // Apply CPUID overrides partition-wide.
+        let cpuid_started = std::time::Instant::now();
         for leaf in cpuid.leaves().iter() {
             let input = hvdef::hypercall::RegisterInterceptResultCpuid {
                 partition_id: 0,
@@ -522,6 +567,12 @@ impl ProtoPartition for MshvProtoPartition<'_> {
                 .hvcall(&mut args)
                 .map_err(|e| ErrorInner::RegisterCpuid(e.into()))?;
         }
+        tracing::info!(
+            leaves = cpuid.leaves().len(),
+            elapsed_us = cpuid_started.elapsed().as_micros() as u64,
+            time_abi = ?time_abi_state.as_ref().map(|state| state.mode),
+            "registered MSHV CPUID overrides"
+        );
 
         let apic_id_map = self
             .config
@@ -556,6 +607,7 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             config: finalize::CreationConfig::new(cpuid, &self.config),
             software_devices: ApicSoftwareDevices::new(apic_id_map),
             isolation,
+            time_abi: time_abi_state,
             // SNP partition creation set TimeFreeze=1 before this object was built.
             time_frozen: Mutex::new(time_frozen),
         });
@@ -919,6 +971,9 @@ impl MshvProcessor<'_> {
             }
             HvMessageType::HvMessageTypeX64InterruptionDeliverable => {
                 self.handle_interrupt_deliverable(exit, dev);
+            }
+            HvMessageType::HvMessageTypeMsrIntercept => {
+                self.handle_time_abi_msr_intercept(exit);
             }
             exit_type => {
                 panic!("Unhandled vcpu exit code {exit_type:?}");
