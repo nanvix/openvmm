@@ -2,9 +2,8 @@
 // Licensed under the MIT License.
 
 //! CPUID policy for the CPU compatibility contract: the fixed TSC frequency
-//! and CPUID exits of a versioned CPU contract, the hidden TSC-deadline timer,
-//! the per-VP topology results returned on CPUID exits, and hiding the L0 GPA
-//! pinning enlightenment.
+//! and CPUID exits of a versioned CPU contract, the per-VP topology results
+//! returned on CPUID exits, and hiding the L0 GPA pinning enlightenment.
 
 use crate::Error;
 use crate::WhpProcessor;
@@ -30,18 +29,6 @@ pub(crate) fn mask_gpa_pinning_enlightenment() -> virt::CpuidLeaf {
         (mask >> 64) as u32,
         (mask >> 96) as u32,
     ])
-}
-
-/// Hides the TSC-deadline timer from a versioned CPU contract, as MSHV does.
-///
-/// A LAPIC in TSC-deadline mode has no periodic mode, so Linux would emulate a
-/// periodic tick with deadline one-shots that snapshot capture cannot tell
-/// apart from a one-shot tick. Without it, a periodic tick uses the LAPIC
-/// timer's periodic mode, which capture detects and rejects. The versioned
-/// contract routes this leaf to the VMM with a CPUID exit.
-pub(crate) fn hide_tsc_deadline_timer() -> virt::CpuidLeaf {
-    let mask = x86defs::cpuid::VersionAndFeaturesEcx::new().with_tsc_deadline_tmr(true);
-    virt::CpuidLeaf::new(CpuidFunction::VersionAndFeatures.0, [0; 4]).masked([0, 0, mask.into(), 0])
 }
 
 /// Sets the fixed TSC frequency of a versioned CPU contract and routes the
@@ -150,23 +137,7 @@ impl WhpProcessor<'_> {
 #[cfg(test)]
 mod tests {
     use super::fixup_extended_topology;
-    use super::hide_tsc_deadline_timer;
     use super::mask_gpa_pinning_enlightenment;
-
-    #[test]
-    fn versioned_contract_hides_only_the_tsc_deadline_timer() {
-        let ecx = x86defs::cpuid::VersionAndFeaturesEcx::new()
-            .with_tsc_deadline_tmr(true)
-            .with_x2_apic(true);
-        let mut result = [1, 2, ecx.into(), 4];
-
-        hide_tsc_deadline_timer().apply(&mut result);
-
-        let ecx = x86defs::cpuid::VersionAndFeaturesEcx::from(result[2]);
-        assert!(!ecx.tsc_deadline_tmr());
-        assert!(ecx.x2_apic());
-        assert_eq!([result[0], result[1], result[3]], [1, 2, 4]);
-    }
 
     #[test]
     fn l0_gpa_pinning_enlightenment_is_not_exposed() {

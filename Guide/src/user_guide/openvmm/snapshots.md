@@ -124,11 +124,14 @@ OpenVMM enforces the part of the contract that it can observe. After it stops
 the vCPUs at the capture boundary, and before any state unit quiesces, it
 rejects the capture if a vCPU's LAPIC timer is unmasked, periodic, and has a
 nonzero initial count. The boundary is released, and the guest continues.
-Versioned MSHV and WHP CPU contracts hide the TSC-deadline timer, so Linux
-drives a periodic tick with the LAPIC timer's periodic mode, which OpenVMM
-detects, rather than with deadline one-shots. WHP snapshots captured before the
-TSC-deadline timer was hidden have a different CPU contract and must be
-recaptured.
+MSHV hides the TSC-deadline timer because that backend does not reliably
+deliver its events, so OpenVMM can directly observe every periodic Linux tick
+there. WHP retains TSC-deadline support: forcing its counting LAPIC timer can
+lose periodic ticks during ordinary host descheduling and make Linux reject
+`tsc-early` before capture. Linux can emulate a periodic tick with deadline
+one-shots that OpenVMM cannot distinguish from a true one-shot tick, so the
+guest-side check is authoritative for that WHP state. OpenVMM's rejection still
+protects WHP guests that use the LAPIC timer's periodic mode.
 
 Reads of the snapshot port (`0x605`) report the outcome of the last completed
 request in the first byte and read the remaining bytes as zero:
