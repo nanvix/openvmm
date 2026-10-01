@@ -447,6 +447,97 @@ mod imp {
         println!("HOSTSKEW max_abs_ns={worst:.1}");
     }
 
+    /// Times each partition property that the time-ABI identity sets, to
+    /// attribute its partition-creation cost.
+    fn props() {
+        fn timed<T>(label: &str, f: impl FnOnce() -> T) -> T {
+            let start = Instant::now();
+            let r = f();
+            println!("PROP {label} us={:.1}", start.elapsed().as_secs_f64() * 1e6);
+            r
+        }
+        let topology_leaves: [u32; 13] = [
+            0,
+            1,
+            4,
+            6,
+            7,
+            0xa,
+            0xb,
+            0x15,
+            0x16,
+            0x1f,
+            0x8000_0007,
+            0x8000_0008,
+            0x8000_001e,
+        ];
+        for round in 0..3 {
+            println!("ROUND {round}");
+            for exit_list_len in [8usize, 13, 13 + 6, 13 + 256] {
+                let mut config = timed("PartitionConfig::new", || {
+                    whp::PartitionConfig::new().unwrap()
+                });
+                config
+                    .set_property(whp::PartitionProperty::ProcessorCount(1))
+                    .unwrap();
+                let mut list: Vec<u32> = topology_leaves.to_vec();
+                list.extend(0x4000_0000..=0x4000_00ffu32);
+                list.truncate(exit_list_len);
+                timed(&format!("ExtendedVmExits"), || {
+                    config
+                        .set_property(whp::PartitionProperty::ExtendedVmExits(
+                            whp::abi::WHV_EXTENDED_VM_EXITS::X64CpuidExit
+                                | whp::abi::WHV_EXTENDED_VM_EXITS::X64MsrExit,
+                        ))
+                        .map(drop)
+                })
+                .unwrap();
+                timed(&format!("CpuidExitList len={exit_list_len}"), || {
+                    config
+                        .set_property(whp::PartitionProperty::CpuidExitList(&list))
+                        .map(drop)
+                })
+                .unwrap();
+                let features = whp::capabilities::processor_features().unwrap();
+                let mut cleared = features;
+                cleared.bank1 &= !(whp::abi::WHV_PROCESSOR_FEATURES1::TscDeadlineTmrSupport
+                    | whp::abi::WHV_PROCESSOR_FEATURES1::TscAdjustSupport
+                    | whp::abi::WHV_PROCESSOR_FEATURES1::ACountMCountSupport);
+                timed("ProcessorFeatures(banks)", || {
+                    config
+                        .set_property(whp::PartitionProperty::ProcessorFeatures(cleared))
+                        .map(drop)
+                })
+                .unwrap();
+                timed("X64MsrExitBitmap", || {
+                    config
+                        .set_property(whp::PartitionProperty::X64MsrExitBitmap(
+                            whp::abi::WHV_X64_MSR_EXIT_BITMAP::UnhandledMsrs,
+                        ))
+                        .map(drop)
+                })
+                .unwrap();
+                let r = timed("InterruptClockFrequency(200MHz) [fails]", || {
+                    config
+                        .set_property(whp::PartitionProperty::InterruptClockFrequency(200_000_000))
+                        .map(drop)
+                });
+                println!("PROP InterruptClockFrequency result={r:?}");
+                let r = timed("ProcessorClockFrequency(1GHz)", || {
+                    config
+                        .set_property(whp::PartitionProperty::ProcessorClockFrequency(
+                            1_000_000_000,
+                        ))
+                        .map(drop)
+                });
+                println!("PROP ProcessorClockFrequency result={r:?}");
+                let partition = timed("WHvSetupPartition", || config.create().unwrap());
+                timed("create_vp", || partition.create_vp(0).create().unwrap());
+                timed("delete partition", || drop(partition));
+            }
+        }
+    }
+
     /// Writes per-VP TSC values while time runs, like the generic restore
     /// path, then aligns them with partition time suspended.
     fn restore_like(vm: &Vm) -> u64 {
@@ -465,6 +556,10 @@ mod imp {
     pub fn main() {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let scenario = args.first().cloned().unwrap_or_else(|| "cold".into());
+        if scenario == "props" {
+            props();
+            return;
+        }
         let o = parse(&args[1.min(args.len())..]);
         let hz = whp::capabilities::processor_clock_frequency().unwrap();
         println!(

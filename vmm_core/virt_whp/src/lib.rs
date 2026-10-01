@@ -1171,6 +1171,7 @@ impl WhpPartitionInner {
                 apic_frequency = ?vtl0.whp.apic_frequency(),
                 "spike: time ABI partition clocks"
             );
+            spike::check_native_hypervisor_leaves(|function, index| vtl0.cpuid(function, index));
         }
 
         // FUTURE: register cpuid results with the hypervisor, and register

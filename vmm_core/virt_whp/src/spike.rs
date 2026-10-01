@@ -9,7 +9,7 @@
 //!   SMP partitions keep their TSCs synchronized.
 //! - `NVX_SPIKE_TIME_ABI=1` serves the minimal Hyper-V frequency and
 //!   invariant-TSC identity from OpenVMM, pins the CPUID time bits, removes
-//!   the fixed 1 GHz TSC request, and pins the offloaded APIC at 200 MHz.
+//!   the fixed 1 GHz TSC request, and verifies the offloaded APIC runs at 200 MHz.
 
 use crate::Error;
 use crate::WhpResultExt;
@@ -161,8 +161,8 @@ pub(crate) fn identity_cpuid_leaves(vp_capacity: u32) -> Vec<virt::CpuidLeaf> {
 }
 
 /// Configures a time-ABI partition: CPUID exits for the topology, clock,
-/// identity, and time-bit leaves; time feature banks; unhandled-MSR exits; and
-/// the 200 MHz APIC. Unlike the versioned contract, the TSC runs at the
+/// identity, and time-bit leaves; time feature banks; and unhandled-MSR exits.
+/// Unlike the versioned contract, the TSC runs at the
 /// host-native rate.
 pub(crate) fn configure_identity_partition(
     whp_config: &mut whp::PartitionConfig,
@@ -184,7 +184,11 @@ pub(crate) fn configure_identity_partition(
         CpuidFunction::ExtendedAddressSpaceSizes.0,
         CpuidFunction::ProcessorTopologyDefinition.0,
     ];
-    exit_list.extend(0x4000_0000..=0x4000_00ff);
+    // Only the identity leaves exit: each exit-list entry costs about 25 us of
+    // WHvSetupPartition, and WHP returns zeros natively for the rest of
+    // 0x40000000..=0x400000ff when synthetic features are off (checked after
+    // partition creation by `check_native_hypervisor_leaves`).
+    exit_list.extend(0x4000_0000..=0x4000_0005);
     whp_config
         .set_property(whp::PartitionProperty::CpuidExitList(&exit_list))
         .for_op("set time ABI CPUID exits")?;
@@ -226,17 +230,35 @@ pub(crate) fn configure_identity_partition(
         ))
         .for_op("set time ABI MSR exits")?;
 
-    let result = whp_config
-        .set_property(whp::PartitionProperty::InterruptClockFrequency(
-            APIC_FREQUENCY_HZ,
-        ))
-        .map(drop);
+    // WHP does not support setting the APIC rate (ERROR_NOT_SUPPORTED); the
+    // partition's rate is verified against 200 MHz after creation instead.
     tracing::info!(
         capability = ?whp::capabilities::interrupt_clock_frequency(),
-        ?result,
-        "spike: time ABI APIC frequency pin"
+        "spike: time ABI APIC frequency capability"
     );
     Ok(())
+}
+
+/// Checks that WHP returns zeros natively for every hypervisor leaf the
+/// identity does not intercept (`NVX_SPIKE_TIME_ABI_CHECK=1`; about 256
+/// CPUID queries, so off for performance runs).
+pub(crate) fn check_native_hypervisor_leaves(cpuid: impl Fn(u32, u32) -> [u32; 4]) {
+    if std::env::var("NVX_SPIKE_TIME_ABI_CHECK").as_deref() != Ok("1") {
+        return;
+    }
+    let nonzero: Vec<(u32, [u32; 4])> = (0x4000_0006..=0x4000_00ffu32)
+        .chain([0x4000_0100, 0x4000_0200, 0x4001_0000])
+        .map(|function| (function, cpuid(function, 0)))
+        .filter(|(_, result)| *result != [0; 4])
+        .collect();
+    if nonzero.is_empty() {
+        tracing::info!("spike: native hypervisor leaves outside the identity are zero");
+    } else {
+        tracing::error!(
+            ?nonzero,
+            "spike: native nonzero hypervisor leaves are not intercepted"
+        );
+    }
 }
 
 /// Reads an identity MSR. `None` leaves the MSR to the existing handlers.
