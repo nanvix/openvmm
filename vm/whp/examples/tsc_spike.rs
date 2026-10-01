@@ -724,6 +724,71 @@ mod imp {
                 report("voffset-after", &measure(&vm, o.samples, &mut seq), hz);
                 vm.stop();
             }
+            "rate" => {
+                // Long-run rate of a VP's live TSC against host UTC and host
+                // monotonic time: least-squares slope, deviation from the
+                // declared rate, and residuals.
+                let mut vm = Vm::new(1);
+                vm.start_all(&o);
+                let start = Instant::now();
+                let mut points: Vec<(f64, f64, f64)> = Vec::new();
+                let mut next = Duration::ZERO;
+                while start.elapsed() <= Duration::from_secs(o.duration_s) {
+                    if start.elapsed() >= next {
+                        let mut best = (u64::MAX, 0u64, 0f64, 0f64);
+                        for _ in 0..200 {
+                            seq = seq.wrapping_add(1).max(1);
+                            if seq == STOP {
+                                seq = 1;
+                            }
+                            let mono = start.elapsed().as_secs_f64();
+                            let utc = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs_f64();
+                            let (h0, h1, g) = ping(&vm, 0, seq).expect("vp answers");
+                            if h1 - h0 < best.0 {
+                                best = (h1 - h0, g, utc, mono);
+                            }
+                        }
+                        points.push((best.2, best.3, best.1 as f64));
+                        next += Duration::from_millis(o.interval_ms);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                vm.stop();
+                fn fit(points: &[(f64, f64)]) -> (f64, f64) {
+                    let n = points.len() as f64;
+                    let (sx, sy) = points
+                        .iter()
+                        .fold((0.0, 0.0), |(a, b), (x, y)| (a + x, b + y));
+                    let (mx, my) = (sx / n, sy / n);
+                    let (num, den) = points.iter().fold((0.0, 0.0), |(a, b), (x, y)| {
+                        (a + (x - mx) * (y - my), b + (x - mx) * (x - mx))
+                    });
+                    let slope = num / den;
+                    let max_residual_s = points
+                        .iter()
+                        .map(|(x, y)| ((y - my) - slope * (x - mx)).abs() / slope)
+                        .fold(0.0, f64::max);
+                    (slope, max_residual_s)
+                }
+                let t0 = points[0];
+                let utc: Vec<(f64, f64)> =
+                    points.iter().map(|p| (p.0 - t0.0, p.2 - t0.2)).collect();
+                let mono: Vec<(f64, f64)> =
+                    points.iter().map(|p| (p.1 - t0.1, p.2 - t0.2)).collect();
+                for (label, series) in [("utc", &utc), ("monotonic", &mono)] {
+                    let (slope, residual) = fit(series);
+                    println!(
+                        "RATE vs={label} samples={} span_s={:.1} tsc_hz={slope:.1} declared_hz={hz} deviation_ppm={:.3} max_residual_us={:.2}",
+                        series.len(),
+                        series.last().unwrap().0,
+                        (slope - hz as f64) / hz as f64 * 1e6,
+                        residual * 1e6
+                    );
+                }
+            }
             "drift" => {
                 let mut vm = Vm::new(o.vps);
                 restore_like(&vm);
