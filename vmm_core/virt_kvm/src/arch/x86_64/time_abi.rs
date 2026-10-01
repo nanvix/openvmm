@@ -254,6 +254,8 @@ impl KvmPartitionInner {
             Some(tsc) => tsc,
             None => *self.bsp().restored_tsc.lock(),
         };
+        let saved: Vec<u64> = self.vps.iter().map(|vp| *vp.restored_tsc.lock()).collect();
+        let saved_spread = saved.iter().max().unwrap() - saved.iter().min().unwrap();
         let vps: Vec<_> = self
             .vps
             .iter()
@@ -333,9 +335,20 @@ impl KvmPartitionInner {
             downtime_ns = downtime.as_nanos() as u64,
             cycles,
             target,
+            host_tsc,
             offset = format_args!("{offset:#x}"),
             before = ?before.iter().map(|o| format!("{o:#x}")).collect::<Vec<_>>(),
             before_equal = before.iter().all(|o| *o == before[0]),
+            // Guest TSC implied by the offsets that KVM derived from the
+            // restored IA32_TSC writes, minus the saved BSP TSC, at the
+            // sampling instant. Small and positive when KVM honored the
+            // writes; about -capture_tsc when KVM matched them to the
+            // vCPU-creation generation instead.
+            before_minus_capture_cycles = ?before
+                .iter()
+                .map(|o| host_tsc.wrapping_add(*o).wrapping_sub(capture_tsc) as i64)
+                .collect::<Vec<_>>(),
+            saved_tsc_spread_cycles = saved_spread,
             sample_window_cycles = h1 - h0,
             set_us = set_elapsed.as_micros() as u64,
             max_readback_window_cycles = max_bracket,
