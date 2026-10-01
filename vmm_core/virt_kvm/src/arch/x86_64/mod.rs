@@ -1141,7 +1141,14 @@ impl virt::BindProcessor for KvmProcessorBinder {
                     // HV_X64_MSR_TSC_INVARIANT_CONTROL. The filter delivers the
                     // guest's write to OpenVMM, so enable KVM's copy from the
                     // host. Host-initiated writes bypass the filter.
-                    if let Err(err) =
+                    //
+                    // SPIKE: NVX_SPIKE_KVM_NO_INVTSC_HOST_WRITE=1 skips the
+                    // write to demonstrate the suppression.
+                    let skip =
+                        std::env::var("NVX_SPIKE_KVM_NO_INVTSC_HOST_WRITE").is_ok_and(|v| v == "1");
+                    if skip {
+                        tracing::warn!("time abi: skipping KVM's invariant TSC control write");
+                    } else if let Err(err) =
                         kvm.set_msrs(&[(time_abi::HV_X64_MSR_TSC_INVARIANT_CONTROL, 1)])
                     {
                         tracing::warn!(
