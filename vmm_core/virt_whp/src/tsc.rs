@@ -129,7 +129,11 @@ impl WhpPartitionInner {
                 .for_op("get APIC clock frequency")?,
         };
         if crate::spike::identity_enabled() && frequency != crate::spike::APIC_FREQUENCY_HZ {
-            tracing::error!(frequency, "spike: time ABI APIC frequency is not 200 MHz");
+            tracing::error!(
+                target: "virt_whp::spike",
+                frequency,
+                "spike: time ABI APIC frequency is not 200 MHz"
+            );
         }
         Ok(Some(frequency))
     }

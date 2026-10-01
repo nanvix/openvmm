@@ -1166,6 +1166,7 @@ impl WhpPartitionInner {
         #[cfg(guest_arch = "x86_64")]
         if time_identity {
             tracing::info!(
+                target: "virt_whp::spike",
                 tsc_frequency,
                 apic_frequency = ?vtl0.whp.apic_frequency(),
                 "spike: time ABI partition clocks"

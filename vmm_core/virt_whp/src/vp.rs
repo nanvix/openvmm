@@ -1150,6 +1150,16 @@ mod x86 {
             }
 
             self.fixup_topology_cpuid(function, index, &mut default);
+            if (0x4000_0000..=0x4000_00ff).contains(&function) && crate::spike::identity_enabled() {
+                tracing::debug!(
+                    target: "virt_whp::spike",
+                    vp = self.vp.index.index(),
+                    function = format_args!("{function:#x}"),
+                    index,
+                    result = format_args!("{default:x?}"),
+                    "spike: identity CPUID exit"
+                );
+            }
             let [eax, ebx, ecx, edx] = default;
 
             if self.vp.partition.vtl2_emulation.is_some() && self.state.active_vtl == Vtl::Vtl0 {

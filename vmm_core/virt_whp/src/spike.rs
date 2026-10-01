@@ -248,13 +248,20 @@ pub(crate) fn identity_msr_read(
     if !identity_enabled() || !(0x4000_0000..=0x4000_01ff).contains(&msr) {
         return None;
     }
-    Some(match msr {
+    let result = match msr {
         MSR_VP_INDEX => Ok(vp_index.into()),
         MSR_TSC_FREQUENCY => Ok(tsc_frequency_hz),
         MSR_APIC_FREQUENCY => Ok(APIC_FREQUENCY_HZ),
         MSR_TSC_INVARIANT_CONTROL => Ok(TSC_INVARIANT_CONTROL.load(Ordering::Relaxed)),
         _ => Err(MsrError::Unknown),
-    })
+    };
+    tracing::debug!(
+        vp_index,
+        msr = format_args!("{msr:#x}"),
+        ?result,
+        "spike: identity MSR read"
+    );
+    Some(result)
 }
 
 /// Writes an identity MSR. `None` leaves the MSR to the existing handlers.
@@ -262,14 +269,20 @@ pub(crate) fn identity_msr_write(msr: u32, value: u64) -> Option<Result<(), MsrE
     if !identity_enabled() || !(0x4000_0000..=0x4000_01ff).contains(&msr) {
         return None;
     }
-    Some(match (msr, value) {
+    let result = match (msr, value) {
         (MSR_TSC_INVARIANT_CONTROL, 0 | 1) => {
             TSC_INVARIANT_CONTROL.store(value, Ordering::Relaxed);
-            tracing::info!(value, "spike: guest wrote TSC_INVARIANT_CONTROL");
             Ok(())
         }
         _ => Err(MsrError::InvalidAccess),
-    })
+    };
+    tracing::info!(
+        msr = format_args!("{msr:#x}"),
+        value,
+        ?result,
+        "spike: identity MSR write"
+    );
+    Some(result)
 }
 
 #[cfg(test)]
