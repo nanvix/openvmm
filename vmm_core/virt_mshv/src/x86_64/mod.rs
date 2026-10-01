@@ -509,7 +509,7 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             Some(mode) => {
                 cpuid.extend(time_abi::cpuid_leaves(
                     self.config.processor_topology.vp_count(),
-                    mode.leaves,
+                    &mode,
                 ));
                 let tsc_frequency_hz = self
                     .vmfd

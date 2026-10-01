@@ -77,7 +77,8 @@ pub(crate) enum MsrRouting {
 pub(crate) enum LeafCoverage {
     /// Override every leaf of the range, zeroing the unlisted ones.
     All,
-    /// Override only the ABI leaves.
+    /// Override only the ABI leaves. Without synthetic processor features the
+    /// hypervisor reports no `0x400000xx` leaves, so the others read as zero.
     Abi,
 }
 
@@ -86,6 +87,9 @@ pub(crate) enum LeafCoverage {
 pub(crate) struct TimeAbiMode {
     pub routing: MsrRouting,
     pub leaves: LeafCoverage,
+    /// Sets CPUID.80000007H:EDX[8] even when the hypervisor does not expose
+    /// an invariant TSC to child partitions (Azure nested MSHV).
+    pub force_invariant_tsc: bool,
 }
 
 impl TimeAbiMode {
@@ -105,10 +109,17 @@ impl TimeAbiMode {
             _ => MsrRouting::Intercept,
         };
         let leaves = match std::env::var("OPENVMM_MSHV_TIME_ABI_LEAVES").as_deref() {
-            Ok("abi") => LeafCoverage::Abi,
-            _ => LeafCoverage::All,
+            Ok("all") => LeafCoverage::All,
+            _ if routing == MsrRouting::Native => LeafCoverage::All,
+            _ => LeafCoverage::Abi,
         };
-        Some(Self { routing, leaves })
+        let force_invariant_tsc =
+            std::env::var("OPENVMM_MSHV_TIME_ABI_INVTSC").as_deref() == Ok("force");
+        Some(Self {
+            routing,
+            leaves,
+            force_invariant_tsc,
+        })
     }
 
     /// Returns the synthetic processor features to set before the partition
@@ -156,9 +167,9 @@ pub(crate) fn msr_index_intercept(msr: u32) -> mshv_bindings::mshv_install_inter
 
 /// Returns the CPUID results of the time ABI: the hypervisor identity leaves
 /// and the time-related feature bits.
-pub(crate) fn cpuid_leaves(vp_capacity: u32, coverage: LeafCoverage) -> Vec<virt::CpuidLeaf> {
+pub(crate) fn cpuid_leaves(vp_capacity: u32, mode: &TimeAbiMode) -> Vec<virt::CpuidLeaf> {
     let signature = |s: &[u8; 4]| u32::from_le_bytes(*s);
-    let last = match coverage {
+    let last = match mode.leaves {
         LeafCoverage::All => HV_LEAF_RANGE_LAST,
         LeafCoverage::Abi => HV_LEAF_MAX,
     };
@@ -194,6 +205,10 @@ pub(crate) fn cpuid_leaves(vp_capacity: u32, coverage: LeafCoverage) -> Vec<virt
     );
     // CPUID.0xA: no PMU.
     leaves.push(virt::CpuidLeaf::new(0xa, [0; 4]));
+    if mode.force_invariant_tsc {
+        // CPUID.80000007H: invariant TSC.
+        leaves.push(virt::CpuidLeaf::new(0x8000_0007, [0, 0, 0, 1 << 8]).masked([0, 0, 0, 1 << 8]));
+    }
     leaves
 }
 
@@ -325,15 +340,16 @@ impl crate::MshvProcessor<'_> {
 mod tests {
     use super::*;
 
+    fn mode(leaves: LeafCoverage, force_invariant_tsc: bool) -> TimeAbiMode {
+        TimeAbiMode {
+            routing: MsrRouting::Intercept,
+            leaves,
+            force_invariant_tsc,
+        }
+    }
+
     fn state() -> TimeAbiState {
-        TimeAbiState::new(
-            TimeAbiMode {
-                routing: MsrRouting::Intercept,
-                leaves: LeafCoverage::All,
-            },
-            2_194_844_000,
-            200_000_000,
-        )
+        TimeAbiState::new(mode(LeafCoverage::Abi, false), 2_194_844_000, 200_000_000)
     }
 
     #[test]
@@ -401,7 +417,7 @@ mod tests {
 
     #[test]
     fn identity_leaves_match_the_abi() {
-        let leaves = virt::CpuidLeafSet::new(cpuid_leaves(8, LeafCoverage::All));
+        let leaves = virt::CpuidLeafSet::new(cpuid_leaves(8, &mode(LeafCoverage::All, false)));
         let leaf = |function| leaves.result(function, 0, &[0xdead_beef; 4]);
         assert_eq!(
             leaf(0x4000_0000),
@@ -419,11 +435,21 @@ mod tests {
         assert_eq!(leaves.result(6, 0, &[!0; 4]), [1 << 2, 0, 0, 0]);
         assert_eq!(leaves.result(7, 0, &[!0; 4])[1], !(1 << 1));
         assert_eq!(leaves.result(0xa, 0, &[!0; 4]), [0; 4]);
+        assert_eq!(leaves.result(0x8000_0007, 0, &[0; 4]), [0; 4]);
+    }
+
+    #[test]
+    fn forced_invariant_tsc_sets_only_its_bit() {
+        let leaves = virt::CpuidLeafSet::new(cpuid_leaves(2, &mode(LeafCoverage::Abi, true)));
+        assert_eq!(
+            leaves.result(0x8000_0007, 0, &[1, 2, 3, 4]),
+            [1, 2, 3, 4 | 1 << 8]
+        );
     }
 
     #[test]
     fn abi_coverage_overrides_only_the_abi_leaves() {
-        let leaves = cpuid_leaves(1, LeafCoverage::Abi);
+        let leaves = cpuid_leaves(1, &mode(LeafCoverage::Abi, false));
         assert!(
             leaves
                 .iter()
@@ -844,6 +870,7 @@ mod hw_probe {
             0xe8,
             0x6e0,
             0x1ad,
+            0x10a,
         ] {
             vm.rdmsr(msr, log);
         }
@@ -916,7 +943,14 @@ mod hw_probe {
     #[test]
     #[ignore = "requires /dev/mshv"]
     fn msr_mechanisms() {
-        let abi_cpuid = cpuid_leaves(8, LeafCoverage::All);
+        let abi_cpuid = cpuid_leaves(
+            8,
+            &TimeAbiMode {
+                routing: MsrRouting::Intercept,
+                leaves: LeafCoverage::All,
+                force_invariant_tsc: true,
+            },
+        );
         let configs = [
             (
                 Config {
@@ -979,6 +1013,14 @@ mod hw_probe {
                     ..Default::default()
                 },
                 true,
+            ),
+            (
+                Config {
+                    name: "no synthetic + MSR_INDEX 0x10a (ARCH_CAPABILITIES)",
+                    msr_index_intercepts: vec![0x10a],
+                    ..Default::default()
+                },
+                false,
             ),
             (
                 Config {
