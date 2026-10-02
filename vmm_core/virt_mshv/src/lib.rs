@@ -1023,6 +1023,78 @@ impl virt::PartitionHostAccess for MshvPartitionInner {
     }
 }
 
+/// EXPERIMENT (not for integration): with `MSHV_EXP_PREFAULT=resident` (or
+/// `all`), copy-on-write populates every 2 MiB chunk of the range that holds a
+/// resident page (`mincore`) with `MADV_POPULATE_WRITE`, on
+/// `MSHV_EXP_PREFAULT_THREADS` threads, before the region is registered (so the
+/// driver's MMU notifier is not yet installed). Appends one line per range to
+/// `/tmp/mshv-exp-prefault.txt`.
+fn exp_prefault(data: *mut u8, size: usize, gpa: u64) {
+    const CHUNK: usize = 2 << 20;
+    const PAGE: usize = 4096;
+    const MADV_POPULATE_WRITE: libc::c_int = 23;
+    let Ok(mode) = std::env::var("MSHV_EXP_PREFAULT") else {
+        return;
+    };
+    let threads: usize = std::env::var("MSHV_EXP_PREFAULT_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+        .max(1);
+    let start = std::time::Instant::now();
+    let mut residency = vec![0u8; size.div_ceil(PAGE)];
+    // SAFETY: `data` maps `size` bytes, and `residency` has one byte per page.
+    let rc = unsafe { libc::mincore(data.cast(), size, residency.as_mut_ptr()) };
+    let resident_pages = residency.iter().filter(|b| **b & 1 != 0).count();
+    let chunks: Vec<usize> = if rc != 0 {
+        Vec::new()
+    } else {
+        residency
+            .chunks(CHUNK / PAGE)
+            .enumerate()
+            .filter(|(_, c)| mode == "all" || c.iter().any(|b| *b & 1 != 0))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let mincore_us = start.elapsed().as_micros();
+    let base = data as usize;
+    let failures = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for t in 0..threads.min(chunks.len().max(1)) {
+            let chunks = &chunks;
+            let failures = &failures;
+            s.spawn(move || {
+                for &i in chunks.iter().skip(t).step_by(threads) {
+                    let off = i * CHUNK;
+                    let len = CHUNK.min(size - off);
+                    // SAFETY: populating the VMM's own private mapping of
+                    // guest RAM does not change its contents.
+                    let rc = unsafe {
+                        libc::madvise((base + off) as *mut libc::c_void, len, MADV_POPULATE_WRITE)
+                    };
+                    if rc != 0 {
+                        failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    let line = format!(
+        "pid={} gpa={gpa:#x} size={size} mode={mode} resident_pages={resident_pages} chunks={} threads={threads} failures={} mincore_us={mincore_us} total_us={}\n",
+        std::process::id(),
+        chunks.len(),
+        failures.load(Ordering::Relaxed),
+        start.elapsed().as_micros(),
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/mshv-exp-prefault.txt")
+    {
+        let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+    }
+}
+
 impl virt::PartitionMemoryMap for MshvPartitionInner {
     unsafe fn map_range(
         &self,
@@ -1076,6 +1148,9 @@ impl virt::PartitionMemoryMap for MshvPartitionInner {
             exec,
         )
         .entered();
+        if writable {
+            exp_prefault(data, size, addr);
+        }
         let mapped = self.isolation.map_memory_timed(&self.vmfd, mem_region)?;
         state.ranges[slot_to_use] = Some(MshvMemoryRange {
             region: mem_region,
