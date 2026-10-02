@@ -134,6 +134,17 @@ impl Session {
     ) -> Result<(), OperationError> {
         request.log();
 
+        // Forget requests have no reply that could report a failure, and malformed requests
+        // never reach the file system, so only the remaining requests enter a scope. The scope
+        // lives until this function returns, after the reply has been sent.
+        let _scope = match request.operation() {
+            FuseOperation::Invalid
+            | FuseOperation::Error(_)
+            | FuseOperation::Forget { .. }
+            | FuseOperation::BatchForget { .. } => None,
+            _ => self.fs.enter_request(&request)?,
+        };
+
         match request.operation() {
             FuseOperation::Invalid => {
                 // This indicates the header could be parsed but the rest of the request could not,
@@ -656,6 +667,7 @@ mod tests {
     mod saved_state;
 
     use super::*;
+    use crate::RequestScope;
     use crate::request::tests::*;
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -1200,6 +1212,162 @@ mod tests {
         assert_eq!(
             init_out.max_pages, 2,
             "max_pages must round up to cover max_write"
+        );
+    }
+
+    /// Creates a FUSE_FORGET request, which has no reply.
+    fn make_forget_request(node_id: u64, lookup_count: u64) -> Vec<u8> {
+        let header = fuse_in_header {
+            len: (size_of::<fuse_in_header>() + size_of::<fuse_forget_in>()) as u32,
+            opcode: FUSE_FORGET,
+            unique: 7,
+            nodeid: node_id,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+            padding: 0,
+        };
+        let forget = fuse_forget_in {
+            nlookup: lookup_count,
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(header.as_bytes());
+        data.extend_from_slice(forget.as_bytes());
+        data
+    }
+
+    /// A file system that records when each request scope begins and ends.
+    struct ScopedFs {
+        events: Arc<Mutex<Vec<String>>>,
+        enter_error: Option<lx::Error>,
+    }
+
+    struct RecordedScope {
+        events: Arc<Mutex<Vec<String>>>,
+        opcode: u32,
+    }
+
+    impl Drop for RecordedScope {
+        fn drop(&mut self) {
+            self.events.lock().push(format!("exit {}", self.opcode));
+        }
+    }
+
+    impl Fuse for ScopedFs {
+        fn enter_request(&self, request: &Request) -> lx::Result<Option<RequestScope>> {
+            self.events
+                .lock()
+                .push(format!("enter {}", request.opcode()));
+            if let Some(error) = self.enter_error {
+                return Err(error);
+            }
+            Ok(Some(Box::new(RecordedScope {
+                events: self.events.clone(),
+                opcode: request.opcode(),
+            })))
+        }
+
+        fn get_attr(&self, _request: &Request, _flags: u32, _fh: u64) -> lx::Result<fuse_attr_out> {
+            self.events.lock().push("getattr".to_owned());
+            Ok(fuse_attr_out::new_zeroed())
+        }
+
+        fn forget(&self, node_id: u64, lookup_count: u64) {
+            self.events
+                .lock()
+                .push(format!("forget {node_id} {lookup_count}"));
+        }
+    }
+
+    /// A ReplySender that records each reply's error code in the shared event log.
+    struct RecordingSender {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ReplySender for RecordingSender {
+        fn send(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<()> {
+            let flat: Vec<u8> = bufs.iter().flat_map(|s| s.iter()).copied().collect();
+            let header = fuse_out_header::read_from_prefix(&flat).unwrap().0;
+            self.events.lock().push(format!("reply {}", header.error));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn replied_requests_run_inside_a_scope() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let session = Session::new(ScopedFs {
+            events: events.clone(),
+            enter_error: None,
+        });
+        let mut sender = RecordingSender {
+            events: events.clone(),
+        };
+
+        // Initialization happens before the file system can handle requests.
+        session.dispatch(Request::new(FUSE_INIT_REQUEST).unwrap(), &mut sender, None);
+        // The scope covers the operation and its reply.
+        session.dispatch(
+            Request::new(FUSE_GETATTR_REQUEST).unwrap(),
+            &mut sender,
+            None,
+        );
+        // Forget has no reply, and a malformed request never reaches the file system.
+        session.dispatch(
+            Request::new(make_forget_request(2, 3).as_slice()).unwrap(),
+            &mut sender,
+            None,
+        );
+        session.dispatch(
+            Request::new(make_lookup_name_too_long().as_slice()).unwrap(),
+            &mut sender,
+            None,
+        );
+
+        assert_eq!(
+            *events.lock(),
+            [
+                "reply 0".to_owned(),
+                format!("enter {FUSE_GETATTR}"),
+                "getattr".to_owned(),
+                "reply 0".to_owned(),
+                format!("exit {FUSE_GETATTR}"),
+                "forget 2 3".to_owned(),
+                format!("reply {}", -lx::Error::ENAMETOOLONG.value()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_scope_fails_the_request_without_running_it() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let session = Session::new(ScopedFs {
+            events: events.clone(),
+            enter_error: Some(lx::Error::EPERM),
+        });
+        session.dispatch(
+            Request::new(FUSE_INIT_REQUEST).unwrap(),
+            &mut MockSender::default(),
+            None,
+        );
+
+        let mut sender = ErrorCheckingSender::default();
+        session.dispatch(
+            Request::new(FUSE_GETATTR_REQUEST).unwrap(),
+            &mut sender,
+            None,
+        );
+        assert_eq!(sender.last_error, Some(lx::Error::EPERM.value()));
+
+        // Forget still releases its lookup references.
+        session.dispatch(
+            Request::new(make_forget_request(2, 3).as_slice()).unwrap(),
+            &mut sender,
+            None,
+        );
+        assert_eq!(
+            *events.lock(),
+            [format!("enter {FUSE_GETATTR}"), "forget 2 3".to_owned()]
         );
     }
 

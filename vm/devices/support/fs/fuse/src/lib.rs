@@ -50,6 +50,11 @@ pub struct CreateOut {
     pub open: fuse_open_out,
 }
 
+/// State that a file system keeps alive while it handles one request.
+///
+/// Dropping the scope ends the request. See [`Fuse::enter_request`].
+pub type RequestScope = Box<dyn std::any::Any>;
+
 /// Trait that FUSE file systems must implement.
 ///
 /// Most operations are loosely based on `fuse_lowlevel_ops` in libfuse, so check the [official
@@ -59,6 +64,18 @@ pub struct CreateOut {
 /// For many operations, a reply of `ENOSYS` is taken as permanent failure, preventing the client
 /// from ever issuing that operation again.
 pub trait Fuse {
+    /// Prepares the calling thread to handle `request`.
+    ///
+    /// After `init`, the session calls this before it dispatches every well-formed request that
+    /// receives a reply, which excludes only `forget` and batch forget. The returned scope stays
+    /// alive until the operation completes and its reply is sent, on the calling thread. An error
+    /// fails the request with that error without invoking the operation.
+    ///
+    /// The default implementation does nothing.
+    fn enter_request(&self, _request: &Request) -> lx::Result<Option<RequestScope>> {
+        Ok(None)
+    }
+
     /// Looks up a child of an inode.
     ///
     /// This increases the lookup count of the found entry by one.
