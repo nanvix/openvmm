@@ -346,13 +346,17 @@ impl Worker for VmWorker {
         let worker_setup = openvmm_defs::profile::ProfileSpan::start();
         let restore_params = restore::RestoreParameters::take(&mut parameters)?;
         let microvm_params = microvm::MicrovmParameters::take(&mut parameters)?;
+        let diag = openvmm_defs::profile::ProfileSpan::start();
         let (device_thread, device_driver) = new_device_thread();
+        diag.complete_milestone("startup", "diag_device_thread", Default::default());
 
         let mut manifest = Manifest::from_config(parameters.cfg);
         manifest.microvm.hypervisor_id = parameters.hypervisor.id().to_owned();
 
+        let diag = openvmm_defs::profile::ProfileSpan::start();
         let hypervisor = block_on(ResourceResolver::new().resolve(parameters.hypervisor, ()))
             .context("failed to resolve hypervisor backend")?;
+        diag.complete_milestone("startup", "diag_hypervisor_resolve", Default::default());
 
         let shared_memory = parameters
             .shared_memory

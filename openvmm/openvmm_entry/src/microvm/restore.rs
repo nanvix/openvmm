@@ -432,7 +432,10 @@ pub(crate) fn validate_restore_contract(
     time_abi: TimeAbiRestoreOptions<'_>,
 ) -> anyhow::Result<TimeAbiRestore> {
     let saved_contract = openvmm_helpers::snapshot::time::required_machine_contract(manifest)?;
+    let diag = openvmm_defs::profile::ProfileSpan::start();
     let destination = preflight_time_abi_restore(saved_contract, expected_hypervisor, time_abi)?;
+    diag.complete_milestone("restore", "diag_preflight_fn", Default::default());
+    let diag = openvmm_defs::profile::ProfileSpan::start();
     let (Some(contract), Some(cpu_profile)) = (
         saved_contract.time.clone(),
         saved_contract.cpu_profile.clone(),
@@ -470,6 +473,7 @@ pub(crate) fn validate_restore_contract(
         manifest,
         &expected_contract,
     )?;
+    diag.complete_milestone("restore", "diag_contract_validate", Default::default());
     Ok(TimeAbiRestore {
         contract,
         cpu_profile,
@@ -484,8 +488,13 @@ fn preflight_time_abi_restore(
     hypervisor: &str,
     options: TimeAbiRestoreOptions<'_>,
 ) -> anyhow::Result<HostIdentity> {
+    let diag = openvmm_defs::profile::ProfileSpan::start();
     let destination = virt::time_abi::host::host_identity()?;
+    diag.complete_milestone("restore", "diag_host_identity", Default::default());
+    let diag = openvmm_defs::profile::ProfileSpan::start();
     let now = virt::time_abi::host::sample_host_time()?;
+    diag.complete_milestone("restore", "diag_host_time", Default::default());
+    let diag = openvmm_defs::profile::ProfileSpan::start();
     let preflight = openvmm_helpers::snapshot::time::preflight_time_abi_restore(
         contract,
         hypervisor,
@@ -495,6 +504,8 @@ fn preflight_time_abi_restore(
         &now,
         options.hooks,
     )?;
+    diag.complete_milestone("restore", "diag_checks", Default::default());
+    let diag = openvmm_defs::profile::ProfileSpan::start();
     if let Some(step_ns) = preflight.downtime.host_wall_clock_step_ns {
         tracing::warn!(
             step_ns,
@@ -508,6 +519,7 @@ fn preflight_time_abi_restore(
         cpu_profile = preflight.cpu_profile,
         "time ABI restore preflight passed"
     );
+    diag.complete_milestone("restore", "diag_log", Default::default());
     Ok(destination)
 }
 
