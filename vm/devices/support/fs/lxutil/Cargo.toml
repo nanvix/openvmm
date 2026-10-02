@@ -18,6 +18,9 @@ tracing.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+caps.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 arrayvec.workspace = true
 bitfield-struct.workspace = true

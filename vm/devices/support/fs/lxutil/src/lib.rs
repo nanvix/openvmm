@@ -25,6 +25,10 @@ use windows as sys;
 
 pub use path::PathBufExt;
 pub use path::PathExt;
+#[cfg(target_os = "linux")]
+pub use unix::identity::FsIdentityScope;
+#[cfg(target_os = "linux")]
+pub use unix::identity::has_fs_identity_capabilities;
 
 /// A platform-independent abstraction that allows you to treat an area of the file system as if
 /// it has Unix semantics.
@@ -56,7 +60,8 @@ pub use path::PathExt;
 ///
 /// All calls pass through directly to their libc equivalent. Attributes like mode are always
 /// enabled if the file system supports them. `LxVolumeOptions` other than `confine_paths` is
-/// ignored, as are the `uid` and `gid` fields of `LxCreateOptions`.
+/// ignored, as are the `uid` and `gid` fields of `LxCreateOptions`. On Linux, an
+/// [`FsIdentityScope`] selects the user that performs the calls and owns new files.
 pub struct LxVolume {
     inner: sys::LxVolume,
 }

@@ -8,6 +8,8 @@
 mod confine;
 #[cfg(test)]
 mod confine_tests;
+#[cfg(target_os = "linux")]
+pub(crate) mod identity;
 pub(crate) mod path;
 mod util;
 
