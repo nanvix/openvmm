@@ -33,20 +33,19 @@ pub struct MicrovmSnapshotBoundaryRequest {
     pub transaction_complete: mesh::rpc::Rpc<(), ()>,
 }
 
-/// The microVM bidirectional portb console at ports `0xe9` and `0xea`.
+/// The microVM bidirectional portb console at ports `0xe9` and `0xea`, with
+/// the NVX time ABI time-sample window at `0xeb`.
 #[derive(MeshPayload)]
 pub struct MicrovmPortbHandle {
     /// Host serial endpoint used for raw input and output.
     pub io: Resource<SerialBackendHandle>,
     /// Fresh generation ID for this microVM instance.
     pub generation_id: [u8; 16],
-    /// Fresh entropy exposed only through the private restore-input selector.
-    pub restore_entropy: Vec<u8>,
     /// Requests to drain and close output before terminating the VM process.
     pub output_drain: Option<mesh::Receiver<mesh::rpc::FailableRpc<(), ()>>>,
     /// NVX time ABI v1 configuration: restore packet version 4 and the time
-    /// samples at port `0xeb`. `restore_entropy` must be empty when set.
-    pub time_abi: Option<MicrovmPortbTimeAbi>,
+    /// samples at port `0xeb`.
+    pub time_abi: MicrovmPortbTimeAbi,
 }
 
 /// NVX time ABI v1 configuration of the portb device.
