@@ -68,13 +68,20 @@ pub(crate) fn prepare_snapshot_restore_for_config(
     )?;
     let restore_time = microvm
         .map(|(contract, time_abi)| {
-            microvm::validate_restore_contract(
+            let time_abi_preflight = openvmm_defs::profile::ProfileSpan::start();
+            let restore = microvm::validate_restore_contract(
                 manifest,
                 expected_memory_size,
                 expected_vp_count,
                 contract,
                 time_abi,
-            )
+            );
+            time_abi_preflight.complete_milestone(
+                "restore",
+                "time_abi_preflight",
+                Default::default(),
+            );
+            restore
         })
         .transpose()?;
 

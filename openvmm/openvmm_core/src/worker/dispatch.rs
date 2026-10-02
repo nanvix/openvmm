@@ -343,6 +343,7 @@ impl Worker for VmWorker {
 
     fn new(mut parameters: Self::Parameters) -> anyhow::Result<Self> {
         let worker_construct = openvmm_defs::profile::ProfileSpan::start();
+        let worker_setup = openvmm_defs::profile::ProfileSpan::start();
         let restore_params = restore::RestoreParameters::take(&mut parameters)?;
         let microvm_params = microvm::MicrovmParameters::take(&mut parameters)?;
         let (device_thread, device_driver) = new_device_thread();
@@ -356,6 +357,7 @@ impl Worker for VmWorker {
         let shared_memory = parameters
             .shared_memory
             .map(|fd| restore_params.shared_memory_backing(fd));
+        worker_setup.complete("startup", "worker_setup", Default::default());
 
         let vm = block_on(InitializedVm::new(
             VmTaskDriverSource::new(ThreadDriverBackend::new(device_driver)),
@@ -1150,6 +1152,7 @@ impl InitializedVm {
         H: virt::Hypervisor<Partition = P>,
         P: 'static + HvlitePartition,
     {
+        let vm_config = openvmm_defs::profile::ProfileSpan::start();
         let node_mem_sizes: Vec<u64> = cfg
             .numa
             .nodes
@@ -1261,16 +1264,19 @@ impl InitializedVm {
         let lazy_memory_registration =
             microvm::uses_lazy_memory_registration(&cfg, shared_memory.as_ref());
         let user_mode_memory_faults = !lazy_memory_registration;
+        vm_config.complete("startup", "vm_config", Default::default());
 
         #[cfg(guest_arch = "x86_64")]
         let (time_abi_partition, time_abi_config) = match &cfg.microvm.time_abi {
             Some(parameters) if cfg.machine_profile == MachineProfile::Microvm => {
+                let time_abi_span = openvmm_defs::profile::ProfileSpan::start();
                 let profile = time_abi::select_cpu_profile(&parameters.cpu_profile)?;
                 let effective_cpuid = Arc::new(virt::time_abi::cpuid::effective_cpuid(
                     profile,
                     &processor_topology,
                 )?);
                 let (msrs, config) = time_abi::partition_config(profile, &effective_cpuid);
+                time_abi_span.complete("startup", "time_abi_config", Default::default());
                 (
                     Some(time_abi::PartitionTimeAbi {
                         msrs,

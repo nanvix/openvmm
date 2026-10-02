@@ -2992,6 +2992,7 @@ async fn run_control_inner(
                 .transpose()?;
             (shared_memory, None)
         };
+        let worker_params = openvmm_defs::profile::ProfileSpan::start();
         let restore = restore.into_worker();
         let restore_ready_sink = snapshot_restore::restore_ready_sink(&opt)?;
 
@@ -3011,6 +3012,7 @@ async fn run_control_inner(
             rpc: rpc_recv,
             notify: notify_send,
         };
+        worker_params.complete("startup", "worker_params", Default::default());
         let worker_launch = openvmm_defs::profile::ProfileSpan::start();
         let launched = vm_host
             .launch_worker(VM_WORKER, params)
