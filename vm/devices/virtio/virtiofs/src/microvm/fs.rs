@@ -4,6 +4,9 @@
 //! microVM filesystem construction, policy hooks, and attachment restore.
 
 use super::MAX_FUSE_REQUEST_BYTES;
+use super::identity::caller_identity;
+use super::identity::require_caller_identity_support;
+use super::profile::MicroVmOwner;
 use super::profile::MicroVmVirtioFsProfile;
 use super::saved_state::MAX_ALIAS_BYTES;
 use super::saved_state::MAX_ALIASES;
@@ -133,11 +136,17 @@ impl VirtioFs {
     ///
     /// `root_path` is deliberately consumed only while opening the attachment;
     /// it is not retained in the filesystem state or in a saved-state blob.
+    ///
+    /// A profile with the caller owner policy requires a Linux host and an
+    /// export root owned by a non-root user and group.
     pub fn new_microvm(
         root_path: impl AsRef<Path>,
         profile: MicroVmVirtioFsProfile,
     ) -> anyhow::Result<Self> {
         let root_path = root_path.as_ref();
+        if profile.owner() == MicroVmOwner::Caller {
+            require_caller_identity_support()?;
+        }
         profile.validate_root_path(root_path)?;
         let mut mount_options = LxVolumeOptions::new();
         mount_options
@@ -165,6 +174,7 @@ impl VirtioFs {
         ));
         let (root_inode, root_stat) = VirtioFsInode::new(Arc::clone(&volume), PathBuf::new())?;
         profile.validate_opened_root(root_path, &root_stat)?;
+        let caller_identity = caller_identity(&profile, &root_stat)?;
         if inodes.insert(root_inode)?.1 != FUSE_ROOT_ID {
             anyhow::bail!("microVM virtio-fs root received an invalid node ID");
         }
@@ -174,6 +184,7 @@ impl VirtioFs {
                 files: RwLock::new(HandleMap::new()),
                 mode: VirtioFsMode::Direct,
                 microvm_profile: Some(profile),
+                caller_identity,
                 negotiation: RwLock::new(FuseNegotiation::default()),
             }),
         })

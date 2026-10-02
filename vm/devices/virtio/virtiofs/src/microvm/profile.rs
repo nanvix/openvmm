@@ -72,6 +72,17 @@ pub enum MicroVmAccessMode {
     ReadWrite,
 }
 
+/// Host identity that performs guest operations on the share.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MicroVmOwner {
+    /// Perform every operation as the VMM process.
+    #[default]
+    Vmm,
+    /// Perform each request as the guest caller's UID and GID, with UID 0 and GID 0 squashed to
+    /// the owner of the export root. Only Linux hosts support this policy.
+    Caller,
+}
+
 /// Errors in the fixed microVM virtio-fs attachment contract.
 #[derive(Debug, thiserror::Error)]
 pub enum MicroVmProfileError {
@@ -100,17 +111,19 @@ pub struct MicroVmVirtioFsProfile {
     root_identity: Vec<u8>,
     access_mode: MicroVmAccessMode,
     denied_paths: Vec<PathBuf>,
+    owner: MicroVmOwner,
 }
 
 impl MicroVmVirtioFsProfile {
     /// Builds the constrained microVM profile from the resource attachment
-    /// fields. `stable_id`, `root_identity`, and `read_only` correspond
-    /// exactly to `VirtioFsProfile::Microvm`.
+    /// fields. `stable_id`, `root_identity`, `read_only`, and `caller_identity`
+    /// correspond exactly to `VirtioFsProfile::Microvm`.
     pub fn from_attachment(
         stable_id: String,
         root_identity: Vec<u8>,
         read_only: bool,
         denied_paths: Vec<String>,
+        caller_identity: bool,
     ) -> Result<Self, MicroVmProfileError> {
         if stable_id != MICROVM_ATTACHMENT_ID {
             return Err(MicroVmProfileError::InvalidStableId);
@@ -128,6 +141,11 @@ impl MicroVmVirtioFsProfile {
                 MicroVmAccessMode::ReadWrite
             },
             denied_paths,
+            owner: if caller_identity {
+                MicroVmOwner::Caller
+            } else {
+                MicroVmOwner::Vmm
+            },
         })
     }
 
@@ -223,6 +241,11 @@ impl MicroVmVirtioFsProfile {
     /// Returns canonical host-relative paths hidden from the guest.
     pub fn denied_paths(&self) -> &[PathBuf] {
         &self.denied_paths
+    }
+
+    /// Returns the host identity that performs guest operations.
+    pub const fn owner(&self) -> MicroVmOwner {
+        self.owner
     }
 
     /// Returns the entry-cache lifetime required by the ABI.
@@ -361,6 +384,7 @@ mod tests {
             root_identity,
             true,
             vec!["secrets".to_owned()],
+            false,
         )
         .unwrap();
         assert_eq!(profile.attachment_id(), "fs:microvm0");
@@ -368,6 +392,7 @@ mod tests {
         assert_eq!(profile.request_queues(), 1);
         assert!(profile.is_readonly());
         assert_eq!(profile.denied_paths(), &[PathBuf::from("secrets")]);
+        assert_eq!(profile.owner(), MicroVmOwner::Vmm);
         assert_eq!(profile.entry_cache_timeout(), Duration::ZERO);
         assert_eq!(profile.attribute_cache_timeout(), Duration::ZERO);
         assert!(profile.direct_io());
@@ -389,6 +414,7 @@ mod tests {
             b"not-a-root-identity".to_vec(),
             false,
             Vec::new(),
+            false,
         )
         .unwrap();
 
@@ -397,6 +423,31 @@ mod tests {
                 .validate_root_path(temporary_directory.path())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn profile_carries_the_caller_owner_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = microvm_root_identity(root.path()).unwrap();
+        let vmm = MicroVmVirtioFsProfile::from_attachment(
+            MICROVM_ATTACHMENT_ID.to_owned(),
+            identity.clone(),
+            false,
+            Vec::new(),
+            false,
+        )
+        .unwrap();
+        let caller = MicroVmVirtioFsProfile::from_attachment(
+            MICROVM_ATTACHMENT_ID.to_owned(),
+            identity,
+            false,
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(caller.owner(), MicroVmOwner::Caller);
+        // The device and its HostFs attachment must agree on the owner policy.
+        assert_ne!(vmm, caller);
     }
 
     #[test]
@@ -415,6 +466,7 @@ mod tests {
                     identity.clone(),
                     true,
                     denied_paths,
+                    false,
                 )
                 .is_err()
             );

@@ -73,6 +73,8 @@ struct VirtioFsInner {
     files: RwLock<HandleMap<Arc<VirtioFsFile>>>,
     mode: VirtioFsMode,
     microvm_profile: Option<MicroVmVirtioFsProfile>,
+    /// Set when guest requests must run as the guest caller (microVM profile only).
+    caller_identity: Option<microvm::identity::CallerIdentity>,
     negotiation: RwLock<FuseNegotiation>,
 }
 
@@ -118,6 +120,10 @@ pub struct VirtioFs {
 }
 
 impl Fuse for VirtioFs {
+    fn enter_request(&self, request: &Request) -> lx::Result<Option<RequestScope>> {
+        microvm::identity::enter_request(self, request)
+    }
+
     fn init(&self, info: &mut SessionInfo) {
         microvm::fs::configure_session(self, info);
 
@@ -645,6 +651,7 @@ impl VirtioFs {
                 files: RwLock::new(HandleMap::new()),
                 mode: VirtioFsMode::Direct,
                 microvm_profile: None,
+                caller_identity: None,
                 negotiation: RwLock::new(FuseNegotiation::default()),
             }),
         })
@@ -664,6 +671,7 @@ impl VirtioFs {
                 files: RwLock::new(HandleMap::new()),
                 mode: VirtioFsMode::Aggregate(AggregateState::new()),
                 microvm_profile: None,
+                caller_identity: None,
                 negotiation: RwLock::new(FuseNegotiation::default()),
             }),
         }

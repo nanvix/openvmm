@@ -50,6 +50,7 @@ guest-visible configuration:
 | File policy | Direct I/O |
 | Maximum write | 1 MiB payload plus protocol headers |
 | Symbolic links | `rw`: created with the exact target; `ro`: `EROFS` |
+| Host identity | `--mount-owner vmm` (default) or `caller` (Linux only) |
 
 For an active cold-boot attachment, the profile adds `virtfs_dir`,
 `virtfs_tag`, and `virtfs_mode` bootstrap tokens to the kernel command line.
@@ -75,6 +76,47 @@ the exported directory must treat guest-created links as untrusted.
 `SectionFs`, aggregate roots, alternate tags, PCI transport, DAX, and extra
 queues are not part of the microVM profile.
 
+### Host identity
+
+By default, HostFs performs every guest operation as the OpenVMM process, so
+files that the guest creates belong to the OpenVMM user, and host permission
+checks use that user's privileges. `--mount-owner caller` instead performs
+each guest request as the guest caller:
+
+```bash
+sudo openvmm --machine microvm \
+  --mount /workspace,path/to/workspace,rw \
+  --mount-owner caller \
+  --kernel path/to/vmlinux --initrd path/to/initramfs.cpio.gz
+```
+
+- For each request, the request thread switches its filesystem UID and GID to
+  the UID and GID that the guest kernel reports for the calling process,
+  clears its supplementary groups, and clears its effective capabilities. The
+  host kernel therefore checks the operation exactly as it would for an
+  unprivileged process with that identity, and new files belong to it.
+  Supplementary groups of the guest caller are not forwarded.
+- Requests from guest UID 0 or GID 0 are squashed, independently, to the owner
+  of the export root. The export root must belong to a non-root user and group;
+  OpenVMM rejects a root-owned export before boot. The guest can therefore
+  never create root-owned files, give files to root, create device nodes,
+  or set file capabilities on the host.
+- The OpenVMM process needs `CAP_SETUID` and `CAP_SETGID`, for example by
+  running as root or through file capabilities
+  (`setcap cap_setuid,cap_setgid=ep openvmm`). If a request cannot switch to
+  the caller identity, including when these capabilities are missing, it fails
+  with `EPERM`; it never falls back to the OpenVMM identity. Releasing handles
+  and unmounting do not access host objects and always succeed.
+- Only Linux hosts support caller identity. On Windows, OpenVMM rejects
+  `--mount-owner caller` before boot, because a Windows process cannot act as
+  an arbitrary POSIX UID and GID.
+
+The guest kernel selects the caller identity. A guest that can change its own
+UID or GID can therefore act as any non-root host identity within the export;
+root squash only prevents it from acting as root. Snapshot capture and restore
+revalidate saved objects as the OpenVMM process, which must be able to reach
+every object that the guest holds open.
+
 ## Snapshot attachments
 
 A microVM snapshot stores FUSE negotiation, namespace identifiers, lookup
@@ -88,7 +130,7 @@ lookups and newly opened directories still observe the live host tree.
 
 Restoring a snapshot captured with an active attachment requires a fresh
 `--mount` argument and the exact same denied-path set, canonical host path,
-guest target, and mode. Identity validation remains independent: before any vCPU starts,
+guest target, mode, and `--mount-owner` policy. Identity validation remains independent: before any vCPU starts,
 OpenVMM pins the supplied root and validates its saved root and object
 identities. Missing, moved, replaced, ambiguous, or no-longer-reopenable
 objects fail restore. A saved symbolic link is revalidated as the link itself,
@@ -127,7 +169,9 @@ that would expose guest RAM or snapshot files through virtio-fs.
 Guest FUSE requests, paths, and saved aliases are untrusted. HostFs rejects
 absolute and parent-relative aliases, does not follow symbolic links or
 Windows reparse points while resolving guest or saved objects, and enforces
-read-only mode before invoking a host mutation.
+read-only mode before invoking a host mutation. With `--mount-owner caller`,
+HostFs also performs each request with the squashed caller identity and no
+capabilities, as described in [Host identity](#host-identity).
 
 On Linux, every host operation opens the parent directory of its path with
 `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`, or with one
@@ -165,6 +209,9 @@ false success.
   `vm/devices/virtio/virtiofs/`
 - FUSE session implementation:
   `vm/devices/support/fs/fuse/`
+- Per-request host identity for `--mount-owner caller`:
+  `vm/devices/virtio/virtiofs/src/microvm/identity.rs` and
+  `vm/devices/support/fs/lxutil/src/unix/identity.rs`
 - Resource contract:
   `vm/devices/virtio/virtio_resources/src/lib.rs` and
   `vm/devices/virtio/virtio_resources/src/fs/microvm.rs`

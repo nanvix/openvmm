@@ -89,6 +89,7 @@ impl VirtioFsDevice {
         root_identity: Vec<u8>,
         read_only: bool,
         denied_paths: Vec<String>,
+        caller_identity: bool,
         root_path: impl AsRef<Path>,
         notify_corruption: Option<Arc<dyn Fn() + Sync + Send>>,
     ) -> anyhow::Result<Self> {
@@ -97,6 +98,7 @@ impl VirtioFsDevice {
             root_identity,
             read_only,
             denied_paths,
+            caller_identity,
         )?;
         let fs = VirtioFs::new_microvm(root_path, profile.clone())?;
         Self::new_microvm(driver_source, profile, fs, notify_corruption)
@@ -292,6 +294,7 @@ mod tests {
             root_identity,
             true,
             Vec::new(),
+            false,
             temporary_directory.path(),
             None,
         )
@@ -340,6 +343,7 @@ mod tests {
             microvm_root_identity(root.path()).unwrap(),
             false,
             Vec::new(),
+            false,
             root.path(),
             None,
         )
@@ -357,6 +361,7 @@ mod tests {
             microvm_root_identity(root.path()).unwrap(),
             false,
             Vec::new(),
+            false,
             root.path(),
             None,
         )
@@ -381,6 +386,7 @@ mod tests {
             microvm_root_identity(temporary_directory.path()).unwrap(),
             true,
             Vec::new(),
+            false,
         )
         .unwrap();
         let fs = VirtioFs::new(temporary_directory.path(), None).unwrap();
@@ -428,6 +434,7 @@ mod tests {
             microvm_root_identity(root.path()).unwrap(),
             false,
             Vec::new(),
+            false,
             root.path(),
             None,
         )

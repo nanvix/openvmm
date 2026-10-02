@@ -282,6 +282,52 @@ impl MicrovmFilesystemAccess {
     }
 }
 
+/// Host identity that performs guest operations on the microVM filesystem.
+#[derive(MeshPayload, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MicrovmFilesystemOwner {
+    /// Perform every operation as the OpenVMM process.
+    #[default]
+    Vmm,
+    /// Perform each request as the guest caller's UID and GID, with UID 0 and
+    /// GID 0 squashed to the owner of the export root. Linux hosts only.
+    Caller,
+}
+
+impl MicrovmFilesystemOwner {
+    /// Returns the command-line spelling of this policy.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Vmm => "vmm",
+            Self::Caller => "caller",
+        }
+    }
+
+    /// Returns whether guest requests run as the guest caller.
+    pub fn is_caller(self) -> bool {
+        matches!(self, Self::Caller)
+    }
+
+    /// Returns the snapshot-contract spelling of this policy.
+    ///
+    /// The default policy is empty, so contracts that predate the owner
+    /// policy keep their exact encoding.
+    pub fn snapshot_name(self) -> &'static str {
+        match self {
+            Self::Vmm => "",
+            Self::Caller => "caller",
+        }
+    }
+
+    /// Parses the snapshot-contract spelling of this policy.
+    pub fn from_snapshot_name(name: &str) -> Option<Self> {
+        match name {
+            "" => Some(Self::Vmm),
+            "caller" => Some(Self::Caller),
+            _ => None,
+        }
+    }
+}
+
 /// Guest-visible configuration for the microVM virtio-fs device.
 #[derive(MeshPayload, Clone, Debug, PartialEq, Eq)]
 pub struct MicrovmFilesystemConfig {
@@ -291,6 +337,8 @@ pub struct MicrovmFilesystemConfig {
     pub access: MicrovmFilesystemAccess,
     /// Canonical host-relative paths hidden by the virtio-fs server.
     pub denied_paths: Vec<String>,
+    /// Snapshot-authoritative host identity for guest operations.
+    pub owner: MicrovmFilesystemOwner,
 }
 
 impl MicrovmFilesystemConfig {
@@ -319,7 +367,14 @@ impl MicrovmFilesystemConfig {
             guest_mount_target,
             access,
             denied_paths: Vec::new(),
+            owner: MicrovmFilesystemOwner::Vmm,
         })
+    }
+
+    /// Selects the host identity that performs guest operations.
+    pub fn with_owner(mut self, owner: MicrovmFilesystemOwner) -> Self {
+        self.owner = owner;
+        self
     }
 
     /// Adds a canonical, non-overlapping denied-path policy.
@@ -1366,6 +1421,33 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
 mod tests {
     use super::*;
     use std::fs::File;
+
+    #[test]
+    fn filesystem_owner_defaults_to_the_vmm_and_round_trips_through_snapshots() {
+        let config = MicrovmFilesystemConfig::new(
+            "/mnt/share".to_owned(),
+            MicrovmFilesystemAccess::ReadWrite,
+        )
+        .unwrap();
+        assert_eq!(config.owner, MicrovmFilesystemOwner::Vmm);
+        // The guest bootstrap does not depend on the host identity policy.
+        let caller = config.clone().with_owner(MicrovmFilesystemOwner::Caller);
+        assert!(caller.owner.is_caller());
+        assert_eq!(
+            caller.command_line_fragment(),
+            config.command_line_fragment()
+        );
+
+        for owner in [MicrovmFilesystemOwner::Vmm, MicrovmFilesystemOwner::Caller] {
+            assert_eq!(
+                MicrovmFilesystemOwner::from_snapshot_name(owner.snapshot_name()),
+                Some(owner)
+            );
+        }
+        assert_eq!(MicrovmFilesystemOwner::Vmm.snapshot_name(), "");
+        assert_eq!(MicrovmFilesystemOwner::from_snapshot_name("vmm"), None);
+        assert_eq!(MicrovmFilesystemOwner::from_snapshot_name("root"), None);
+    }
 
     fn linux_load_mode(
         boot_mode: LinuxDirectBootMode,

@@ -36,6 +36,7 @@ fn profile(root_path: &Path, read_only: bool, denied_paths: &[&str]) -> MicroVmV
         microvm_root_identity(root_path).unwrap(),
         read_only,
         denied_paths.iter().map(|path| (*path).to_owned()).collect(),
+        false,
     )
     .unwrap()
 }

@@ -267,6 +267,7 @@ pub(crate) fn microvm_filesystem_attachment(
 fn microvm_filesystem_from_mount(
     requested: &cli_args::microvm::MicrovmMountCli,
     denied_paths: &[PathBuf],
+    owner: openvmm_defs::microvm::MicrovmFilesystemOwner,
 ) -> anyhow::Result<EffectiveMicrovmFilesystem> {
     let (root_path, attachment) = microvm_filesystem_attachment(&requested.host_path)?;
     let denied_paths =
@@ -275,7 +276,8 @@ fn microvm_filesystem_from_mount(
         requested.guest_target.clone(),
         requested.access,
     )?
-    .with_denied_paths(denied_paths)?;
+    .with_denied_paths(denied_paths)?
+    .with_owner(owner);
     Ok(EffectiveMicrovmFilesystem {
         config,
         root_path,
@@ -346,9 +348,20 @@ pub(crate) fn microvm_filesystem_from_snapshot(
         "rw" => openvmm_defs::microvm::MicrovmFilesystemAccess::ReadWrite,
         mode => anyhow::bail!("snapshot microVM filesystem access mode '{mode}' is unsupported"),
     };
-    openvmm_defs::microvm::MicrovmFilesystemConfig::new(saved.guest_mount_target.clone(), access)?
-        .with_denied_paths(saved.denied_paths.clone())
-        .context("snapshot microVM filesystem policy is invalid")
+    let owner = openvmm_defs::microvm::MicrovmFilesystemOwner::from_snapshot_name(&saved.owner)
+        .with_context(|| {
+            format!(
+                "snapshot microVM filesystem owner '{}' is unsupported",
+                saved.owner
+            )
+        })?;
+    Ok(openvmm_defs::microvm::MicrovmFilesystemConfig::new(
+        saved.guest_mount_target.clone(),
+        access,
+    )?
+    .with_denied_paths(saved.denied_paths.clone())
+    .context("snapshot microVM filesystem policy is invalid")?
+    .with_owner(owner))
 }
 
 pub(crate) fn microvm_filesystem_slot_from_snapshot(
@@ -376,11 +389,12 @@ pub(crate) fn microvm_filesystem_slot_from_snapshot(
 pub(super) fn effective_microvm_filesystem(
     requested: Option<&cli_args::microvm::MicrovmMountCli>,
     denied_paths: &[PathBuf],
+    owner: openvmm_defs::microvm::MicrovmFilesystemOwner,
     restore: Option<&openvmm_helpers::snapshot::microvm::SnapshotMachineContract>,
 ) -> anyhow::Result<Option<EffectiveMicrovmFilesystem>> {
     let Some(restore) = restore else {
         return requested
-            .map(|requested| microvm_filesystem_from_mount(requested, denied_paths))
+            .map(|requested| microvm_filesystem_from_mount(requested, denied_paths, owner))
             .transpose();
     };
 
@@ -405,7 +419,7 @@ pub(super) fn effective_microvm_filesystem(
                 == openvmm_helpers::snapshot::microvm::MICROVM_FILESYSTEM_SLOT_VERSION,
             "snapshot does not support restore-time microVM filesystem attachment"
         );
-        return microvm_filesystem_from_mount(requested, denied_paths).map(Some);
+        return microvm_filesystem_from_mount(requested, denied_paths, owner).map(Some);
     };
     let requested = requested
         .context("snapshot restore requires a fresh --mount attachment for fs:microvm0")?;
@@ -414,7 +428,13 @@ pub(super) fn effective_microvm_filesystem(
         requested.guest_target == config.guest_mount_target && requested.access == config.access,
         "restore-time mount target or access mode does not match the snapshot contract"
     );
-    let effective = microvm_filesystem_from_mount(requested, denied_paths)?;
+    anyhow::ensure!(
+        owner == config.owner,
+        "restore-time mount owner '{}' does not match the snapshot contract owner '{}'",
+        owner.as_str(),
+        config.owner.as_str()
+    );
+    let effective = microvm_filesystem_from_mount(requested, denied_paths, owner)?;
     anyhow::ensure!(
         !saved.canonical_host_path.is_empty(),
         "snapshot filesystem canonical host path is missing; this snapshot predates path-bound filesystem restore"
@@ -440,17 +460,26 @@ mod tests {
     use crate::Options;
     use crate::microvm::network::tests::network_contract;
     use clap::Parser as _;
+    use openvmm_defs::microvm::MicrovmFilesystemOwner;
     use openvmm_defs::microvm::build_microvm_command_line;
     use test_with_tracing::test;
 
     fn filesystem_contract(
         root: &Path,
     ) -> openvmm_helpers::snapshot::microvm::SnapshotMachineContract {
+        filesystem_contract_with_owner(root, MicrovmFilesystemOwner::Vmm)
+    }
+
+    fn filesystem_contract_with_owner(
+        root: &Path,
+        owner: MicrovmFilesystemOwner,
+    ) -> openvmm_helpers::snapshot::microvm::SnapshotMachineContract {
         let filesystem = openvmm_defs::microvm::MicrovmFilesystemConfig::new(
             "/mnt/share".to_owned(),
             openvmm_defs::microvm::MicrovmFilesystemAccess::ReadOnly,
         )
-        .unwrap();
+        .unwrap()
+        .with_owner(owner);
         let (root_path, attachment) = microvm_filesystem_attachment(root).unwrap();
         let mut command_line = build_microvm_command_line(&[], false).unwrap();
         openvmm_defs::microvm::append_microvm_virtio_discovery(
@@ -578,6 +607,7 @@ mod tests {
         let filesystem = effective_microvm_filesystem(
             options.microvm.microvm_mount.as_ref(),
             &options.microvm.microvm_mount_deny,
+            MicrovmFilesystemOwner::Vmm,
             None,
         )
         .unwrap()
@@ -603,6 +633,7 @@ mod tests {
         let restored = effective_microvm_filesystem(
             options.microvm.microvm_mount.as_ref(),
             &[],
+            MicrovmFilesystemOwner::Vmm,
             Some(&contract),
         )
         .unwrap()
@@ -616,6 +647,7 @@ mod tests {
             effective_microvm_filesystem(
                 replacement_options.microvm.microvm_mount.as_ref(),
                 &[],
+                MicrovmFilesystemOwner::Vmm,
                 Some(&contract)
             )
             .is_err()
@@ -636,6 +668,7 @@ mod tests {
             effective_microvm_filesystem(
                 options.microvm.microvm_mount.as_ref(),
                 &[],
+                MicrovmFilesystemOwner::Vmm,
                 Some(&contract)
             )
             .is_err()
@@ -646,13 +679,17 @@ mod tests {
     fn filesystem_restore_rejects_missing_or_changed_policy() {
         let root = tempfile::tempdir().unwrap();
         let contract = filesystem_contract(root.path());
-        assert!(effective_microvm_filesystem(None, &[], Some(&contract)).is_err());
+        assert!(
+            effective_microvm_filesystem(None, &[], MicrovmFilesystemOwner::Vmm, Some(&contract))
+                .is_err()
+        );
 
         let changed_mode = restore_mount_options(root.path(), "rw");
         assert!(
             effective_microvm_filesystem(
                 changed_mode.microvm.microvm_mount.as_ref(),
                 &[],
+                MicrovmFilesystemOwner::Vmm,
                 Some(&contract),
             )
             .is_err()
@@ -660,10 +697,43 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_restore_requires_the_same_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let options = restore_mount_options(root.path(), "ro");
+        for (saved, requested) in [
+            (MicrovmFilesystemOwner::Vmm, MicrovmFilesystemOwner::Caller),
+            (MicrovmFilesystemOwner::Caller, MicrovmFilesystemOwner::Vmm),
+        ] {
+            let contract = filesystem_contract_with_owner(root.path(), saved);
+            let error = match effective_microvm_filesystem(
+                options.microvm.microvm_mount.as_ref(),
+                &[],
+                requested,
+                Some(&contract),
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("restore changed the filesystem owner from {saved:?}"),
+            };
+            assert!(error.to_string().contains("mount owner"), "{error:#}");
+        }
+
+        let contract = filesystem_contract_with_owner(root.path(), MicrovmFilesystemOwner::Caller);
+        let restored = effective_microvm_filesystem(
+            options.microvm.microvm_mount.as_ref(),
+            &[],
+            MicrovmFilesystemOwner::Caller,
+            Some(&contract),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(restored.config.owner, MicrovmFilesystemOwner::Caller);
+    }
+
+    #[test]
     fn filesystem_restore_without_mount_preserves_dormant_slot() {
         let contract = dormant_filesystem_contract();
         assert!(
-            effective_microvm_filesystem(None, &[], Some(&contract))
+            effective_microvm_filesystem(None, &[], MicrovmFilesystemOwner::Vmm, Some(&contract))
                 .unwrap()
                 .is_none()
         );
@@ -677,6 +747,7 @@ mod tests {
         let filesystem = effective_microvm_filesystem(
             options.microvm.microvm_mount.as_ref(),
             &[],
+            MicrovmFilesystemOwner::Caller,
             Some(&contract),
         )
         .unwrap()
@@ -686,6 +757,8 @@ mod tests {
             filesystem.config.access,
             openvmm_defs::microvm::MicrovmFilesystemAccess::ReadWrite
         );
+        // A new attachment may select any owner.
+        assert_eq!(filesystem.config.owner, MicrovmFilesystemOwner::Caller);
         assert_eq!(
             filesystem.root_path,
             fs_err::canonicalize(root.path()).unwrap().to_str().unwrap()
@@ -700,6 +773,7 @@ mod tests {
         let error = match effective_microvm_filesystem(
             options.microvm.microvm_mount.as_ref(),
             &[],
+            MicrovmFilesystemOwner::Vmm,
             Some(&contract),
         ) {
             Err(error) => error,

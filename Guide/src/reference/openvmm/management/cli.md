@@ -209,10 +209,20 @@ describes the source definitions.
   same device, hard-link aliases, symlinks, junctions, and bind-mount aliases
   cannot re-expose it.
 
+  `--mount-owner <vmm|caller>` selects the host identity for guest operations.
+  `vmm`, the default, performs every operation as the OpenVMM process.
+  `caller` performs each request as the UID and GID that the guest kernel
+  reports for the calling process, squashes UID 0 and GID 0 to the owner of
+  the export root, and drops the process's supplementary groups and
+  capabilities for the request. It requires a Linux host and an export root
+  owned by a non-root user and group; OpenVMM rejects it before boot on other
+  hosts. Without `CAP_SETUID` and `CAP_SETGID`, every guest request on the
+  share fails with `EPERM` rather than running as the OpenVMM process.
+
   Filesystem snapshots contain guest-visible FUSE and queue state, not host
   directory contents or native handles. An active snapshot requires
   `--mount` again with the exact canonical host path, guest target, access
-  mode, and denied-path set; the live root and every saved object identity are
+  mode, denied-path set, and owner policy; the live root and every saved object identity are
   also revalidated before vCPUs start. A snapshot captured without `--mount` may remain dormant
   or bind a new attachment. The resumed guest must then explicitly run
   `mount -t virtiofs microvm <GUEST_TARGET>` because its cold-boot mount hook

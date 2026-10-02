@@ -36,6 +36,7 @@ fn profile(root_path: &Path) -> MicroVmVirtioFsProfile {
         microvm_root_identity(root_path).unwrap(),
         true,
         Vec::new(),
+        false,
     )
     .unwrap()
 }
@@ -148,6 +149,7 @@ fn microvm_denied_subtree_is_not_lookupable() {
         microvm_root_identity(root_path).unwrap(),
         false,
         vec!["secrets".to_owned()],
+        false,
     )
     .unwrap();
     let fs = VirtioFs::new_microvm(root_path, profile).unwrap();

@@ -43,6 +43,25 @@ pub enum MicrovmNetworkActionCli {
     Deny,
 }
 
+/// Host identity for guest operations on the microVM filesystem.
+#[derive(Debug, Copy, Clone, ValueEnum, PartialEq, Eq)]
+pub enum MicrovmMountOwnerCli {
+    /// Perform every operation as the OpenVMM process.
+    Vmm,
+    /// Perform each request as the guest caller's UID and GID, squashing UID 0
+    /// and GID 0 to the owner of the export root.
+    Caller,
+}
+
+impl From<MicrovmMountOwnerCli> for openvmm_defs::microvm::MicrovmFilesystemOwner {
+    fn from(owner: MicrovmMountOwnerCli) -> Self {
+        match owner {
+            MicrovmMountOwnerCli::Vmm => Self::Vmm,
+            MicrovmMountOwnerCli::Caller => Self::Caller,
+        }
+    }
+}
+
 /// Fixed numeric identity for microVM workloads.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct MicrovmWorkloadIdentityCli {
@@ -334,6 +353,22 @@ pub struct MicrovmCli {
     )]
     pub microvm_mount_deny: Vec<PathBuf>,
 
+    /// Select the host identity for guest operations on the `--mount` share.
+    ///
+    /// `vmm` (the default) performs every operation as the OpenVMM process.
+    /// `caller` performs each request as the guest caller's UID and GID and
+    /// squashes UID 0 and GID 0 to the owner of the export root, which must
+    /// not be root. It requires a Linux host and CAP_SETUID and CAP_SETGID;
+    /// without them, guest requests fail with EPERM. An active snapshot
+    /// requires the same owner on restore.
+    #[clap(
+        long = "mount-owner",
+        value_enum,
+        value_name = "OWNER",
+        requires = "microvm_mount"
+    )]
+    pub microvm_mount_owner: Option<MicrovmMountOwnerCli>,
+
     /// dedicated microVM control console backed by a local serial endpoint
     ///
     /// Accepts listen=\<path\> or none. The boot
@@ -468,6 +503,7 @@ impl Options {
                     && self.microvm.allow_endpoint.is_empty()
                     && self.microvm.microvm_mount.is_none()
                     && self.microvm.microvm_mount_deny.is_empty()
+                    && self.microvm.microvm_mount_owner.is_none()
                     && self.microvm.microvm_sandbox_block.is_empty()
                     && self.microvm.microvm_workload_identity.is_none()
                     && self.microvm.microvm_lifecycle.is_none()
@@ -712,6 +748,11 @@ impl Options {
         anyhow::ensure!(
             self.microvm.microvm_mount_deny.len() <= 128,
             "microVM filesystem permits at most 128 denied paths"
+        );
+        anyhow::ensure!(
+            cfg!(target_os = "linux")
+                || self.microvm.microvm_mount_owner != Some(MicrovmMountOwnerCli::Caller),
+            "--mount-owner caller requires a Linux host; on this host every share operation runs as the OpenVMM process"
         );
         for (index, block) in self.microvm.microvm_sandbox_block.iter().enumerate() {
             anyhow::ensure!(
@@ -2151,5 +2192,68 @@ mod tests {
         assert!(MicrovmMountCli::from_str("relative,host").is_err());
         assert!(MicrovmMountCli::from_str("/mnt/../escape,host").is_err());
         assert!(MicrovmMountCli::from_str("/mnt/share,host,write").is_err());
+    }
+
+    #[test]
+    fn test_microvm_mount_owner_parses_and_requires_a_mount() {
+        let parse = |owner: &[&str]| {
+            Options::try_parse_from(
+                [
+                    "openvmm",
+                    "--machine",
+                    "microvm",
+                    "--mount",
+                    "/mnt/share,host,rw",
+                ]
+                .into_iter()
+                .chain(owner.iter().copied()),
+            )
+        };
+        assert_eq!(parse(&[]).unwrap().microvm.microvm_mount_owner, None);
+        for (value, owner) in [
+            ("vmm", MicrovmMountOwnerCli::Vmm),
+            ("caller", MicrovmMountOwnerCli::Caller),
+        ] {
+            assert_eq!(
+                parse(&["--mount-owner", value])
+                    .unwrap()
+                    .microvm
+                    .microvm_mount_owner,
+                Some(owner)
+            );
+        }
+        assert!(parse(&["--mount-owner", "root"]).is_err());
+        assert!(
+            Options::try_parse_from(["openvmm", "--machine", "microvm", "--mount-owner", "caller"])
+                .is_err()
+        );
+        assert_eq!(
+            openvmm_defs::microvm::MicrovmFilesystemOwner::from(MicrovmMountOwnerCli::Caller),
+            openvmm_defs::microvm::MicrovmFilesystemOwner::Caller
+        );
+    }
+
+    #[test]
+    fn test_microvm_mount_owner_caller_requires_a_linux_host() {
+        let options = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--mount",
+            "/mnt/share,host,rw",
+            "--mount-owner",
+            "caller",
+        ])
+        .unwrap();
+        let result = options.validate_microvm_options();
+        if cfg!(target_os = "linux") {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains("requires a Linux host"),
+                "{error:#}"
+            );
+        }
     }
 }
