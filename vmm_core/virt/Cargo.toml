@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 aarch64defs.workspace = true
+cpu_profile.workspace = true
 hvdef.workspace = true
 pci_core.workspace = true
 memory_range = { workspace = true, features = ["inspect"] }
@@ -27,6 +28,21 @@ slab.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 zerocopy.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+safe_intrinsics.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_WindowsProgramming",
+] }
+
 [dev-dependencies]
 test_with_tracing.workspace = true
 

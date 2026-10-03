@@ -2,8 +2,8 @@
 // Licensed under the MIT License.
 
 //! Partition unit support for snapshots: validating the instantiated VP prefix,
-//! stopping VPs at a deferred I/O boundary for capture, and advancing TSC after
-//! restore downtime.
+//! stopping VPs at a deferred I/O boundary for capture, and the NVX time ABI's
+//! LAPIC timer checks and restore advance.
 
 use super::Error;
 use super::PartitionRequest;
@@ -18,7 +18,21 @@ use mesh::rpc::RpcSend;
 pub(super) enum SnapshotRequest {
     StopVpsAtIoBoundary(FailableRpc<(mesh::OneshotSender<()>, mesh::OneshotReceiver<()>), ()>),
     #[cfg(guest_arch = "x86_64")]
-    AdvanceTsc(FailableRpc<(std::time::Duration, u64, Option<u64>), ()>),
+    CheckTimers(FailableRpc<(), ()>),
+    #[cfg(guest_arch = "x86_64")]
+    AdvanceLapic(FailableRpc<(u64, u64), ()>),
+    #[cfg(guest_arch = "x86_64")]
+    OmitSavedTsc(mesh::rpc::Rpc<(), ()>),
+}
+
+/// Returns `data`, a VP's saved state, without its saved TSC.
+#[cfg(guest_arch = "x86_64")]
+pub(super) fn without_saved_tsc(
+    data: vmcore::save_restore::SavedStateBlob,
+) -> Result<vmcore::save_restore::SavedStateBlob, vmcore::save_restore::RestoreError> {
+    let mut state: virt::vp::VpSavedState = data.parse()?;
+    state.clear_tsc();
+    Ok(vmcore::save_restore::SavedStateBlob::new(state))
 }
 
 /// Returns the number of VPs to instantiate, validated against the topology's
@@ -54,21 +68,49 @@ impl PartitionUnit {
         Ok(StopGuard(self.req_send.clone()))
     }
 
-    /// Advances TSC state on all stopped vCPUs.
+    /// Checks the LAPIC timer of every stopped vCPU for the NVX time ABI
+    /// (`E_LAPIC_PERIODIC`, `E_LAPIC_TSC_DEADLINE`).
     #[cfg(guest_arch = "x86_64")]
-    pub async fn advance_tsc(
-        &mut self,
-        duration: std::time::Duration,
-        frequency_hz: u64,
-        apic_frequency_hz: Option<u64>,
-    ) -> anyhow::Result<()> {
+    pub async fn check_one_shot_timers(&mut self) -> anyhow::Result<()> {
         self.req_send
             .call_failable(
-                |rpc| PartitionRequest::Snapshot(SnapshotRequest::AdvanceTsc(rpc)),
-                (duration, frequency_hz, apic_frequency_hz),
+                |rpc| PartitionRequest::Snapshot(SnapshotRequest::CheckTimers(rpc)),
+                (),
             )
             .await?;
         Ok(())
+    }
+
+    /// Advances the one-shot LAPIC timer of every stopped vCPU by
+    /// `downtime_ns` at `apic_hz` and sets every vCPU's LAPIC state again,
+    /// for the NVX time ABI.
+    #[cfg(guest_arch = "x86_64")]
+    pub async fn advance_lapic_timers(
+        &mut self,
+        downtime_ns: u64,
+        apic_hz: u64,
+    ) -> anyhow::Result<()> {
+        self.req_send
+            .call_failable(
+                |rpc| PartitionRequest::Snapshot(SnapshotRequest::AdvanceLapic(rpc)),
+                (downtime_ns, apic_hz),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Makes every later restore drop the VPs' saved TSC values, which the
+    /// NVX time ABI's synchronized TSC set supersedes, so no backend applies
+    /// a per-VP TSC write before it.
+    #[cfg(guest_arch = "x86_64")]
+    pub async fn omit_saved_tsc(&mut self) {
+        self.req_send
+            .call(
+                |rpc| PartitionRequest::Snapshot(SnapshotRequest::OmitSavedTsc(rpc)),
+                (),
+            )
+            .await
+            .unwrap();
     }
 }
 
@@ -88,14 +130,21 @@ impl PartitionUnitRunner {
                 .await
             }
             #[cfg(guest_arch = "x86_64")]
-            SnapshotRequest::AdvanceTsc(rpc) => {
-                rpc.handle_failable(async |(duration, frequency_hz, apic_frequency_hz)| {
-                    self.vp_set
-                        .advance_tsc(duration, frequency_hz, apic_frequency_hz)
-                        .await
+            SnapshotRequest::CheckTimers(rpc) => {
+                rpc.handle_failable(async |()| self.vp_set.check_one_shot_timers().await)
+                    .await
+            }
+            #[cfg(guest_arch = "x86_64")]
+            SnapshotRequest::AdvanceLapic(rpc) => {
+                rpc.handle_failable(async |(downtime_ns, apic_hz)| {
+                    self.vp_set.advance_lapic_timers(downtime_ns, apic_hz).await
                 })
                 .await
             }
+            #[cfg(guest_arch = "x86_64")]
+            SnapshotRequest::OmitSavedTsc(rpc) => rpc.handle_sync(|()| {
+                self.omit_saved_tsc = true;
+            }),
         }
     }
 }

@@ -1710,12 +1710,6 @@ pub struct SyntheticMsrs {
     #[mesh(5)]
     #[inspect(iter_by_index)]
     pub sint: [u64; 16],
-    /// KVM wall-clock GPA/configuration MSR.
-    #[mesh(6)]
-    pub kvm_wall_clock: u64,
-    /// KVM system-time GPA/configuration MSR.
-    #[mesh(7)]
-    pub kvm_system_time: u64,
 }
 
 impl HvRegisterState<HvX64RegisterName, 20> for SyntheticMsrs {
@@ -1771,21 +1765,16 @@ impl HvRegisterState<HvX64RegisterName, 20> for SyntheticMsrs {
 
 impl StateElement<X86PartitionCapabilities, X86VpInfo> for SyntheticMsrs {
     fn is_present(caps: &X86PartitionCapabilities) -> bool {
-        caps.hv1 || caps.kvm_clock
+        caps.hv1
     }
 
     fn at_reset(_caps: &X86PartitionCapabilities, _vp_info: &X86VpInfo) -> Self {
-        if !_caps.hv1 {
-            return Self::default();
-        }
         Self {
             vp_assist_page: 0,
             scontrol: 1,
             siefp: 0,
             simp: 0,
             sint: [0x10000; 16],
-            kvm_wall_clock: 0,
-            kvm_system_time: 0,
         }
     }
 }
@@ -2010,6 +1999,14 @@ state_trait! {
     (200, "nested_state", nested_state, set_nested_state, NestedState),
 }
 
+impl VpSavedState {
+    /// Removes the saved TSC, so restoring this state leaves the VP's TSC to
+    /// the NVX time ABI's synchronized TSC set.
+    pub fn clear_tsc(&mut self) {
+        self.tsc = None;
+    }
+}
+
 /// Resets register state for an x86 INIT via the APIC.
 pub fn x86_init<T: AccessVpState>(access: &mut T, vp_info: &X86VpInfo) -> Result<(), T::Error> {
     // Reset core register and debug register state, but preserve a few bits of cr0.
@@ -2039,4 +2036,26 @@ pub fn x86_init<T: AccessVpState>(access: &mut T, vp_info: &X86VpInfo) -> Result
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_tsc_keeps_the_other_elements() {
+        let mut state = VpSavedState {
+            tsc: Some(Tsc { value: 7 }),
+            tsc_aux: Some(TscAux { value: 3 }),
+            ..Default::default()
+        };
+        state.clear_tsc();
+        assert_eq!(
+            state,
+            VpSavedState {
+                tsc_aux: Some(TscAux { value: 3 }),
+                ..Default::default()
+            }
+        );
+    }
 }

@@ -37,7 +37,6 @@ use openvmm_defs::profile::ProfileSpan;
 use openvmm_defs::worker::SharedMemoryFd;
 use openvmm_defs::worker::SnapshotRestoreGuards;
 use openvmm_helpers::snapshot::restore::OpenedSnapshot;
-use std::time::Duration;
 
 /// The snapshot restore of a VM launched from the command line.
 pub(crate) struct SnapshotRestore {
@@ -54,14 +53,9 @@ pub(crate) struct WorkerRestore {
     pub(crate) shared_memory_copy_on_write: bool,
     /// Snapshot generation handles that must outlive the restored VM.
     pub(crate) guards: Option<SnapshotRestoreGuards>,
-    /// Host downtime to apply before starting a restored microVM.
-    pub(crate) downtime: Option<Duration>,
-    /// Saved effective TSC frequency of a restored microVM.
-    pub(crate) tsc_frequency_hz: Option<u64>,
-    /// Saved local APIC timer frequency of a restored microVM.
-    pub(crate) apic_frequency_hz: Option<u64>,
-    /// Saved canonical CPU contract of a restored microVM.
-    pub(crate) cpu_contract: Option<Vec<u8>>,
+    /// The time ABI inputs of a restored microVM, validated by the
+    /// controller's restore preflight.
+    pub(crate) time: Option<openvmm_defs::time_abi::RestoreTimeInput>,
 }
 
 impl SnapshotRestore {
@@ -111,7 +105,7 @@ impl SnapshotRestore {
     pub(crate) fn prepare(
         &mut self,
         opt: &Options,
-        microvm: &MicrovmLaunch,
+        microvm: &mut MicrovmLaunch,
         expected_hypervisor: &str,
     ) -> anyhow::Result<(SharedMemoryFd, ProtobufMessage)> {
         let prepared = prepare::prepare_snapshot_restore(
@@ -124,13 +118,12 @@ impl SnapshotRestore {
         )?;
         self.worker.shared_memory_copy_on_write = true;
         self.worker.guards = Some(prepared.guards);
-        if let Some((downtime, tsc_frequency_hz, apic_frequency_hz, cpu_contract)) =
-            prepared.restore_time
-        {
-            self.worker.downtime = Some(downtime);
-            self.worker.tsc_frequency_hz = Some(tsc_frequency_hz);
-            self.worker.apic_frequency_hz = apic_frequency_hz;
-            self.worker.cpu_contract = Some(cpu_contract);
+        if let Some(time) = prepared.restore_time {
+            let restore_record = microvm
+                .take_restore_time_record()
+                .context("time ABI restore is missing its restore packet")?;
+            let packet_selected = microvm.take_restore_packet_selected();
+            self.worker.time = Some(time.into_input(restore_record, packet_selected));
         }
         Ok((prepared.shared_memory, prepared.saved_state))
     }

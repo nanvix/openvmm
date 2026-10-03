@@ -11,6 +11,7 @@ mod network;
 pub(crate) mod output;
 pub(crate) mod report;
 mod restore;
+mod verify;
 
 pub(crate) use config::MicrovmConfigBuilder;
 #[cfg(test)]
@@ -40,12 +41,16 @@ pub(crate) use filesystem::validate_microvm_filesystem_private_storage;
 pub(crate) use launch::MicrovmLaunch;
 pub(crate) use restore::ExpectedRestoreContract;
 pub(crate) use restore::MicrovmRestore;
+pub(crate) use restore::TimeAbiRestore;
+pub(crate) use restore::TimeAbiRestoreOptions;
 #[cfg(any(feature = "ttrpc", feature = "grpc"))]
 pub(crate) use restore::fresh_microvm_generation_id;
-#[cfg(any(feature = "ttrpc", feature = "grpc"))]
-pub(crate) use restore::fresh_microvm_restore_packet;
 pub(crate) use restore::prepare_restore;
+#[cfg(any(feature = "ttrpc", feature = "grpc"))]
+pub(crate) use restore::restore_packet_base;
 pub(crate) use restore::validate_restore_contract;
+pub(crate) use verify::fatal_error_message;
+pub(crate) use verify::report_time_abi_verification;
 
 use crate::storage_builder::microvm::MicrovmSandboxBlockSource;
 use chipset_resources::microvm::MicrovmSnapshotBoundaryRequest;
@@ -80,4 +85,62 @@ pub(crate) struct MicrovmResources {
     pub(crate) filesystem_attachment: Option<SnapshotAttachment>,
     /// Canonical host path of the live filesystem root.
     pub(crate) filesystem_root_path: Option<PathBuf>,
+    /// Under the time ABI, seals the time fields of the restore packet; the
+    /// restoring worker takes it.
+    pub(crate) restore_time_record:
+        Option<mesh::OneshotSender<chipset_resources::microvm_time::RestoreTimeRecord>>,
+    /// Under the time ABI with profiling enabled, notified when the guest
+    /// first selects the restore packet; the restoring worker takes it.
+    pub(crate) restore_packet_selected: Option<mesh::OneshotReceiver<()>>,
+}
+
+impl MicrovmResources {
+    /// Returns the portb source of a time ABI restore packet with `base`, and
+    /// keeps the restoring worker's ends of its channels.
+    pub(crate) fn time_abi_restore_packet(
+        &mut self,
+        base: chipset_resources::microvm_time::RestorePacketBase,
+    ) -> chipset_resources::microvm::MicrovmRestorePacketSource {
+        let (record, time) = mesh::oneshot();
+        self.restore_time_record = Some(record);
+        let selected = openvmm_defs::profile::enabled().then(|| {
+            let (selected, recv) = mesh::oneshot();
+            self.restore_packet_selected = Some(recv);
+            selected
+        });
+        chipset_resources::microvm::MicrovmRestorePacketSource {
+            base,
+            time,
+            selected,
+        }
+    }
+}
+
+/// Configures the chipset devices of a microVM for the time ABI: puts the PIT
+/// in strict mode, which forbids a periodic channel 0 at capture and restore
+/// (`E_PIT_ACTIVE`), and returns the portb device's time ABI configuration,
+/// with the restore packet of a restore.
+pub(crate) fn time_abi_chipset(
+    chipset_devices: &mut [vmotherboard::ChipsetDeviceHandle],
+    hooks: &virt::time_abi::TimeAbiTestHooks,
+    restore: Option<chipset_resources::microvm::MicrovmRestorePacketSource>,
+) -> chipset_resources::microvm::MicrovmPortbTimeAbi {
+    use vm_resource::IntoResource;
+    use vm_resource::ResourceId;
+
+    for device in chipset_devices.iter_mut() {
+        if device.name == chipset_resources::pit::PitDeviceHandle::ID {
+            device.resource =
+                chipset_resources::pit::PitDeviceHandle { time_abi: true }.into_resource();
+        }
+    }
+    chipset_resources::microvm::MicrovmPortbTimeAbi {
+        generation: restore
+            .as_ref()
+            .map_or(0, |restore| restore.base.generation),
+        utc_offset_ms: hooks.utc_offset_ms,
+        sample_delay_us: hooks.sample_delay_us,
+        test_hooks: hooks.active(),
+        restore,
+    }
 }

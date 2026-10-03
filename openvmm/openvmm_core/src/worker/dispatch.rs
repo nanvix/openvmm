@@ -2,7 +2,6 @@
 // Licensed under the MIT License.
 
 mod amd_iommu_wiring;
-mod clock;
 mod dump;
 mod ecam_config_access;
 mod intel_vtd_wiring;
@@ -13,6 +12,7 @@ mod pcie_wiring;
 mod restore;
 mod smmu_wiring;
 mod snapshot_rpc;
+mod time_abi;
 
 use crate::emuplat;
 use crate::partition::BindHvliteVp;
@@ -347,7 +347,8 @@ impl Worker for VmWorker {
         let microvm_params = microvm::MicrovmParameters::take(&mut parameters)?;
         let (device_thread, device_driver) = new_device_thread();
 
-        let manifest = Manifest::from_config(parameters.cfg);
+        let mut manifest = Manifest::from_config(parameters.cfg);
+        manifest.microvm.hypervisor_id = parameters.hypervisor.id().to_owned();
 
         let hypervisor = block_on(ResourceResolver::new().resolve(parameters.hypervisor, ()))
             .context("failed to resolve hypervisor backend")?;
@@ -356,19 +357,18 @@ impl Worker for VmWorker {
             .shared_memory
             .map(|fd| restore_params.shared_memory_backing(fd));
 
-        let mut vm = block_on(InitializedVm::new(
+        let vm = block_on(InitializedVm::new(
             VmTaskDriverSource::new(ThreadDriverBackend::new(device_driver)),
             hypervisor.0,
             manifest,
             shared_memory,
         ))?;
-        restore::validate_restore_cpu_contract(vm.partition.as_ref(), restore_params.cpu_contract)?;
         let saved_state = parameters
             .saved_state
             .map(|m| m.parse())
             .transpose()
             .context("failed to decode saved state")?;
-        microvm_params.prepare_cold_boot(&mut vm, saved_state.is_some())?;
+        microvm_params.check_cold_boot(&vm, saved_state.is_some())?;
 
         let mut vm =
             block_with_io(|_| vm.load(saved_state, parameters.notify, restore_params.state))?;
@@ -491,6 +491,9 @@ pub(crate) struct InitializedVm {
     processor_topology: ProcessorTopology,
     igvm_file: Option<IgvmFile>,
     driver_source: VmTaskDriverSource,
+    /// The time ABI of the partition, when it uses the time ABI.
+    #[cfg(guest_arch = "x86_64")]
+    time_abi_partition: Option<time_abi::PartitionTimeAbi>,
 }
 
 trait ExtractTopologyConfig {
@@ -914,6 +917,9 @@ struct LoadedVmInner {
     partition: Arc<dyn HvlitePartition>,
     chipset_devices: ChipsetDevices,
     _vmtime: SpawnedUnit<VmTimeKeeper>,
+    /// The time ABI state, when the partition uses the time ABI.
+    #[cfg(guest_arch = "x86_64")]
+    time_abi: Option<time_abi::TimeAbiState>,
     memory_manager: GuestMemoryManager,
     gm: GuestMemory,
     vtl0_hvsock_relay: Option<HvsockRelay>,
@@ -1256,6 +1262,27 @@ impl InitializedVm {
             microvm::uses_lazy_memory_registration(&cfg, shared_memory.as_ref());
         let user_mode_memory_faults = !lazy_memory_registration;
 
+        #[cfg(guest_arch = "x86_64")]
+        let (time_abi_partition, time_abi_config) = match &cfg.microvm.time_abi {
+            Some(parameters) if cfg.machine_profile == MachineProfile::Microvm => {
+                let profile = time_abi::select_cpu_profile(&parameters.cpu_profile)?;
+                let effective_cpuid = Arc::new(virt::time_abi::cpuid::effective_cpuid(
+                    profile,
+                    &processor_topology,
+                )?);
+                let (msrs, config) = time_abi::partition_config(profile, &effective_cpuid);
+                (
+                    Some(time_abi::PartitionTimeAbi {
+                        msrs,
+                        profile,
+                        effective_cpuid,
+                    }),
+                    Some(config),
+                )
+            }
+            _ => (None, None),
+        };
+
         let partition_prototype = openvmm_defs::profile::ProfileSpan::start();
         let proto = hypervisor
             .new_partition(virt::ProtoPartitionConfig {
@@ -1268,7 +1295,8 @@ impl InitializedVm {
                 device_assignment_msi_iova_range,
                 user_mode_memory_faults,
                 lazy_memory_registration,
-                versioned_cpu_contract: microvm::uses_versioned_cpu_contract(cfg.machine_profile),
+                #[cfg(guest_arch = "x86_64")]
+                time_abi: time_abi_config,
             })
             .context("failed to create the prototype partition")?;
         partition_prototype.complete("startup", "partition_prototype", Default::default());
@@ -1642,6 +1670,8 @@ impl InitializedVm {
             processor_topology,
             igvm_file,
             driver_source,
+            #[cfg(guest_arch = "x86_64")]
+            time_abi_partition,
         })
     }
 
@@ -1674,6 +1704,8 @@ impl InitializedVm {
             processor_topology,
             igvm_file,
             driver_source,
+            #[cfg(guest_arch = "x86_64")]
+            time_abi_partition,
         } = self;
 
         let instantiated_vp_count = snapshot_restore.select_instantiated_vps(
@@ -1896,6 +1928,7 @@ impl InitializedVm {
 
         let vmtime = state_units
             .add("vmtime")
+            .advances_time()
             .spawn(driver_source.simple(), {
                 |recv| {
                     let mut vmtime = vmtime_keeper;
@@ -1906,6 +1939,91 @@ impl InitializedVm {
                 }
             })
             .unwrap();
+
+        #[cfg(guest_arch = "x86_64")]
+        let time_abi_state = match time_abi_partition {
+            Some(time_abi::PartitionTimeAbi {
+                msrs,
+                profile,
+                effective_cpuid,
+            }) => {
+                let parameters = cfg
+                    .microvm
+                    .time_abi
+                    .as_ref()
+                    .context("time ABI parameters are missing")?;
+                let hypervisor = &cfg.microvm.hypervisor_id;
+                let restore = snapshot_restore.time_abi.as_ref();
+                anyhow::ensure!(
+                    saved_state.is_some() == restore.is_some(),
+                    "a time ABI restore requires both the saved state and the time ABI restore inputs"
+                );
+                let checks_started = std::time::Instant::now();
+                if let Some(input) = restore {
+                    anyhow::ensure!(
+                        input.cpu_profile.id == profile.id(),
+                        "the partition's CPU profile '{}' is not the snapshot's '{}'",
+                        profile.id(),
+                        input.cpu_profile.id
+                    );
+                    time_abi::check_recorded_cpuid(&effective_cpuid, &input.cpu_profile)?;
+                }
+                let recorded_done = std::time::Instant::now();
+                time_abi::check_presented_cpuid(
+                    partition.as_ref(),
+                    hypervisor,
+                    profile,
+                    &effective_cpuid,
+                )?;
+                let presented_done = std::time::Instant::now();
+                time_abi::check_profile_support(partition.as_ref(), hypervisor, profile)?;
+                let support_done = std::time::Instant::now();
+                tracing::info!(
+                    cpu_profile = profile.id(),
+                    recorded_cpuid_us = (recorded_done - checks_started).as_micros() as u64,
+                    presented_cpuid_us = (presented_done - recorded_done).as_micros() as u64,
+                    profile_support_us = (support_done - presented_done).as_micros() as u64,
+                    "time ABI CPU checks passed"
+                );
+                let report = time_abi::declare_rates(
+                    partition.as_ref(),
+                    &msrs,
+                    hypervisor,
+                    profile.id().to_owned(),
+                    restore.map(|input| virt::time_abi::DeclaredRates {
+                        tsc_hz: input.contract.tsc_frequency_hz,
+                        apic_hz: input.contract.apic_frequency_hz,
+                    }),
+                    &parameters.hooks,
+                )?;
+                let unit = state_units
+                    .add(time_abi::TIME_ABI_UNIT)
+                    .spawn(driver_source.simple(), {
+                        let msrs = msrs.clone();
+                        let report = report.clone();
+                        move |recv| {
+                            state_unit::run_unit(time_abi::TimeAbiUnit { msrs, report }, recv)
+                        }
+                    })
+                    .unwrap();
+                Some(time_abi::TimeAbiState {
+                    _unit: unit,
+                    msrs,
+                    profile,
+                    effective_cpuid,
+                    report,
+                    generation: parameters.generation,
+                    hooks: parameters.hooks.clone(),
+                })
+            }
+            None => {
+                anyhow::ensure!(
+                    snapshot_restore.time_abi.is_none(),
+                    "time ABI restore inputs require a time ABI partition"
+                );
+                None
+            }
+        };
 
         let mut input_distributor = InputDistributor::new(cfg.input);
         resolver.add_async_resolver::<KeyboardInputHandleKind, _, MultiplexedInputHandle, _>(
@@ -3278,6 +3396,8 @@ impl InitializedVm {
                 partition,
                 chipset_devices: devices,
                 _vmtime: vmtime,
+                #[cfg(guest_arch = "x86_64")]
+                time_abi: time_abi_state,
                 memory_manager,
                 gm,
                 vtl0_hvsock_relay,
@@ -3328,7 +3448,7 @@ impl InitializedVm {
         };
 
         if let Some(saved_state) = saved_state {
-            let saved_state_restore = this.begin_snapshot_restore(&saved_state)?;
+            let saved_state_restore = this.begin_snapshot_restore(&saved_state).await?;
             this.restore(saved_state)
                 .await
                 .context("loadedvm restore failed")?;
@@ -3871,7 +3991,7 @@ impl LoadedVm {
             VmRpc(Result<VmRpc, mesh::RecvError>),
             Halt(Result<HaltReason, mesh::RecvError>),
             SnapshotBoundary(microvm::SnapshotBoundaryEvent),
-            RestoreGateTimeout,
+            Restore(restore::RestoreEvent),
         }
 
         // Start a task to handle state unit inspections by filtering the worker
@@ -3900,10 +4020,7 @@ impl LoadedVm {
                 let b = worker_rpc.recv().map(Event::WorkerRpc);
                 let c = self.inner.halt_recv.recv().map(Event::Halt);
                 let d = self.snapshot_boundary.recv().map(Event::SnapshotBoundary);
-                let e = self
-                    .snapshot_restore
-                    .gate_expired(driver)
-                    .map(|()| Event::RestoreGateTimeout);
+                let e = self.snapshot_restore.next_event(driver).map(Event::Restore);
                 (a, b, c, d, e).race().await
             };
 
@@ -4356,9 +4473,12 @@ impl LoadedVm {
                         break;
                     }
                 }
-                Event::RestoreGateTimeout => {
+                Event::Restore(restore::RestoreEvent::GateExpired) => {
                     self.handle_restore_gate_timeout().await;
                     break;
+                }
+                Event::Restore(restore::RestoreEvent::PacketSelected) => {
+                    self.snapshot_restore.restore_packet_selected();
                 }
             }
         }

@@ -23,7 +23,6 @@ use super::output::MicrovmOutputDrain;
 use super::output::OutputCompletion;
 use super::output::spawn_output;
 use super::restore::fresh_microvm_generation_id;
-use super::restore::fresh_microvm_restore_packet;
 use crate::ConsoleState;
 use crate::Options;
 use crate::VmResources;
@@ -394,23 +393,26 @@ impl<'a> MicrovmConfigBuilder<'a> {
         let opt = self.opt;
         let (drain, output_drain) = MicrovmOutputDrain::new(Some(output_completion));
         self.resources.output_drain = Some(drain);
-        let (generation_id, restore_entropy) =
-            if opt.microvm.restore_entropy || self.restore.memory_target_requested {
-                fresh_microvm_restore_packet(
-                    opt.microvm.restore_processors,
-                    self.restore.memory_target_requested,
-                    &self.restore.memory_ranges,
-                )?
-            } else {
-                (fresh_microvm_generation_id()?, Vec::new())
-            };
+        let (generation_id, time_abi_restore) = if self.restore.machine_contract.is_some() {
+            let (generation_id, base) = self
+                .restore
+                .time_abi_restore_packet(opt.microvm.restore_processors)?;
+            (
+                generation_id,
+                Some(self.resources.time_abi_restore_packet(base)),
+            )
+        } else {
+            (fresh_microvm_generation_id()?, None)
+        };
+        let hooks = time_abi_test_hooks(opt)?;
+        let time_abi = super::time_abi_chipset(chipset_devices, &hooks, time_abi_restore);
         chipset_devices.push(ChipsetDeviceHandle {
             name: MicrovmPortbHandle::ID.to_owned(),
             resource: MicrovmPortbHandle {
                 io,
                 generation_id,
-                restore_entropy,
                 output_drain: Some(output_drain),
+                time_abi,
             }
             .into_resource(),
         });
@@ -680,6 +682,33 @@ impl<'a> MicrovmConfigBuilder<'a> {
                 memory_range::MemoryRange::new(range.gpa_start..range.gpa_start + range.length)
             })
             .collect();
+        if cfg.machine_profile == MachineProfile::Microvm {
+            let hooks = time_abi_test_hooks(opt)?;
+            if hooks.active() {
+                tracing::warn!(?hooks, "time ABI test hooks are active");
+            }
+            let requested_profile = opt.microvm.cpu_profile.as_deref().unwrap_or("auto");
+            let (cpu_profile, generation) = match self.restore.time_abi_records() {
+                // The controller's restore preflight checks the requested
+                // profile against the snapshot's.
+                Some((time, record)) => {
+                    (record.id.clone(), time.capture_generation.saturating_add(1))
+                }
+                None => (requested_profile.to_owned(), 0),
+            };
+            cfg.microvm.time_abi = Some(openvmm_defs::time_abi::TimeAbiParameters {
+                cpu_profile,
+                generation,
+                hooks,
+            });
+        } else {
+            anyhow::ensure!(
+                opt.microvm.cpu_profile.is_none()
+                    && opt.microvm.x_time_abi_test_hook.is_empty()
+                    && !opt.microvm.x_time_abi_verify,
+                "--cpu-profile, --x-time-abi-test-hook, and --x-time-abi-verify require the microVM machine profile"
+            );
+        }
 
         let requested_hypervisor = opt
             .hypervisor
@@ -779,6 +808,13 @@ fn setup_host_console(
         }
         _ => unreachable!("microVM host consoles use the console or stderr"),
     })
+}
+
+/// Returns the time ABI test hooks selected on the command line.
+fn time_abi_test_hooks(opt: &Options) -> anyhow::Result<virt::time_abi::TimeAbiTestHooks> {
+    Ok(virt::time_abi::TimeAbiTestHooks::parse(
+        &opt.microvm.x_time_abi_test_hook,
+    )?)
 }
 
 fn build_effective_microvm_command_line(

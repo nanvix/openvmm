@@ -39,11 +39,16 @@ mod ioctl {
 
     const KVMIO: u8 = 0xae;
 
+    ioctl_write_int_bad!(kvm_get_api_version, request_code_none!(KVMIO, 0x0));
     ioctl_write_int_bad!(kvm_create_vm, request_code_none!(KVMIO, 0x1));
+    #[cfg(target_arch = "x86_64")]
+    ioctl_readwrite!(kvm_get_msr_index_list, KVMIO, 0x02, kvm_msr_list);
     ioctl_write_int_bad!(kvm_check_extension, request_code_none!(KVMIO, 0x03));
     ioctl_write_int_bad!(kvm_get_vcpu_mmap_size, request_code_none!(KVMIO, 0x04));
     #[cfg(target_arch = "x86_64")]
     ioctl_readwrite!(kvm_get_supported_cpuid, KVMIO, 0x05, kvm_cpuid2);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_readwrite!(kvm_get_msr_feature_index_list, KVMIO, 0x0a, kvm_msr_list);
     #[cfg(target_arch = "x86_64")]
     ioctl_readwrite!(kvm_get_supported_hv_cpuid, KVMIO, 0xc1, kvm_cpuid2);
     ioctl_write_int_bad!(kvm_create_vcpu, request_code_none!(KVMIO, 0x41));
@@ -98,8 +103,6 @@ mod ioctl {
     #[cfg(target_arch = "x86_64")]
     ioctl_write_ptr!(kvm_set_debugregs, KVMIO, 0xa2, kvm_debugregs);
     #[cfg(target_arch = "x86_64")]
-    ioctl_write_int_bad!(kvm_set_tsc_khz, request_code_none!(KVMIO, 0xa2));
-    #[cfg(target_arch = "x86_64")]
     ioctl_write_int_bad!(kvm_get_tsc_khz, request_code_none!(KVMIO, 0xa3));
     ioctl_write_ptr!(kvm_enable_cap, KVMIO, 0xa3, kvm_enable_cap);
     #[cfg(target_arch = "x86_64")]
@@ -133,6 +136,10 @@ mod ioctl {
     ioctl_write_ptr!(kvm_set_device_attr, KVMIO, 0xe1, kvm_device_attr);
     #[cfg(target_arch = "x86_64")]
     ioctl_write_ptr!(kvm_get_device_attr, KVMIO, 0xe2, kvm_device_attr);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_write_ptr!(kvm_has_device_attr, KVMIO, 0xe3, kvm_device_attr);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_write_ptr!(kvm_x86_set_msr_filter, KVMIO, 0xc6, kvm_msr_filter);
     ioctl_readwrite!(kvm_create_guest_memfd, KVMIO, 0xd4, kvm_create_guest_memfd);
     #[cfg(target_arch = "aarch64")]
     ioctl_readwrite_bad!(
@@ -291,9 +298,6 @@ pub enum Error {
     #[error("GetTscFrequency")]
     GetTscFrequency(#[source] nix::Error),
     #[cfg(target_arch = "x86_64")]
-    #[error("SetTscFrequency")]
-    SetTscFrequency(#[source] nix::Error),
-    #[cfg(target_arch = "x86_64")]
     #[error("GetTscOffset")]
     GetTscOffset(#[source] nix::Error),
     #[cfg(target_arch = "x86_64")]
@@ -356,6 +360,12 @@ pub enum Error {
         requested: usize,
         failed_msr: u32,
     },
+    #[cfg(target_arch = "x86_64")]
+    #[error("SetMsrFilter")]
+    SetMsrFilter(#[source] nix::Error),
+    #[cfg(target_arch = "x86_64")]
+    #[error("invalid MSR filter: {0}")]
+    InvalidMsrFilter(&'static str),
     #[error("SetupMce")]
     SetupMce(#[source] nix::Error),
     #[error("GetMceCapSupported")]
@@ -392,6 +402,20 @@ pub enum Error {
     GetClock(#[source] nix::Error),
     #[error("SetClock")]
     SetClock(#[source] nix::Error),
+    #[error("GetApiVersion")]
+    GetApiVersion(#[source] nix::Error),
+    #[cfg(target_arch = "x86_64")]
+    #[error("GetMsrIndexList")]
+    GetMsrIndexList(#[source] nix::Error),
+    #[cfg(target_arch = "x86_64")]
+    #[error("GetMsrFeatureIndexList")]
+    GetMsrFeatureIndexList(#[source] nix::Error),
+    #[cfg(target_arch = "x86_64")]
+    #[error("GetFeatureMsr({0:#x})")]
+    GetFeatureMsr(u32, #[source] nix::Error),
+    #[cfg(target_arch = "x86_64")]
+    #[error("KVM did not report the MSR-based feature {0:#x}")]
+    FeatureMsrNotReported(u32),
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -516,6 +540,111 @@ impl Kvm {
         unsafe { ioctl::kvm_check_extension(self.as_fd().as_raw_fd(), extension as i32) }
     }
 
+    /// Returns the KVM API version (`KVM_GET_API_VERSION`), which is 12 for
+    /// every stable KVM.
+    pub fn api_version(&self) -> Result<i32> {
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe { ioctl::kvm_get_api_version(self.as_fd().as_raw_fd(), 0) }
+            .map_err(Error::GetApiVersion)
+    }
+
+    /// Returns the MSRs that KVM can save and restore for a vCPU
+    /// (`KVM_GET_MSR_INDEX_LIST`).
+    #[cfg(target_arch = "x86_64")]
+    pub fn msr_index_list(&self) -> Result<Vec<u32>> {
+        self.msr_list(ioctl::kvm_get_msr_index_list)
+            .map_err(Error::GetMsrIndexList)
+    }
+
+    /// Returns the MSR-based features that KVM reports
+    /// (`KVM_GET_MSR_FEATURE_INDEX_LIST`).
+    #[cfg(target_arch = "x86_64")]
+    pub fn msr_feature_index_list(&self) -> Result<Vec<u32>> {
+        self.msr_list(ioctl::kvm_get_msr_feature_index_list)
+            .map_err(Error::GetMsrFeatureIndexList)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn msr_list(
+        &self,
+        get: unsafe fn(libc::c_int, *mut kvm_msr_list) -> nix::Result<libc::c_int>,
+    ) -> nix::Result<Vec<u32>> {
+        const MAX_MSR_LIST_ENTRIES: usize = 1024;
+
+        #[repr(C)]
+        struct MsrList {
+            header: kvm_msr_list,
+            indices: [u32; MAX_MSR_LIST_ENTRIES],
+        }
+
+        let mut list = MsrList {
+            header: kvm_msr_list {
+                nmsrs: MAX_MSR_LIST_ENTRIES as u32,
+                ..Default::default()
+            },
+            indices: [0; MAX_MSR_LIST_ENTRIES],
+        };
+        // SAFETY: The header is immediately followed by space for `nmsrs`
+        // indices, as the ioctl requires.
+        unsafe {
+            get(self.as_fd().as_raw_fd(), &mut list.header)?;
+        }
+        let count = (list.header.nmsrs as usize).min(MAX_MSR_LIST_ENTRIES);
+        Ok(list.indices[..count].to_vec())
+    }
+
+    /// Returns the value that KVM reports for the MSR-based feature `index`
+    /// (`KVM_GET_MSRS` on the system file descriptor).
+    #[cfg(target_arch = "x86_64")]
+    pub fn feature_msr(&self, index: u32) -> Result<u64> {
+        #[repr(C)]
+        struct Msrs {
+            header: kvm_msrs,
+            entries: [kvm_msr_entry; 1],
+        }
+
+        let mut msrs = Msrs {
+            header: kvm_msrs {
+                nmsrs: 1,
+                ..Default::default()
+            },
+            entries: [kvm_msr_entry {
+                index,
+                reserved: 0,
+                data: 0,
+            }],
+        };
+        // SAFETY: The header is immediately followed by `nmsrs` entries, as
+        // the ioctl requires.
+        let read = unsafe { ioctl::kvm_get_msrs(self.as_fd().as_raw_fd(), &mut msrs.header) }
+            .map_err(|err| Error::GetFeatureMsr(index, err))?;
+        if read != 1 {
+            return Err(Error::FeatureMsrNotReported(index));
+        }
+        Ok(msrs.entries[0].data)
+    }
+
+    /// Returns the XSAVE features that KVM supports for guests
+    /// (`KVM_X86_XCOMP_GUEST_SUPP`), including dynamically enabled features
+    /// that a VMM must request permission for before KVM reports them in
+    /// [`Self::supported_cpuid`].
+    #[cfg(target_arch = "x86_64")]
+    pub fn xsave_guest_supported(&self) -> Result<u64> {
+        let mut value = 0u64;
+        let attr = kvm_device_attr {
+            group: KVM_X86_GRP_SYSTEM,
+            attr: u64::from(KVM_X86_XCOMP_GUEST_SUPP),
+            addr: std::ptr::from_mut(&mut value) as u64,
+            flags: 0,
+        };
+        // SAFETY: `attr.addr` points to `value` for the duration of the ioctl.
+        unsafe {
+            ioctl::kvm_get_device_attr(self.as_fd().as_raw_fd(), &attr)
+                .map_err(Error::GetDeviceAttr)?;
+        }
+        Ok(value)
+    }
+
     pub fn new_vm(&self, vm_type: VmType) -> Result<Partition> {
         let raw_vm_type = self.raw_vm_type(vm_type)?;
         self.new_vm_with_type(raw_vm_type)
@@ -625,6 +754,76 @@ struct Cpuid {
     entries: [kvm_cpuid_entry2; 256],
 }
 
+/// One range of an MSR filter installed with [`Partition::set_msr_filter`].
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MsrFilterRange {
+    /// The first MSR of the range.
+    pub base: u32,
+    /// The number of MSRs in the range.
+    pub nmsrs: u32,
+    /// Whether the range applies to reads.
+    pub read: bool,
+    /// Whether the range applies to writes.
+    pub write: bool,
+    /// One bit per MSR, LSB first: a set bit lets KVM handle the access, a
+    /// clear bit denies it. A denied access raises #GP in the guest or, with
+    /// `KVM_MSR_EXIT_REASON_FILTER` enabled, exits to user space. Holds
+    /// `nmsrs.div_ceil(8)` bytes.
+    pub bitmap: Vec<u8>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl MsrFilterRange {
+    /// Returns a range that denies reads and writes of every MSR in `msrs`.
+    pub fn deny(msrs: std::ops::RangeInclusive<u32>) -> Self {
+        let nmsrs = msrs.end() - msrs.start() + 1;
+        Self {
+            base: *msrs.start(),
+            nmsrs,
+            read: true,
+            write: true,
+            bitmap: vec![0; nmsrs.div_ceil(8) as usize],
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.nmsrs == 0 {
+            return Err(Error::InvalidMsrFilter("empty range"));
+        }
+        if !self.read && !self.write {
+            return Err(Error::InvalidMsrFilter("range applies to no access"));
+        }
+        if self.bitmap.len() != self.nmsrs.div_ceil(8) as usize
+            || self.kvm_bitmap_words() * 8 > KVM_MSR_FILTER_MAX_BITMAP_SIZE as usize
+        {
+            return Err(Error::InvalidMsrFilter(
+                "bitmap size does not match the range",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The number of 64-bit words of the bitmap that KVM copies,
+    /// `BITS_TO_LONGS(nmsrs)`.
+    fn kvm_bitmap_words(&self) -> usize {
+        self.nmsrs.div_ceil(64) as usize
+    }
+
+    /// Returns the bitmap as KVM reads it: [`Self::kvm_bitmap_words`] words
+    /// that hold the bytes of `bitmap` in order, little-endian, followed by
+    /// zero padding. Bit `i` stays the bit for MSR `base + i`.
+    fn kvm_bitmap(&self) -> Vec<u64> {
+        let mut words = vec![0; self.kvm_bitmap_words()];
+        for (word, bytes) in words.iter_mut().zip(self.bitmap.chunks(8)) {
+            let mut le = [0; 8];
+            le[..bytes.len()].copy_from_slice(bytes);
+            *word = u64::from_le_bytes(le);
+        }
+        words
+    }
+}
+
 #[derive(Debug)]
 pub struct Partition {
     vm: File,
@@ -666,6 +865,19 @@ impl Partition {
     pub fn check_extension(&self, extension: u32) -> nix::Result<libc::c_int> {
         // SAFETY: Calling IOCTL as documented, with no special requirements.
         unsafe { ioctl::kvm_check_extension(self.vm.as_raw_fd(), extension as i32) }
+    }
+
+    /// Returns the TSC frequency, in Hz, that new vCPUs of this VM get
+    /// (`KVM_GET_TSC_KHZ` on the VM, which requires `KVM_CAP_VM_TSC_CONTROL`).
+    #[cfg(target_arch = "x86_64")]
+    pub fn tsc_frequency_hz(&self) -> Result<u64> {
+        // SAFETY: Calling the documented VM ioctl with no pointer argument.
+        let khz = unsafe { ioctl::kvm_get_tsc_khz(self.vm.as_raw_fd(), 0) }
+            .map_err(Error::GetTscFrequency)?;
+        if khz <= 0 {
+            return Err(Error::GetTscFrequency(nix::errno::Errno::EINVAL));
+        }
+        Ok(khz as u64 * 1000)
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -831,6 +1043,12 @@ impl Partition {
     }
 
     pub fn enable_unknown_msr_exits(&self) -> Result<()> {
+        self.enable_msr_exits(KVM_MSR_EXIT_REASON_UNKNOWN)
+    }
+
+    /// Enables user-space MSR exits (`KVM_CAP_X86_USER_SPACE_MSR`) for the
+    /// `KVM_MSR_EXIT_REASON_*` bits in `reasons`, replacing the previous set.
+    pub fn enable_msr_exits(&self, reasons: u32) -> Result<()> {
         // SAFETY: Calling IOCTL as documented, with no special requirements.
         // TODO: We are not checking KVM_CAP_ENABLE_CAP_VM first.
         unsafe {
@@ -838,11 +1056,60 @@ impl Partition {
                 self.vm.as_raw_fd(),
                 &kvm_enable_cap {
                     cap: KVM_CAP_X86_USER_SPACE_MSR,
-                    args: [KVM_MSR_EXIT_REASON_UNKNOWN.into(), 0, 0, 0],
+                    args: [reasons.into(), 0, 0, 0],
                     ..Default::default()
                 },
             )
             .map_err(|err| Error::EnableCap("user_space_msr", err))?;
+        }
+        Ok(())
+    }
+
+    /// Installs an MSR filter (`KVM_X86_SET_MSR_FILTER`), replacing the
+    /// previous one. KVM checks `ranges` in order and uses the first range
+    /// that covers the MSR and the access type; accesses no range covers are
+    /// allowed if `default_allow`, and denied otherwise.
+    ///
+    /// The filter applies to guest accesses only: host-initiated
+    /// `KVM_GET_MSRS` and `KVM_SET_MSRS` bypass it. KVM never filters the
+    /// x2APIC MSRs.
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_msr_filter(&self, default_allow: bool, ranges: &[MsrFilterRange]) -> Result<()> {
+        if ranges.len() > KVM_MSR_FILTER_MAX_RANGES as usize {
+            return Err(Error::InvalidMsrFilter("too many ranges"));
+        }
+        let mut filter = kvm_msr_filter {
+            flags: if default_allow {
+                KVM_MSR_FILTER_DEFAULT_ALLOW
+            } else {
+                KVM_MSR_FILTER_DEFAULT_DENY
+            },
+            ..Default::default()
+        };
+        // KVM copies each bitmap in whole `long`s, so it gets padded copies.
+        let bitmaps = ranges
+            .iter()
+            .map(|range| {
+                range.validate()?;
+                Ok(range.kvm_bitmap())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for ((slot, range), bitmap) in filter.ranges.iter_mut().zip(ranges).zip(&bitmaps) {
+            *slot = kvm_msr_filter_range {
+                flags: if range.read { KVM_MSR_FILTER_READ } else { 0 }
+                    | if range.write { KVM_MSR_FILTER_WRITE } else { 0 },
+                nmsrs: range.nmsrs,
+                base: range.base,
+                // KVM only reads the bitmap, and copies it during the ioctl.
+                bitmap: bitmap.as_ptr().cast::<u8>().cast_mut(),
+            };
+        }
+        // SAFETY: `filter` and `bitmaps` are valid for the duration of the
+        // ioctl. KVM copies `BITS_TO_LONGS(nmsrs) * sizeof(long)` bytes of
+        // each range's bitmap, which is the size of its padded copy.
+        unsafe {
+            ioctl::kvm_x86_set_msr_filter(self.vm.as_raw_fd(), &filter)
+                .map_err(Error::SetMsrFilter)?;
         }
         Ok(())
     }
@@ -1303,18 +1570,6 @@ impl<'a> Processor<'a> {
         Ok(khz as u64 * 1000)
     }
 
-    #[cfg(target_arch = "x86_64")]
-    pub fn set_tsc_frequency_hz(&self, frequency_hz: u64) -> Result<()> {
-        let khz = frequency_hz
-            .checked_div(1000)
-            .and_then(|khz| libc::c_int::try_from(khz).ok())
-            .ok_or(Error::SetTscFrequency(nix::errno::Errno::EINVAL))?;
-        // SAFETY: Calling the documented vCPU ioctl with its integer value.
-        unsafe { ioctl::kvm_set_tsc_khz(self.get().vcpu.as_raw_fd(), khz) }
-            .map_err(Error::SetTscFrequency)?;
-        Ok(())
-    }
-
     /// Gets the guest TSC offset, in guest TSC cycles.
     #[cfg(target_arch = "x86_64")]
     pub fn tsc_offset(&self) -> Result<u64> {
@@ -1340,6 +1595,42 @@ impl<'a> Processor<'a> {
         unsafe {
             self.set_device_attr(KVM_VCPU_TSC_CTRL, KVM_VCPU_TSC_OFFSET, &offset, 0)
                 .map_err(Error::SetTscOffset)?;
+        }
+        Ok(())
+    }
+
+    /// Returns whether the vCPU supports the `KVM_VCPU_TSC_OFFSET` attribute
+    /// (`KVM_HAS_DEVICE_ATTR`, Linux 5.16 and later).
+    #[cfg(target_arch = "x86_64")]
+    pub fn has_tsc_offset_attr(&self) -> bool {
+        let attr = kvm_device_attr {
+            group: KVM_VCPU_TSC_CTRL,
+            attr: u64::from(KVM_VCPU_TSC_OFFSET),
+            addr: 0,
+            flags: 0,
+        };
+        // SAFETY: KVM_HAS_DEVICE_ATTR does not dereference `attr.addr`.
+        unsafe { ioctl::kvm_has_device_attr(self.get().vcpu.as_raw_fd(), &attr) }.is_ok()
+    }
+
+    /// Makes KVM honor the guest's KVM paravirtual feature leaf (`0x40000001`),
+    /// so that the paravirtual features it doesn't advertise, such as KVM's
+    /// paravirtual MSRs, are unavailable to the guest
+    /// (`KVM_CAP_ENFORCE_PV_FEATURE_CPUID` on the vCPU).
+    #[cfg(target_arch = "x86_64")]
+    pub fn enable_enforce_pv_feature_cpuid(&self) -> Result<()> {
+        // SAFETY: Calling IOCTL as documented. The capability's only argument
+        // is a flag, which KVM does not dereference.
+        unsafe {
+            ioctl::kvm_enable_cap(
+                self.get().vcpu.as_raw_fd(),
+                &kvm_enable_cap {
+                    cap: KVM_CAP_ENFORCE_PV_FEATURE_CPUID,
+                    args: [1, 0, 0, 0],
+                    ..Default::default()
+                },
+            )
+            .map_err(|err| Error::EnableCap("enforce_pv_feature_cpuid", err))?;
         }
         Ok(())
     }
@@ -2335,5 +2626,92 @@ mod tests {
         assert_eq!(update.len, 0x2000);
         assert_eq!(update.type_, KVM_SEV_SNP_PAGE_TYPE_ZERO_UAPI);
         assert_eq!(update.flags, 0);
+    }
+
+    #[test]
+    fn msr_filter_deny_range_covers_every_msr() {
+        let range = MsrFilterRange::deny(0x4000_0000..=0x4000_01ff);
+        assert_eq!(range.base, 0x4000_0000);
+        assert_eq!(range.nmsrs, 0x200);
+        assert!(range.read && range.write);
+        assert_eq!(range.bitmap, vec![0; 0x40]);
+        range.validate().unwrap();
+
+        let single = MsrFilterRange::deny(0x3b..=0x3b);
+        assert_eq!((single.base, single.nmsrs), (0x3b, 1));
+        assert_eq!(single.bitmap, vec![0]);
+        single.validate().unwrap();
+    }
+
+    #[test]
+    fn msr_filter_bitmap_is_padded_to_whole_words() {
+        let max = KVM_MSR_FILTER_MAX_BITMAP_SIZE * 8;
+        for (nmsrs, words) in [
+            (1, 1),
+            (8, 1),
+            (63, 1),
+            (64, 1),
+            (65, 2),
+            (256, 4),
+            (max, max as usize / 64),
+        ] {
+            let mut range = MsrFilterRange::deny(0x100..=0x100 + nmsrs - 1);
+            for (i, byte) in range.bitmap.iter_mut().enumerate() {
+                *byte = (i as u8).wrapping_mul(37) ^ 0xa5;
+            }
+            range.validate().unwrap();
+            let padded = range.kvm_bitmap();
+            // KVM copies BITS_TO_LONGS(nmsrs) * sizeof(long) bytes.
+            assert_eq!(padded.len(), words, "{nmsrs} MSRs");
+            let bytes: Vec<u8> = padded.iter().flat_map(|word| word.to_le_bytes()).collect();
+            assert_eq!(
+                bytes[..range.bitmap.len()],
+                range.bitmap[..],
+                "{nmsrs} MSRs"
+            );
+            assert!(
+                bytes[range.bitmap.len()..].iter().all(|&byte| byte == 0),
+                "{nmsrs} MSRs"
+            );
+            // KVM tests bit `i` of the `long` array for MSR `base + i`.
+            for i in 0..nmsrs as usize {
+                assert_eq!(
+                    u64::from((range.bitmap[i / 8] >> (i % 8)) & 1),
+                    (padded[i / 64] >> (i % 64)) & 1,
+                    "{nmsrs} MSRs, bit {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn msr_filter_rejects_malformed_ranges() {
+        let valid = MsrFilterRange::deny(0x10..=0x1f);
+        for range in [
+            MsrFilterRange {
+                nmsrs: 0,
+                bitmap: Vec::new(),
+                ..valid.clone()
+            },
+            MsrFilterRange {
+                read: false,
+                write: false,
+                ..valid.clone()
+            },
+            MsrFilterRange {
+                bitmap: vec![0; 3],
+                ..valid.clone()
+            },
+            MsrFilterRange {
+                nmsrs: (KVM_MSR_FILTER_MAX_BITMAP_SIZE + 1) * 8,
+                bitmap: vec![0; KVM_MSR_FILTER_MAX_BITMAP_SIZE as usize + 1],
+                ..valid.clone()
+            },
+        ] {
+            assert!(
+                matches!(range.validate(), Err(Error::InvalidMsrFilter(_))),
+                "{range:?}"
+            );
+        }
     }
 }

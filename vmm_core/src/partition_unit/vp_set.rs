@@ -6,7 +6,7 @@
 mod boundary;
 mod prefix;
 #[cfg(guest_arch = "x86_64")]
-mod tsc;
+mod time_abi;
 
 use super::HaltReason;
 use super::HaltReasonReceiver;
@@ -83,9 +83,13 @@ trait ControlVp: ProtobufSaveRestore {
     /// Scrub per-VP state for a VTL.
     fn scrub(&mut self, vtl: Vtl) -> anyhow::Result<()>;
 
-    /// Advances the stopped vCPU TSC after snapshot downtime.
+    /// Checks the stopped vCPU's LAPIC timer for the time ABI.
     #[cfg(guest_arch = "x86_64")]
-    fn advance_tsc(&mut self, advance: tsc::TscAdvance) -> anyhow::Result<()>;
+    fn check_one_shot_timer(&mut self) -> anyhow::Result<()>;
+
+    /// Advances the stopped vCPU's one-shot LAPIC timer for the time ABI.
+    #[cfg(guest_arch = "x86_64")]
+    fn advance_lapic_timer(&mut self, advance: time_abi::LapicAdvance) -> anyhow::Result<()>;
 
     #[cfg(feature = "gdb")]
     fn debug(&mut self) -> &mut dyn DebugVp;
@@ -185,7 +189,12 @@ where
     }
 
     #[cfg(guest_arch = "x86_64")]
-    fn advance_tsc(&mut self, advance: tsc::TscAdvance) -> anyhow::Result<()> {
+    fn check_one_shot_timer(&mut self) -> anyhow::Result<()> {
+        time_abi::check_one_shot_timer(self.vp)
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn advance_lapic_timer(&mut self, advance: time_abi::LapicAdvance) -> anyhow::Result<()> {
         advance.apply(self.vp)
     }
 
@@ -1125,7 +1134,9 @@ enum StateEvent {
     Reset(mesh::rpc::FailableRpc<(), ()>),
     Scrub(mesh::rpc::FailableRpc<Vtl, ()>),
     #[cfg(guest_arch = "x86_64")]
-    AdvanceTsc(mesh::rpc::FailableRpc<tsc::TscAdvance, ()>),
+    CheckTimers(mesh::rpc::FailableRpc<(), ()>),
+    #[cfg(guest_arch = "x86_64")]
+    AdvanceLapic(mesh::rpc::FailableRpc<time_abi::LapicAdvance, ()>),
     #[cfg(feature = "dump")]
     GetDumpVpState(Rpc<Vtl, anyhow::Result<hyperv_dump::VpState>>),
     #[cfg(feature = "gdb")]
@@ -1373,7 +1384,13 @@ impl RunnerInner {
             StateEvent::Reset(rpc) => rpc.handle_failable_sync(|()| vp.reset()),
             StateEvent::Scrub(rpc) => rpc.handle_failable_sync(|vtl| vp.scrub(vtl)),
             #[cfg(guest_arch = "x86_64")]
-            StateEvent::AdvanceTsc(rpc) => rpc.handle_failable_sync(|tsc| vp.advance_tsc(tsc)),
+            StateEvent::CheckTimers(rpc) => {
+                rpc.handle_failable_sync(|()| vp.check_one_shot_timer())
+            }
+            #[cfg(guest_arch = "x86_64")]
+            StateEvent::AdvanceLapic(rpc) => {
+                rpc.handle_failable_sync(|advance| vp.advance_lapic_timer(advance))
+            }
             #[cfg(feature = "dump")]
             StateEvent::GetDumpVpState(rpc) => rpc.handle_sync(|vtl| vp.get_dump_vp_state(vtl)),
             #[cfg(feature = "gdb")]

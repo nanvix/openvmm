@@ -15,6 +15,7 @@ ttrpc = []
 [dependencies]
 chipset_resources.workspace = true
 chipset_device_worker_defs.workspace = true
+cpu_profile.workspace = true
 crypto.workspace = true
 cxl_spec.workspace = true
 debug_worker_defs.workspace = true
@@ -60,6 +61,7 @@ vmgs_format.workspace = true
 vmgs_resources.workspace = true
 vm_manifest_builder.workspace = true
 vm_resource.workspace = true
+virt.workspace = true
 vtl2_settings_proto.workspace = true
 pcie_remote_resources.workspace = true
 

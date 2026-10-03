@@ -23,6 +23,46 @@ pub(crate) struct MshvFinalizedPartition {
     pub(super) caps: virt::PartitionCapabilities,
 }
 
+/// The CPUID entries that the partition capabilities read
+/// (`X86PartitionCapabilities::from_cpuid`): the maximum and feature leaves,
+/// SGX, every architectural XSAVE component, the address sizes and SEV
+/// leaves, and the hypervisor leaves. Finalization reads them in one bulk
+/// call.
+const CAPS_CPUID_ENTRIES: [(u32, u32); 32] = [
+    (0x0, 0),
+    (0x1, 0),
+    (0x7, 0),
+    (0x12, 2),
+    (0xd, 0),
+    (0xd, 1),
+    (0xd, 2),
+    (0xd, 3),
+    (0xd, 4),
+    (0xd, 5),
+    (0xd, 6),
+    (0xd, 7),
+    (0xd, 8),
+    (0xd, 9),
+    (0xd, 10),
+    (0xd, 11),
+    (0xd, 12),
+    (0xd, 13),
+    (0xd, 14),
+    (0xd, 15),
+    (0xd, 16),
+    (0xd, 17),
+    (0xd, 18),
+    (0xd, 19),
+    (0x8000_0000, 0),
+    (0x8000_0001, 0),
+    (0x8000_0008, 0),
+    (0x8000_001f, 0),
+    (hvdef::HV_CPUID_FUNCTION_HV_VENDOR_AND_MAX_FUNCTION, 0),
+    (hvdef::HV_CPUID_FUNCTION_HV_INTERFACE, 0),
+    (hvdef::HV_CPUID_FUNCTION_MS_HV_FEATURES, 0),
+    (hvdef::HV_CPUID_FUNCTION_MS_HV_ISOLATION_CONFIGURATION, 0),
+];
+
 /// Partition creation settings that are needed after the partition is built.
 #[derive(Inspect)]
 pub(crate) struct CreationConfig {
@@ -117,23 +157,52 @@ impl MshvPartitionInner {
                 "MSHV_CREATE_VCPU completed"
             );
             let bsp_vcpufd = result?;
+            if let Some(time_abi) = &self.time_abi {
+                time_abi.register_cpuid(&self.vmfd, &bsp_vcpufd, &self.config.cpuid)?;
+            }
             let caps = self.build_caps(&bsp_vcpufd)?;
             Ok(MshvFinalizedPartition { bsp_vcpufd, caps })
         })
     }
 
     fn build_caps(&self, bsp: &VcpuFd) -> Result<virt::PartitionCapabilities, Error> {
+        // One bulk read serves the entries the capabilities read, instead of
+        // one hypercall each (about 15 of them, 9 us apiece on bare metal);
+        // any other entry falls back to a single read.
+        let prefetched =
+            super::time_abi::vp_cpuid_many(bsp, VpIndex::BSP.index(), &CAPS_CPUID_ENTRIES)
+                .inspect_err(|error| {
+                    tracing::debug!(
+                        error = error as &dyn std::error::Error,
+                        "MSHV bulk CPUID read failed, reading the capabilities one entry at a time"
+                    );
+                })
+                .unwrap_or_default();
         let mut cpuid_error = None;
-        let cpuid_caps = virt::PartitionCapabilities::from_cpuid(
-            &self.config.processor_topology,
-            &mut |function, index| {
-                bsp.get_cpuid_values(function, index, 0, 0)
-                    .unwrap_or_else(|error| {
-                        cpuid_error.get_or_insert(error);
-                        [0; 4]
-                    })
-            },
-        );
+        let mut cpuid = |function, index| {
+            if let Some(position) = CAPS_CPUID_ENTRIES
+                .iter()
+                .position(|&entry| entry == (function, index))
+                .filter(|&position| position < prefetched.len())
+            {
+                return prefetched[position];
+            }
+            bsp.get_cpuid_values(function, index, 0, 0)
+                .unwrap_or_else(|error| {
+                    cpuid_error.get_or_insert(error);
+                    [0; 4]
+                })
+        };
+        // The time ABI identity must not make the partition look like an hv1
+        // or KVM-clock guest, so its capabilities ignore the hypervisor range.
+        let cpuid_caps = if self.time_abi.is_some() {
+            virt::PartitionCapabilities::from_cpuid(
+                &self.config.processor_topology,
+                &mut virt::time_abi::identity::capabilities_cpuid(&mut cpuid),
+            )
+        } else {
+            virt::PartitionCapabilities::from_cpuid(&self.config.processor_topology, &mut cpuid)
+        };
         let mut caps = match (cpuid_caps, cpuid_error) {
             (Ok(caps), None) => caps,
             (result, error) => {
@@ -158,6 +227,13 @@ impl MshvPartitionInner {
         caps.xsaves_state_bv_broken = true;
         // Ordinary state access does not freeze the partition clock.
         caps.can_freeze_time = false;
+        if self.time_abi.is_some() && caps.hv1 {
+            return Err(virt::time_abi::TimeAbiError::new(
+                virt::time_abi::TimeAbiCode::IdentityRouting,
+                "the time ABI partition capabilities include hv1",
+            )
+            .into());
+        }
         Ok(caps)
     }
 }

@@ -44,18 +44,47 @@ pub enum MicrovmPortbDrain {
     Close,
 }
 
-/// The microVM bidirectional portb console at ports `0xe9` and `0xea`.
+/// The microVM bidirectional portb console at ports `0xe9` and `0xea`, with
+/// the NVX time ABI time-sample window at `0xeb`.
 #[derive(MeshPayload)]
 pub struct MicrovmPortbHandle {
     /// Host serial endpoint used for raw input and output.
     pub io: Resource<SerialBackendHandle>,
     /// Fresh generation ID for this microVM instance.
     pub generation_id: [u8; 16],
-    /// Fresh entropy exposed only through the private restore-input selector.
-    pub restore_entropy: Vec<u8>,
     /// Requests to deliver accepted output before a snapshot capture or before
     /// terminating the VM process.
     pub output_drain: Option<mesh::Receiver<mesh::rpc::FailableRpc<MicrovmPortbDrain, ()>>>,
+    /// NVX time ABI v1 configuration: restore packet version 4 and the time
+    /// samples at port `0xeb`.
+    pub time_abi: MicrovmPortbTimeAbi,
+}
+
+/// NVX time ABI v1 configuration of the portb device.
+#[derive(MeshPayload)]
+pub struct MicrovmPortbTimeAbi {
+    /// The generation counter of this VM process.
+    pub generation: u32,
+    /// Test hook: milliseconds added to every host UTC reading.
+    pub utc_offset_ms: i64,
+    /// Test hook: microseconds of delay before latching a UTC reading.
+    pub sample_delay_us: u32,
+    /// Whether a test hook is active.
+    pub test_hooks: bool,
+    /// The restore packet of a restored VM process.
+    pub restore: Option<MicrovmRestorePacketSource>,
+}
+
+/// The parts of a restore packet version 4.
+#[derive(MeshPayload)]
+pub struct MicrovmRestorePacketSource {
+    /// The fields the controller knows before the worker starts.
+    pub base: crate::microvm_time::RestorePacketBase,
+    /// The time fields the worker seals before the first restored VP runs.
+    pub time: mesh::OneshotReceiver<crate::microvm_time::RestoreTimeRecord>,
+    /// Notified when the guest first selects the packet, which ends the
+    /// guest-resume phase of the restore profile.
+    pub selected: Option<mesh::OneshotSender<()>>,
 }
 
 impl ResourceId<ChipsetDeviceHandleKind> for MicrovmPortbHandle {

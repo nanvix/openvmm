@@ -8,8 +8,10 @@ use super::Apic;
 use super::ApicRegisters;
 use crate::state::HvRegisterState;
 use crate::state::StateElement;
+use crate::time_abi::TimeAbiCode;
+use crate::time_abi::TimeAbiError;
+use crate::time_abi::rate;
 use crate::x86::X86PartitionCapabilities;
-use anyhow::Context as _;
 use hvdef::HvRegisterValue;
 use hvdef::HvX64RegisterName;
 use inspect::Inspect;
@@ -32,75 +34,60 @@ impl Apic {
         self.auto_eoi[bank] &= !mask;
     }
 
-    /// Advances an active TSC deadline and returns the restored deadline value.
-    pub fn advance_tsc_deadline(
-        &mut self,
-        previous_tsc: u64,
-        advanced_tsc: u64,
-        deadline: u64,
-    ) -> u64 {
-        let mut registers = ApicRegisters::from_array(self.registers);
-        let timer_mode = (registers.lvt_timer >> 17) & 0x3;
-        let deadline_distance = deadline.wrapping_sub(previous_tsc) as i64;
-        let elapsed_ticks = advanced_tsc - previous_tsc;
-        if deadline != 0
-            && timer_mode == 2
-            && (deadline_distance <= 0 || deadline_distance as u64 <= elapsed_ticks)
-        {
-            self.queue_timer_interrupt(&mut registers);
-            self.registers = *registers.as_array();
-            0
-        } else {
-            deadline
+    /// Checks the LAPIC timer against the NVX time ABI: an armed periodic
+    /// timer fails with `E_LAPIC_PERIODIC`, and TSC-deadline (or reserved)
+    /// timer mode with `E_LAPIC_TSC_DEADLINE`.
+    pub fn check_one_shot_timer(&self) -> Result<(), TimeAbiError> {
+        let registers = ApicRegisters::from_array(self.registers);
+        match (registers.lvt_timer >> 17) & 0x3 {
+            1 if registers.timer_icr != 0 => Err(TimeAbiError::new(
+                TimeAbiCode::LapicPeriodic,
+                format!(
+                    "the LAPIC timer is periodic with initial count {:#x}",
+                    registers.timer_icr
+                ),
+            )),
+            mode @ (2 | 3) => Err(TimeAbiError::new(
+                TimeAbiCode::LapicTscDeadline,
+                format!("the LAPIC timer is in mode {mode}, not one-shot"),
+            )),
+            _ => Ok(()),
         }
     }
 
-    /// Advances the LAPIC timer by host downtime using the interrupt clock.
-    pub fn advance_timer(
+    /// Advances a counting-mode one-shot LAPIC timer over a downtime of
+    /// `downtime_ns` at `apic_hz`, by the time ABI's tick rule: if the ticks
+    /// reach the current count, the count becomes 0 and the timer interrupt
+    /// is queued unless the LVT is masked; otherwise the count decreases by
+    /// the ticks. Fails like [`Self::check_one_shot_timer`].
+    pub fn advance_one_shot_timer(
         &mut self,
-        duration: std::time::Duration,
-        frequency_hz: u64,
-    ) -> anyhow::Result<()> {
-        let registers = ApicRegisters::from_array(self.registers);
-        let mut registers = registers;
+        downtime_ns: u64,
+        apic_hz: u64,
+    ) -> Result<(), TimeAbiError> {
+        self.check_one_shot_timer()?;
+        let mut registers = ApicRegisters::from_array(self.registers);
         if registers.timer_ccr == 0 {
             return Ok(());
         }
-
-        let timer_mode = (registers.lvt_timer >> 17) & 0x3;
-        if timer_mode == 2 {
-            // TSC-deadline mode is handled through IA32_TSC_DEADLINE.
-            return Ok(());
-        }
-        let divider_shift = match registers.timer_dcr & 0xb {
-            0xb => 0,
-            0 => 1,
-            1 => 2,
-            2 => 3,
-            3 => 4,
-            8 => 5,
-            9 => 6,
-            0xa => 7,
+        let divide = match registers.timer_dcr & 0xb {
+            0xb => 1,
+            0 => 2,
+            1 => 4,
+            2 => 8,
+            3 => 16,
+            8 => 32,
+            9 => 64,
+            0xa => 128,
             _ => unreachable!(),
         };
-        let elapsed_ticks = duration
-            .as_nanos()
-            .checked_mul(u128::from(frequency_hz))
-            .context("LAPIC timer downtime adjustment overflows")?
-            / 1_000_000_000
-            / (1_u128 << divider_shift);
-
-        if elapsed_ticks >= u128::from(registers.timer_ccr) {
+        let ticks = rate::lapic_ticks(downtime_ns, apic_hz, divide)
+            .expect("the divide configuration is a power of two up to 128");
+        if ticks >= u64::from(registers.timer_ccr) {
+            registers.timer_ccr = 0;
             self.queue_timer_interrupt(&mut registers);
-            if timer_mode == 1 && registers.timer_icr != 0 {
-                let remaining = elapsed_ticks - u128::from(registers.timer_ccr);
-                let period = u128::from(registers.timer_icr);
-                registers.timer_ccr = (period - remaining % period) as u32;
-            } else {
-                registers.timer_ccr = 0;
-            }
         } else {
-            registers.timer_ccr -= elapsed_ticks as u32;
+            registers.timer_ccr -= ticks as u32;
         }
         self.registers = *registers.as_array();
         Ok(())
@@ -153,7 +140,6 @@ impl StateElement<X86PartitionCapabilities, X86VpInfo> for TscDeadline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use test_with_tracing::test;
     use zerocopy::FromZeros;
 
@@ -182,110 +168,96 @@ mod tests {
         registers.irr[TIMER_VECTOR as usize / 32] & (1 << (TIMER_VECTOR as usize % 32)) != 0
     }
 
-    #[test]
-    fn snapshot_downtime_expires_one_shot_once() {
-        let mut apic = apic(TIMER_VECTOR, 100, 50);
+    fn with_divide(apic: Apic, dcr: u32) -> Apic {
+        let mut registers = ApicRegisters::from_array(apic.registers);
+        registers.timer_dcr = dcr;
+        Apic {
+            registers: *registers.as_array(),
+            ..apic
+        }
+    }
 
-        apic.advance_timer(Duration::from_nanos(50), 1_000_000_000)
+    #[test]
+    fn time_abi_one_shot_timer_counts_down_by_the_tick_rule() {
+        // D = 1 ms at L = 200 MHz is 200,000 ticks before division.
+        for (dcr, divide) in [
+            (0xb, 1),
+            (0, 2),
+            (1, 4),
+            (2, 8),
+            (3, 16),
+            (8, 32),
+            (9, 64),
+            (0xa, 128),
+        ] {
+            let mut timer = with_divide(apic(TIMER_VECTOR, 1_000_000, 1_000_000), dcr);
+            timer
+                .advance_one_shot_timer(1_000_000, 200_000_000)
+                .unwrap();
+            assert_eq!(timer.registers().timer_ccr, 1_000_000 - 200_000 / divide);
+            assert!(!timer_pending(&timer));
+        }
+
+        // floor(999 ns * 1 GHz / 1e9) = 999 ticks.
+        let mut timer = apic(TIMER_VECTOR, 1_000, 1_000);
+        timer.advance_one_shot_timer(999, 1_000_000_000).unwrap();
+        assert_eq!(timer.registers().timer_ccr, 1);
+        assert!(!timer_pending(&timer));
+    }
+
+    #[test]
+    fn time_abi_one_shot_timer_expires_once() {
+        let mut timer = apic(TIMER_VECTOR, 100, 50);
+        timer.advance_one_shot_timer(50, 1_000_000_000).unwrap();
+        assert_eq!(timer.registers().timer_ccr, 0);
+        assert!(timer_pending(&timer));
+        // An expired timer stays expired; nothing else is queued.
+        timer
+            .advance_one_shot_timer(1_000_000_000, 1_000_000_000)
+            .unwrap();
+        assert_eq!(timer.registers().timer_ccr, 0);
+
+        let mut masked = apic(TIMER_VECTOR | TIMER_MASKED, 100, 50);
+        masked
+            .advance_one_shot_timer(1_000_000_000, 200_000_000)
+            .unwrap();
+        assert_eq!(masked.registers().timer_ccr, 0);
+        assert!(!timer_pending(&masked));
+
+        let mut idle = apic(TIMER_VECTOR, 0, 0);
+        idle.advance_one_shot_timer(1_000_000_000, 200_000_000)
+            .unwrap();
+        assert!(!timer_pending(&idle));
+    }
+
+    #[test]
+    fn time_abi_rejects_periodic_and_deadline_timers() {
+        let periodic = apic(TIMER_VECTOR | TIMER_PERIODIC, 100, 25);
+        assert_eq!(
+            periodic.check_one_shot_timer().unwrap_err().code,
+            TimeAbiCode::LapicPeriodic
+        );
+        let mut advanced = apic(TIMER_VECTOR | TIMER_PERIODIC, 100, 25);
+        assert_eq!(
+            advanced
+                .advance_one_shot_timer(1_000, 200_000_000)
+                .unwrap_err()
+                .code,
+            TimeAbiCode::LapicPeriodic
+        );
+        // A periodic LVT with no initial count is not armed.
+        apic(TIMER_VECTOR | TIMER_PERIODIC, 0, 0)
+            .check_one_shot_timer()
             .unwrap();
 
-        assert_eq!(apic.registers().timer_ccr, 0);
-        assert!(timer_pending(&apic));
-
-        apic.advance_timer(Duration::from_secs(1), 1_000_000_000)
-            .unwrap();
-        assert!(timer_pending(&apic));
-    }
-
-    #[test]
-    fn snapshot_downtime_does_not_queue_masked_one_shot() {
-        let mut apic = apic(TIMER_VECTOR | TIMER_MASKED, 100, 50);
-
-        apic.advance_timer(Duration::from_nanos(50), 1_000_000_000)
-            .unwrap();
-
-        assert_eq!(apic.registers().timer_ccr, 0);
-        assert!(!timer_pending(&apic));
-    }
-
-    #[test]
-    fn snapshot_downtime_coalesces_periods_and_preserves_phase() {
-        let mut apic = apic(TIMER_VECTOR | TIMER_PERIODIC, 100, 25);
-
-        apic.advance_timer(Duration::from_nanos(250), 1_000_000_000)
-            .unwrap();
-
-        assert_eq!(apic.registers().timer_ccr, 75);
-        assert!(timer_pending(&apic));
-    }
-
-    #[test]
-    fn snapshot_downtime_preserves_near_expiry_timer() {
-        let mut apic = apic(TIMER_VECTOR, 100, 50);
-
-        apic.advance_timer(Duration::from_nanos(49), 1_000_000_000)
-            .unwrap();
-
-        assert_eq!(apic.registers().timer_ccr, 1);
-        assert!(!timer_pending(&apic));
-    }
-
-    #[test]
-    fn snapshot_downtime_rejects_lapic_tick_overflow() {
-        let mut apic = apic(TIMER_VECTOR, 100, 50);
-
-        let error = apic.advance_timer(Duration::MAX, u64::MAX).unwrap_err();
-
-        assert!(error.to_string().contains("overflows"));
-    }
-
-    #[test]
-    fn snapshot_downtime_expires_tsc_deadline_once() {
-        let mut apic = apic(TIMER_VECTOR | TIMER_TSC_DEADLINE, 0, 0);
-
-        let deadline = apic.advance_tsc_deadline(1_000, 2_000, 2_000);
-
-        assert_eq!(deadline, 0);
-        assert!(timer_pending(&apic));
-    }
-
-    #[test]
-    fn snapshot_downtime_expires_already_overdue_tsc_deadline() {
-        let mut apic = apic(TIMER_VECTOR | TIMER_TSC_DEADLINE, 0, 0);
-
-        let deadline = apic.advance_tsc_deadline(1_000, 2_000, 500);
-
-        assert_eq!(deadline, 0);
-        assert!(timer_pending(&apic));
-    }
-
-    #[test]
-    fn snapshot_downtime_preserves_wrapped_future_tsc_deadline() {
-        let mut apic = apic(TIMER_VECTOR | TIMER_TSC_DEADLINE, 0, 0);
-
-        let deadline = apic.advance_tsc_deadline(u64::MAX - 1_000, u64::MAX - 900, 500);
-
-        assert_eq!(deadline, 500);
-        assert!(!timer_pending(&apic));
-    }
-
-    #[test]
-    fn snapshot_downtime_drops_masked_tsc_deadline() {
-        let mut apic = apic(TIMER_VECTOR | TIMER_TSC_DEADLINE | TIMER_MASKED, 0, 0);
-
-        let deadline = apic.advance_tsc_deadline(1_000, 2_000, 2_000);
-
-        assert_eq!(deadline, 0);
-        assert!(!timer_pending(&apic));
-    }
-
-    #[test]
-    fn snapshot_downtime_ignores_deadline_outside_deadline_mode() {
-        let mut apic = apic(TIMER_VECTOR, 0, 0);
-
-        let deadline = apic.advance_tsc_deadline(1_000, 2_000, 1_500);
-
-        assert_eq!(deadline, 1_500);
-        assert!(!timer_pending(&apic));
+        for lvt in [TIMER_TSC_DEADLINE, 3 << 17] {
+            assert_eq!(
+                apic(TIMER_VECTOR | lvt, 0, 0)
+                    .check_one_shot_timer()
+                    .unwrap_err()
+                    .code,
+                TimeAbiCode::LapicTscDeadline
+            );
+        }
     }
 }

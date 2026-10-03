@@ -191,7 +191,9 @@ impl From<MachineProfileCli> for MachineProfile {
 /// Options of the microVM machine profile.
 #[derive(clap::Args)]
 pub struct MicrovmCli {
-    /// Expose a fresh OPENVMM_ENTROPY_V1 packet through the private portb restore channel.
+    /// Accepted for compatibility: every microVM restore exposes restore packet
+    /// version 4, which carries fresh entropy, through the private portb restore
+    /// channel.
     #[clap(long, requires = "restore_snapshot")]
     pub restore_entropy: bool,
 
@@ -346,7 +348,7 @@ pub struct MicrovmCli {
         long,
         hide = true,
         requires("microvm_control_console"),
-        conflicts_with_all = ["rpc", "ttrpc", "grpc", "relay_console_path", "write_saved_state_proto", "paused"]
+        conflicts_with_all = ["rpc", "ttrpc", "grpc", "relay_console_path", "write_saved_state_proto", "cpu_fingerprint", "paused"]
     )]
     pub microvm_control_auth_stdin: bool,
 
@@ -358,6 +360,25 @@ pub struct MicrovmCli {
         hide = true
     )]
     pub microvm_control_auth_timeout_ms: u64,
+
+    /// microVM CPU profile: a pinned profile ID, or `auto` (the default) to
+    /// select the host's profile; a restore must name the snapshot's profile
+    #[clap(long = "cpu-profile", value_name = "ID", hide = true)]
+    pub cpu_profile: Option<String>,
+
+    /// time ABI test hook (repeatable; testing only)
+    #[clap(long = "x-time-abi-test-hook", value_name = "HOOK", hide = true)]
+    pub x_time_abi_test_hook: Vec<String>,
+
+    /// build the partition and run the time ABI preflight without running
+    /// the guest, print one `NVX-TIME-ABI-VERIFY:` line, and exit with status
+    /// 0 or 1 (host qualification)
+    #[clap(
+        long = "x-time-abi-verify",
+        hide = true,
+        conflicts_with_all = ["restore_snapshot", "snapshot_destination"]
+    )]
+    pub x_time_abi_verify: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

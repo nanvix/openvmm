@@ -145,11 +145,6 @@ impl MicrovmLaunch {
         })
     }
 
-    /// Returns whether guest-requested snapshot capture is configured.
-    pub(crate) fn snapshot_capture_enabled(&self) -> bool {
-        self.snapshot_destination.is_some()
-    }
-
     /// Duplicates the exact RAM handle used for guest-requested snapshot
     /// capture, as the VM worker's shared guest RAM.
     pub(crate) fn capture_shared_memory(&self) -> anyhow::Result<Option<SharedMemoryFd>> {
@@ -168,6 +163,20 @@ impl MicrovmLaunch {
         self.restore
             .gate_required
             .then_some(Duration::from_millis(opt.microvm.restore_gate_timeout_ms))
+    }
+
+    /// Takes the sender that seals the time fields of a time ABI restore
+    /// packet, for the restoring worker.
+    pub(crate) fn take_restore_time_record(
+        &mut self,
+    ) -> Option<mesh::OneshotSender<chipset_resources::microvm_time::RestoreTimeRecord>> {
+        self.resources.restore_time_record.take()
+    }
+
+    /// Takes the receiver notified when the guest first selects a time ABI
+    /// restore packet, for the restoring worker's profile.
+    pub(crate) fn take_restore_packet_selected(&mut self) -> Option<mesh::OneshotReceiver<()>> {
+        self.resources.restore_packet_selected.take()
     }
 
     /// Creates the channels that carry guest-requested snapshot boundaries from

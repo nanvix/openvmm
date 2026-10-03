@@ -310,10 +310,8 @@ impl VmController {
                 self.memory,
                 self.microvm.memory_capacity,
                 response.state_unit_names,
-                response.capture_wall_clock,
-                response.tsc_frequency_hz,
-                Some(response.apic_frequency_hz),
-                response.cpu_contract,
+                response.time.time,
+                response.time.cpu_profile,
             )?;
             let manifest = openvmm_helpers::snapshot::SnapshotManifest {
                 version: openvmm_helpers::snapshot::MANIFEST_VERSION,
@@ -324,8 +322,6 @@ impl VmController {
                 page_size: crate::system_page_size(),
                 architecture: crate::GUEST_ARCH.to_owned(),
                 state_size_bytes: 0,
-                state_sha256: Vec::new(),
-                memory_sha256: Vec::new(),
                 machine_contract: Some(machine_contract),
                 format_magic: openvmm_helpers::snapshot::format::SNAPSHOT_FORMAT_MAGIC.to_vec(),
                 saved_state_schema_version:

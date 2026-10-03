@@ -117,6 +117,21 @@ pub mod capabilities {
             Err(err) => Err(err),
         }
     }
+    /// The available processor features of the first bank, from the query
+    /// that predates feature banks.
+    pub fn processor_features_bank0() -> Result<abi::WHV_PROCESSOR_FEATURES> {
+        get(abi::WHvCapabilityCodeProcessorFeatures)
+    }
+    /// The available processor feature banks, without a fallback to the
+    /// query that predates them.
+    pub fn processor_features_banks() -> Result<abi::WHV_PROCESSOR_FEATURES_BANKS> {
+        get(abi::WHvCapabilityCodeProcessorFeaturesBanks)
+    }
+    /// The available synthetic processor feature banks, whatever their count.
+    pub fn synthetic_processor_features_banks()
+    -> Result<abi::WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS> {
+        get(abi::WHvCapabilityCodeSyntheticProcessorFeaturesBanks)
+    }
     /// Processor frequency capping capabilities.
     pub fn processor_frequency_cap() -> Result<abi::WHV_CAPABILITY_PROCESSOR_FREQUENCY_CAP> {
         get(abi::WHvCapabilityCodeProcessorFrequencyCap)
@@ -236,6 +251,10 @@ pub enum PartitionProperty<'a> {
     AllowDeviceAssignment(bool),
     DisableSmt(bool),
     ProcessorFeatures(ProcessorFeatures),
+    /// Processor features banks 0 and 1, always set through the banks
+    /// property. Unlike [`Self::ProcessorFeatures`], a zero bank 1 is set
+    /// explicitly instead of keeping WHP's default.
+    ProcessorFeaturesBanks(ProcessorFeatures),
     ProcessorClFlushSize(u8),
     #[cfg(target_arch = "x86_64")]
     CpuidExitList(&'a [u32]),
@@ -428,6 +447,14 @@ impl Partition {
                     };
                     set(partition_prop::ProcessorFeaturesBanks, &banks)
                 }
+            }
+            PartitionProperty::ProcessorFeaturesBanks(val) => {
+                banks = abi::WHV_PROCESSOR_FEATURES_BANKS {
+                    BanksCount: 2,
+                    Reserved0: 0,
+                    Banks: [val.bank0.0, val.bank1.0],
+                };
+                set(partition_prop::ProcessorFeaturesBanks, &banks)
             }
             PartitionProperty::ProcessorClFlushSize(val) => {
                 set(partition_prop::ProcessorClFlushSize, val)

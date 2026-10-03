@@ -8,10 +8,9 @@
 //! (input gate, readiness event, and VP release).
 
 use super::LoadedVm;
-use super::clock;
-use super::clock::RestoreTime;
-use crate::partition::HvlitePartition;
 use anyhow::Context;
+use futures::FutureExt;
+use futures_concurrency::future::Race;
 use hypervisor_resources::HypervisorKind;
 use hypervisor_resources::MshvHandle;
 use membacking::FileMappingMode;
@@ -37,8 +36,6 @@ use vmm_core::partition_unit::StopGuard;
 pub(super) struct RestoreParameters {
     /// Restore state handed to the loaded VM.
     pub(super) state: SnapshotRestore,
-    /// Saved canonical CPU contract required by restore.
-    pub(super) cpu_contract: Option<Vec<u8>>,
     /// Mapping mode of the file-backed guest RAM handle.
     file_mapping_mode: FileMappingMode,
     /// Snapshot generation handles that must outlive the restored VM.
@@ -46,18 +43,11 @@ pub(super) struct RestoreParameters {
 }
 
 impl RestoreParameters {
-    /// Takes the restore inputs out of the worker parameters and validates
-    /// the saved time contract.
+    /// Takes the restore inputs out of the worker parameters.
     pub(super) fn take(parameters: &mut VmWorkerParameters) -> anyhow::Result<Self> {
         let guards = parameters.snapshot_restore_guards.take();
         let ready_sink = parameters.restore_ready_sink.take();
         let gate_timeout = parameters.restore_gate_timeout.take();
-        let restore_time = clock::restore_time_contract(
-            parameters.restore_downtime,
-            parameters.restore_tsc_frequency_hz,
-            parameters.restore_apic_frequency_hz,
-        )?;
-        tracing::debug!(?restore_time, "received snapshot restore time contract");
         let restore_vp_count = parameters.restore_vp_count.take();
         let vp_prefix = restore_vp_prefix(parameters.hypervisor.id(), restore_vp_count);
         tracing::debug!(
@@ -65,7 +55,7 @@ impl RestoreParameters {
             ?vp_prefix,
             "received restore-time VP activation target"
         );
-        let cpu_contract = parameters.restore_cpu_contract.take();
+        let time_abi = parameters.restore_time.take();
         let file_mapping_mode = if parameters.shared_memory_copy_on_write {
             FileMappingMode::CopyOnWrite
         } else {
@@ -73,13 +63,12 @@ impl RestoreParameters {
         };
         Ok(Self {
             state: SnapshotRestore {
-                time: restore_time,
+                time_abi,
                 vp_prefix,
                 ready_sink,
                 gate_timeout,
                 ..Default::default()
             },
-            cpu_contract,
             file_mapping_mode,
             guards,
         })
@@ -132,8 +121,8 @@ fn select_instantiated_vps<T>(
 /// Snapshot-restore state of a [`LoadedVm`].
 #[derive(Default)]
 pub(super) struct SnapshotRestore {
-    /// Saved guest-clock contract, checked and applied around the restore.
-    time: Option<RestoreTime>,
+    /// The time ABI inputs of a restore, validated by the controller.
+    pub(super) time_abi: Option<openvmm_defs::time_abi::RestoreTimeInput>,
     /// VP prefix instantiated for an explicit MSHV restore-time activation
     /// target.
     vp_prefix: Option<u32>,
@@ -151,6 +140,23 @@ pub(super) struct SnapshotRestore {
     pub(super) gate_profile: Option<ProfileSpan>,
     /// Whether host input is gated by the post-restore input gate.
     pub(super) input_gated: bool,
+    /// With profiling enabled, notified when the guest first selects the
+    /// time ABI restore packet.
+    packet_selected: Option<mesh::OneshotReceiver<()>>,
+    /// Profile span from the release of the restored VPs to the guest's
+    /// first selection of the restore packet.
+    resume_profile: Option<ProfileSpan>,
+    /// Profile span from the guest's first selection of the restore packet to
+    /// its acknowledgement of a gated restore.
+    repair_profile: Option<ProfileSpan>,
+}
+
+/// A post-restore event handled by the VM worker's run loop.
+pub(super) enum RestoreEvent {
+    /// The armed post-restore input gate expired.
+    GateExpired,
+    /// The guest first selected the time ABI restore packet.
+    PacketSelected,
 }
 
 impl SnapshotRestore {
@@ -165,54 +171,86 @@ impl SnapshotRestore {
         select_instantiated_vps(vps, vp_capacity, self.vp_prefix, restoring)
     }
 
-    /// Returns a future that completes when the armed post-restore input gate
-    /// expires, and never completes while the gate is not armed.
-    pub(super) fn gate_expired(&self, driver: &impl Driver) -> impl Future<Output = ()> {
+    /// Returns a future that completes at the next post-restore event: the
+    /// expiry of the armed input gate, or the guest's first selection of the
+    /// restore packet. It never completes while neither is pending.
+    pub(super) fn next_event(
+        &mut self,
+        driver: &impl Driver,
+    ) -> impl Future<Output = RestoreEvent> {
         let deadline = self.gate_deadline;
+        let packet_selected = &mut self.packet_selected;
         async move {
-            match deadline {
-                Some(deadline) => {
-                    PolledTimer::new(driver).sleep_until(deadline).await;
+            let gate_expired = async {
+                match deadline {
+                    Some(deadline) => {
+                        PolledTimer::new(driver).sleep_until(deadline).await;
+                    }
+                    None => std::future::pending().await,
                 }
-                None => std::future::pending().await,
+                RestoreEvent::GateExpired
+            };
+            let selected = async {
+                if let Some(selected) = packet_selected.as_mut() {
+                    let result = selected.await;
+                    *packet_selected = None;
+                    if result.is_ok() {
+                        return RestoreEvent::PacketSelected;
+                    }
+                }
+                std::future::pending().await
+            };
+            (gate_expired, selected).race().await
+        }
+    }
+
+    /// Ends the `restore/guest_resume` profile phase at the guest's first
+    /// selection of the restore packet, and starts the `restore/guest_repair`
+    /// phase of a gated restore.
+    pub(super) fn restore_packet_selected(&mut self) {
+        if let Some(resume) = self.resume_profile.take() {
+            resume.complete("restore", "guest_resume", Default::default());
+            if self.gate_profile.is_some() {
+                self.repair_profile = Some(ProfileSpan::start());
             }
         }
     }
-}
 
-#[cfg(guest_arch = "x86_64")]
-pub(super) fn validate_restore_cpu_contract(
-    partition: &dyn HvlitePartition,
-    expected_cpu_contract: Option<Vec<u8>>,
-) -> anyhow::Result<()> {
-    if let Some(expected_cpu_contract) = expected_cpu_contract {
-        let destination_contract = partition.cpu_compatibility_contract();
-        let destination_cpu_contract = mesh::payload::encode(destination_contract.clone());
-        if destination_cpu_contract != expected_cpu_contract {
-            let expected_contract: virt::x86::CpuCompatibilityContract =
-                mesh::payload::decode(&expected_cpu_contract)
-                    .context("failed to decode snapshot CPU contract")?;
-            let first_cpuid_difference = expected_contract
-                .cpuid
-                .iter()
-                .zip(&destination_contract.cpuid)
-                .find(|(expected, destination)| expected != destination);
-            anyhow::bail!(
-                "destination CPU contract does not match the snapshot; first CPUID difference: {first_cpuid_difference:?}"
-            );
+    /// Ends the `restore/guest_repair` profile phase when the guest
+    /// acknowledges a gated restore.
+    pub(super) fn restore_acknowledged(&mut self) {
+        // The guest selects the packet before it acknowledges the restore, so
+        // handle a selection that the run loop has not handled yet first.
+        if let Some(result) = self
+            .packet_selected
+            .as_mut()
+            .and_then(|selected| selected.now_or_never())
+        {
+            self.packet_selected = None;
+            if result.is_ok() {
+                self.restore_packet_selected();
+            }
+        }
+        if let Some(repair) = self.repair_profile.take() {
+            repair.complete("restore", "guest_repair", Default::default());
         }
     }
-    Ok(())
 }
 
-#[cfg(not(guest_arch = "x86_64"))]
-pub(super) fn validate_restore_cpu_contract(
-    _partition: &dyn HvlitePartition,
-    expected_cpu_contract: Option<Vec<u8>>,
+/// Checks that the saved state of a time ABI restore holds the partition
+/// state, which the restore clock sets and advances.
+#[cfg(guest_arch = "x86_64")]
+fn validate_snapshot_restore_partition_presence(
+    saved_state: &SavedState,
+    time_abi_restore: bool,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
-        expected_cpu_contract.is_none(),
-        "snapshot CPU contracts are only supported for x86-64 guests"
+        !time_abi_restore
+            || saved_state
+                .units
+                .iter()
+                .any(|unit| unit.name == "partition"),
+        "a time ABI restore requires partition state"
     );
     Ok(())
 }
@@ -230,33 +268,41 @@ pub(super) fn validate_inventory(
 }
 
 impl LoadedVm {
-    /// Prepares to restore `saved_state` into the loaded VM: checks the saved
-    /// time contract against the saved state and the destination clocks, and
-    /// starts the profile span of the restore.
-    pub(super) fn begin_snapshot_restore(
+    /// Prepares to restore `saved_state` into the loaded VM: checks that a
+    /// time ABI restore has partition state, and starts the profile span of
+    /// the restore. A time ABI restore drops the VPs' saved TSC values, which
+    /// its synchronized TSC set supersedes.
+    pub(super) async fn begin_snapshot_restore(
         &mut self,
         #[cfg_attr(not(guest_arch = "x86_64"), expect(unused_variables))] saved_state: &SavedState,
     ) -> anyhow::Result<ProfileSpan> {
         self.snapshot_restore.restored_from_snapshot = true;
-        let restore_time = self.snapshot_restore.time;
-
         #[cfg(guest_arch = "x86_64")]
-        clock::validate_snapshot_restore_partition_presence(saved_state, restore_time)?;
-
-        self.validate_restore_clock(restore_time)?;
+        {
+            let time_abi_restore = self.snapshot_restore.time_abi.is_some();
+            validate_snapshot_restore_partition_presence(saved_state, time_abi_restore)?;
+            if time_abi_restore {
+                self.inner.partition_unit.omit_saved_tsc().await;
+            }
+        }
         Ok(ProfileSpan::start())
     }
 
-    /// Completes a restore after the saved state is applied: advances the
-    /// guest clocks by the snapshot downtime and holds the VPs stopped until
-    /// the VM first starts.
+    /// Completes a restore after the saved state is applied: sets and
+    /// advances the guest clocks of a time ABI restore, and holds the VPs
+    /// stopped until the VM first starts.
     pub(super) async fn finish_snapshot_restore(
         &mut self,
         saved_state_restore: ProfileSpan,
     ) -> anyhow::Result<()> {
         saved_state_restore.complete("restore", "saved_state_restore", Default::default());
-        self.advance_restored_clock(self.snapshot_restore.time)
-            .await?;
+        #[cfg(guest_arch = "x86_64")]
+        if let Some(mut input) = self.snapshot_restore.time_abi.take() {
+            self.snapshot_restore.packet_selected = input.packet_selected.take();
+            let clock_restore = ProfileSpan::start();
+            self.time_abi_restore(input).await?;
+            clock_restore.complete("restore", "time_abi_clock", Default::default());
+        }
         self.snapshot_restore.start_guard =
             Some(self.inner.partition_unit.temporarily_stop_vps().await);
         Ok(())
@@ -310,6 +356,9 @@ impl LoadedVm {
             self.snapshot_restore.gate_deadline = Some(Instant::now().saturating_add(timeout));
             self.snapshot_restore.gate_profile = Some(ProfileSpan::start());
         }
+        if self.snapshot_restore.packet_selected.is_some() {
+            self.snapshot_restore.resume_profile = Some(ProfileSpan::start());
+        }
         self.snapshot_restore.start_guard.take();
         Ok(())
     }
@@ -332,6 +381,42 @@ mod tests {
 
     fn binders() -> Vec<u32> {
         (0..8).collect()
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn saved_state(unit_names: &[&str]) -> SavedState {
+        use state_unit::SavedStateUnit;
+        use vmcore::save_restore::NoSavedState;
+        use vmcore::save_restore::SavedStateBlob;
+
+        SavedState {
+            units: unit_names
+                .iter()
+                .map(|name| SavedStateUnit {
+                    name: (*name).to_owned(),
+                    state: SavedStateBlob::new(NoSavedState),
+                })
+                .collect(),
+            inventory: Vec::new(),
+        }
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    #[test]
+    fn time_abi_restore_requires_partition_state() {
+        validate_snapshot_restore_partition_presence(&saved_state(&[]), false).unwrap();
+        validate_snapshot_restore_partition_presence(&saved_state(&["partition"]), true).unwrap();
+        let error = validate_snapshot_restore_partition_presence(&saved_state(&["other"]), true)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "a time ABI restore requires partition state"
+        );
+
+        // The payload must hold the unit; the inventory alone does not.
+        let mut inventory_only = saved_state(&[]);
+        inventory_only.inventory.push("partition".to_owned());
+        validate_snapshot_restore_partition_presence(&inventory_only, true).unwrap_err();
     }
 
     #[test]
@@ -397,5 +482,84 @@ mod tests {
             error.to_string(),
             "backend returned 4 VP binders for topology capacity 8"
         );
+    }
+
+    #[test]
+    fn restore_events_report_the_first_packet_selection() {
+        pal_async::DefaultPool::run_with(async |driver| {
+            let (send, recv) = mesh::oneshot();
+            let mut restore = SnapshotRestore {
+                packet_selected: Some(recv),
+                ..Default::default()
+            };
+            assert!(restore.next_event(&driver).now_or_never().is_none());
+            send.send(());
+            assert!(matches!(
+                restore.next_event(&driver).await,
+                RestoreEvent::PacketSelected
+            ));
+            assert!(restore.packet_selected.is_none());
+            assert!(restore.next_event(&driver).now_or_never().is_none());
+        });
+    }
+
+    #[test]
+    fn restore_events_ignore_a_dropped_packet_notifier() {
+        pal_async::DefaultPool::run_with(async |driver| {
+            let (send, recv) = mesh::oneshot::<()>();
+            let mut restore = SnapshotRestore {
+                packet_selected: Some(recv),
+                ..Default::default()
+            };
+            drop(send);
+            assert!(restore.next_event(&driver).now_or_never().is_none());
+            assert!(restore.packet_selected.is_none());
+        });
+    }
+
+    #[test]
+    fn restore_events_report_the_gate_expiry() {
+        pal_async::DefaultPool::run_with(async |driver| {
+            let mut restore = SnapshotRestore {
+                gate_deadline: Some(Instant::now()),
+                ..Default::default()
+            };
+            assert!(matches!(
+                restore.next_event(&driver).await,
+                RestoreEvent::GateExpired
+            ));
+        });
+    }
+
+    #[test]
+    fn packet_selection_starts_the_repair_phase_of_a_gated_restore() {
+        for gated in [false, true] {
+            let mut restore = SnapshotRestore {
+                resume_profile: Some(ProfileSpan::start()),
+                gate_profile: gated.then(ProfileSpan::start),
+                ..Default::default()
+            };
+            restore.restore_packet_selected();
+            assert!(restore.resume_profile.is_none());
+            assert_eq!(restore.repair_profile.is_some(), gated);
+            restore.restore_acknowledged();
+            assert!(restore.repair_profile.is_none());
+        }
+    }
+
+    #[test]
+    fn acknowledgement_handles_an_unhandled_packet_selection_first() {
+        let (send, recv) = mesh::oneshot();
+        let mut restore = SnapshotRestore {
+            packet_selected: Some(recv),
+            resume_profile: Some(ProfileSpan::start()),
+            gate_profile: Some(ProfileSpan::start()),
+            ..Default::default()
+        };
+        send.send(());
+        restore.restore_acknowledged();
+        assert!(restore.packet_selected.is_none());
+        assert!(restore.resume_profile.is_none());
+        assert!(restore.repair_profile.is_none());
     }
 }

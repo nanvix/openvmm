@@ -162,6 +162,8 @@ impl<'a> MshvProtoPartition<'a> {
                 extint_pending: AtomicBool::new(false),
                 #[cfg(guest_arch = "x86_64")]
                 created: AtomicBool::new(false),
+                #[cfg(guest_arch = "x86_64")]
+                lapic_written: AtomicBool::new(false),
                 waker: RwLock::new(None),
             })
             .collect();
@@ -207,6 +209,8 @@ impl<'a> MshvProtoPartition<'a> {
             config,
             #[cfg(guest_arch = "x86_64")]
             isolation: arch::MshvProtoPartitionIsolation::None,
+            #[cfg(guest_arch = "x86_64")]
+            time_abi_host: None,
             vmfd,
             vps,
             #[cfg(guest_arch = "aarch64")]
@@ -229,6 +233,10 @@ pub struct MshvProtoPartition<'a> {
     config: ProtoPartitionConfig<'a>,
     #[cfg(guest_arch = "x86_64")]
     isolation: arch::MshvProtoPartitionIsolation,
+    /// The processor features the host partition offered, read when the
+    /// partition carries the time ABI.
+    #[cfg(guest_arch = "x86_64")]
+    time_abi_host: Option<cpu_profile::hv_banks::HvFeatures>,
     vmfd: VmFd,
     vps: Vec<MshvVpInner>,
     #[cfg(guest_arch = "aarch64")]
@@ -333,6 +341,9 @@ struct MshvPartitionInner {
     /// Set to `true` when partition time is frozen (e.g. during reset).
     /// The first VP to enter `run_vp` after a freeze will thaw time.
     time_frozen: Mutex<bool>,
+    /// The NVX time ABI state, for a partition built with it.
+    #[cfg(guest_arch = "x86_64")]
+    time_abi: Option<arch::time_abi::MshvTimeAbi>,
     /// aarch64 GIC MSI controller config, used to decode PCIe MSIs into SPI
     /// assertions via a v2m frame.
     #[cfg(guest_arch = "aarch64")]
@@ -357,6 +368,11 @@ struct MshvVpInner {
     /// uncreated.
     #[cfg(guest_arch = "x86_64")]
     created: AtomicBool,
+    /// Set when the VMM writes this VP's LAPIC state. The next VP run
+    /// consumes it and re-asserts the highest pending edge-triggered vector
+    /// (see `MshvProcessor::assert_pending_interrupt`).
+    #[cfg(guest_arch = "x86_64")]
+    lapic_written: AtomicBool,
     /// Waker for the VP run loop task. Set by the VP thread, used by device
     /// threads to re-poll the run loop when new messages are enqueued.
     waker: RwLock<Option<Waker>>,
@@ -640,6 +656,20 @@ impl virt::Processor for MshvProcessor<'_> {
             .thaw_time()
             .expect("failed to thaw partition time");
 
+        // A LAPIC state written since the last run may hold a pending vector
+        // that the hypervisor hasn't delivered, and partition time may have
+        // been frozen and thawed since then. Assert it again now that the VP
+        // is about to run.
+        #[cfg(guest_arch = "x86_64")]
+        if vpinner.lapic_written.swap(false, Ordering::AcqRel) {
+            if let Err(err) = self.reassert_pending_interrupt() {
+                tracelimit::warn_ratelimited!(
+                    error = &err as &dyn std::error::Error,
+                    "failed to re-assert a pending LAPIC vector"
+                );
+            }
+        }
+
         // Ensure any messages present from a state restore are flushed on
         // the first loop iteration.
         if vpinner.message_queues.pending_sints() != 0 {
@@ -818,13 +848,6 @@ enum ErrorInner {
     #[error("register access error")]
     Register(#[source] KernelError),
     #[cfg(guest_arch = "x86_64")]
-    #[error("failed to synchronize restored VP {vp_index} TSC")]
-    SynchronizeTsc {
-        vp_index: u32,
-        #[source]
-        error: KernelError,
-    },
-    #[cfg(guest_arch = "x86_64")]
     #[error("failed to get VP state {ty}")]
     GetVpState {
         #[source]
@@ -837,6 +860,13 @@ enum ErrorInner {
         #[source]
         error: KernelError,
         ty: u8,
+    },
+    #[cfg(guest_arch = "x86_64")]
+    #[error("failed to re-assert pending LAPIC vector {vector:#x}")]
+    AssertPendingInterrupt {
+        #[source]
+        error: KernelError,
+        vector: u8,
     },
     #[error("failed to reset state")]
     ResetState(#[source] Box<virt::state::StateError<Error>>),
@@ -851,16 +881,17 @@ enum ErrorInner {
     #[error("unsupported processor vendor: {0:?}")]
     UnsupportedProcessorVendor(hvdef::HvProcessorVendor),
     #[cfg(guest_arch = "x86_64")]
-    #[error(
-        "TSC frequency mismatch between snapshot ({saved} Hz) and destination ({destination} Hz)"
-    )]
-    TscFrequencyMismatch { saved: u64, destination: u64 },
-    #[cfg(guest_arch = "x86_64")]
-    #[error(transparent)]
-    TscFrequencyCpuid(#[from] virt::x86::tsc::TscFrequencyCpuidError),
-    #[cfg(guest_arch = "x86_64")]
     #[error("failed to create virtual device")]
     NewDevice(#[source] virt::x86::apic_software_device::DeviceIdInUse),
+    #[cfg(guest_arch = "x86_64")]
+    #[error(transparent)]
+    TimeAbi(#[from] virt::time_abi::TimeAbiError),
+    #[cfg(guest_arch = "x86_64")]
+    #[error("failed to get host partition property {0:?}")]
+    GetHostPartitionProperty(HvPartitionPropertyCode, #[source] KernelError),
+    #[cfg(guest_arch = "x86_64")]
+    #[error("failed to query the CPUID values of the fingerprint probe partition")]
+    FingerprintCpuid(#[source] KernelError),
 }
 
 /// Equivalent to [`MshvError`] but has a much better error message.

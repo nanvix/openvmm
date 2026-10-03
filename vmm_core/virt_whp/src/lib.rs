@@ -14,10 +14,16 @@ mod apic;
 mod cpu_contract;
 pub mod device;
 mod emu;
+#[cfg(guest_arch = "x86_64")]
+mod fingerprint;
 mod hypercalls;
 mod memory;
+#[cfg(guest_arch = "x86_64")]
+mod profile_features;
 mod regs;
 mod synic;
+#[cfg(guest_arch = "x86_64")]
+mod time_abi;
 #[cfg(guest_arch = "x86_64")]
 mod tsc;
 mod vm_state;
@@ -81,6 +87,8 @@ use x86defs::cpuid::Vendor;
 
 #[cfg(guest_arch = "aarch64")]
 pub use aarch64::WHP_PMU_GSIV;
+#[cfg(guest_arch = "x86_64")]
+pub use fingerprint::cpu_fingerprint;
 
 #[derive(Debug)]
 pub struct Whp {
@@ -129,9 +137,9 @@ struct WhpPartitionInner {
     #[cfg(guest_arch = "x86_64")]
     #[inspect(flatten)]
     cpuid_topology: cpu_contract::CpuidTopology,
+    /// The NVX time ABI state, for a partition built with it.
     #[cfg(guest_arch = "x86_64")]
-    #[inspect(flatten)]
-    clock: tsc::PartitionClock,
+    time_abi: Option<time_abi::WhpTimeAbi>,
     vtl0_alias_map_offset: Option<u64>,
     monitor_page: MonitorPage,
     hvstate: Hv1State,
@@ -164,6 +172,12 @@ struct VtlPartition {
     lapic: LocalApicKind,
 
     hypervisor_enlightened: bool,
+
+    /// The NVX time ABI state this partition was configured with, until the
+    /// partition build moves it to [`WhpPartitionInner`].
+    #[cfg(guest_arch = "x86_64")]
+    #[inspect(skip)]
+    time_abi: Option<time_abi::WhpTimeAbi>,
 }
 
 impl VtlPartition {
@@ -220,6 +234,11 @@ struct WhpVp {
     vtl2_wake: AtomicBool,
     /// Enable VTL2 at the next opportunity.
     vtl2_enable: AtomicBool,
+    /// Set when the VMM writes this VP's offloaded VTL0 LAPIC state. The next
+    /// VP run consumes it and asserts the highest pending edge-triggered
+    /// vector again (see `WhpProcessor::assert_pending_interrupt`).
+    #[cfg(guest_arch = "x86_64")]
+    lapic_written: AtomicBool,
     vp_info: TargetVpInfo,
     waker: RwLock<Option<Waker>>,
 }
@@ -394,6 +413,8 @@ impl WhpVp {
             interrupt: NeedsYield::new(),
             vtl2_wake: false.into(),
             vtl2_enable: vtl2_enabled.into(),
+            #[cfg(guest_arch = "x86_64")]
+            lapic_written: false.into(),
             vp_info: vp,
             waker: Default::default(),
         }
@@ -539,8 +560,6 @@ impl virt::ResetPartition for WhpPartition {
     type Error = Error;
 
     fn reset(&self) -> Result<(), Error> {
-        #[cfg(guest_arch = "x86_64")]
-        self.inner.reset_restored_tsc()?;
         self.inner.vtl0.reset()?;
         self.validate_is_reset(Vtl::Vtl0);
 
@@ -620,28 +639,8 @@ impl virt::Partition for WhpPartition {
     }
 
     #[cfg(guest_arch = "x86_64")]
-    fn cpu_compatibility_contract(&self) -> virt::x86::CpuCompatibilityContract {
-        virt::x86::CpuCompatibilityContract::new(&self.inner.caps, &self.inner.cpuid)
-    }
-
-    #[cfg(guest_arch = "x86_64")]
-    fn tsc_frequency_hz(&self) -> Result<Option<u64>, Self::Error> {
-        Ok(Some(self.inner.clock.tsc_frequency_hz))
-    }
-
-    #[cfg(guest_arch = "x86_64")]
-    fn set_tsc_frequency_hz(&self, frequency_hz: u64) -> Result<(), Self::Error> {
-        self.inner.clock.check_frequency(frequency_hz)
-    }
-
-    #[cfg(guest_arch = "x86_64")]
-    fn advance_snapshot_time(&self, _duration: std::time::Duration) -> Result<(), Self::Error> {
-        self.inner.advance_snapshot_time()
-    }
-
-    #[cfg(guest_arch = "x86_64")]
-    fn apic_frequency_hz(&self) -> Result<Option<u64>, Self::Error> {
-        self.inner.apic_frequency_hz()
+    fn time_abi(&self) -> Option<&dyn virt::time_abi::TimeAbiBackend> {
+        self.inner.time_abi.as_ref().map(|_| &*self.inner as _)
     }
 
     fn supports_reset(&self) -> Option<&dyn virt::ResetPartition<Error = Error>> {
@@ -877,11 +876,9 @@ pub enum Error {
     NestedVirtIncompatibleWithIsolation,
     #[error("WHP does not support {0:?} isolation")]
     IsolationNotSupported(IsolationType),
-    #[error("saved TSC frequency {saved} Hz does not match destination frequency {destination} Hz")]
-    TscFrequencyMismatch { saved: u64, destination: u64 },
     #[cfg(guest_arch = "x86_64")]
-    #[error("timestamp intercept arrived without a restored TSC clock")]
-    UnexpectedTimestampExit,
+    #[error(transparent)]
+    TimeAbi(#[from] virt::time_abi::TimeAbiError),
 }
 
 trait WhpResultExt<T> {
@@ -956,6 +953,16 @@ impl virt::Hypervisor for Whp {
             if config.isolation.is_isolated() {
                 return Err(Error::NestedVirtIncompatibleWithIsolation);
             }
+        }
+
+        #[cfg(guest_arch = "x86_64")]
+        if config.time_abi.is_some() {
+            time_abi::validate_partition(
+                isolation,
+                config.hv_config.is_some(),
+                nested_virt,
+                user_mode_apic,
+            )?;
         }
 
         let vtl0 = VtlPartition::new(
@@ -1155,6 +1162,12 @@ impl WhpPartitionInner {
 
         #[cfg(guest_arch = "x86_64")]
         let tsc_frequency = vtl0.whp.tsc_frequency().for_op("get tsc frequency")?;
+        #[cfg(guest_arch = "x86_64")]
+        let (vtl0, time_abi) = {
+            let mut vtl0 = vtl0;
+            let time_abi = vtl0.time_abi.take();
+            (vtl0, time_abi)
+        };
 
         // FUTURE: register cpuid results with the hypervisor, and register
         // appropriate per-VP results where necessary (or tell the hypervisor
@@ -1236,8 +1249,15 @@ impl WhpPartitionInner {
             )
             .map_err(Error::TopologyCpuid)?;
 
-            let cpuid = tsc::add_frequency_leaves(cpuid, tsc_frequency, &vtl0)?;
-            virt::CpuidLeafSet::new(cpuid)
+            match &time_abi {
+                // The time ABI declares the TSC rate through its identity
+                // MSRs; leaf 0x15 stays zero.
+                Some(time_abi) => time_abi.partition_cpuid(cpuid)?,
+                None => {
+                    let cpuid = tsc::add_frequency_leaves(cpuid, tsc_frequency, &vtl0)?;
+                    virt::CpuidLeafSet::new(cpuid)
+                }
+            }
         };
 
         let mut vtl0_alias_map_offset = None;
@@ -1300,15 +1320,34 @@ impl WhpPartitionInner {
 
         #[cfg(guest_arch = "x86_64")]
         let caps = {
-            let mut caps = virt::x86::X86PartitionCapabilities::from_cpuid(
-                proto_config.processor_topology,
-                &mut |function, index| cpuid.result(function, index, &vtl0.cpuid(function, index)),
-            )
-            .map_err(Error::Capabilities)?;
+            let mut lookup =
+                |function, index| cpuid.result(function, index, &vtl0.cpuid(function, index));
+            let caps = if time_abi.is_some() {
+                // The time ABI identity must not make the partition look like
+                // an hv1 or KVM-clock guest, so its capabilities ignore the
+                // hypervisor range.
+                virt::x86::X86PartitionCapabilities::from_cpuid(
+                    proto_config.processor_topology,
+                    &mut virt::time_abi::identity::capabilities_cpuid(&mut lookup),
+                )
+            } else {
+                virt::x86::X86PartitionCapabilities::from_cpuid(
+                    proto_config.processor_topology,
+                    &mut lookup,
+                )
+            };
+            let mut caps = caps.map_err(Error::Capabilities)?;
             caps.can_freeze_time = true;
             caps.xsaves_state_bv_broken = true;
             caps.dr6_tsx_broken = true;
             caps.nested_virt = nested_virt;
+            if time_abi.is_some() && caps.hv1 {
+                return Err(virt::time_abi::TimeAbiError::new(
+                    virt::time_abi::TimeAbiCode::IdentityRouting,
+                    "the time ABI partition capabilities include hv1",
+                )
+                .into());
+            }
             caps
         };
         let vendor = match whp::capabilities::processor_vendor().for_op("get processor vendor")? {
@@ -1369,9 +1408,12 @@ impl WhpPartitionInner {
             #[cfg(guest_arch = "x86_64")]
             cpuid,
             #[cfg(guest_arch = "x86_64")]
-            cpuid_topology: cpu_contract::CpuidTopology::new(proto_config.processor_topology),
+            cpuid_topology: match &time_abi {
+                Some(time_abi) => time_abi.cpuid_topology(proto_config.processor_topology),
+                None => cpu_contract::CpuidTopology::new(proto_config.processor_topology),
+            },
             #[cfg(guest_arch = "x86_64")]
-            clock: tsc::PartitionClock::new(tsc_frequency),
+            time_abi,
             vtl0_alias_map_offset,
             monitor_page: MonitorPage::new(),
             hvstate,
@@ -1531,9 +1573,13 @@ impl VtlPartition {
             .for_op("set processor count")?;
 
         #[cfg(guest_arch = "x86_64")]
-        if config.versioned_cpu_contract {
-            cpu_contract::configure_versioned_contract(&mut whp_config, &mut extended_exits)?;
-        }
+        let time_abi = config
+            .time_abi
+            .as_ref()
+            .map(|time_abi| {
+                time_abi::WhpTimeAbi::configure(time_abi, &mut whp_config, &mut extended_exits)
+            })
+            .transpose()?;
 
         #[cfg(guest_arch = "x86_64")]
         if nested_virt {
@@ -1833,6 +1879,8 @@ impl VtlPartition {
             mapper,
             lapic,
             hypervisor_enlightened,
+            #[cfg(guest_arch = "x86_64")]
+            time_abi,
         })
     }
 

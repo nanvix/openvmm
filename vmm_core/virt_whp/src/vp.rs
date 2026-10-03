@@ -1,9 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-#[cfg(guest_arch = "x86_64")]
-mod tsc;
-
 use super::Vplc;
 use super::VtlPartition;
 use super::vtl2::Vtl2InterceptState;
@@ -41,8 +38,6 @@ pub(crate) struct ExitStats {
     memory: Counter,
     #[cfg(guest_arch = "x86_64")]
     cpuid: Counter,
-    #[cfg(guest_arch = "x86_64")]
-    rdtsc: Counter,
     #[cfg(guest_arch = "x86_64")]
     apic_eoi: Counter,
     cancel: Counter,
@@ -236,6 +231,17 @@ impl<'a> WhpProcessor<'a> {
         dev: &impl CpuIo,
     ) -> Result<Infallible, VpHaltReason> {
         tracing::trace!(vtl = ?self.state.active_vtl, "current vtl");
+        // A LAPIC state written since the last run may hold a pending vector
+        // that the hypervisor has not delivered, and partition time may have
+        // been suspended and resumed since then. Assert it again now that the
+        // VP is about to run.
+        #[cfg(guest_arch = "x86_64")]
+        if let Err(err) = self.reassert_written_lapic() {
+            tracelimit::warn_ratelimited!(
+                error = &err as &dyn std::error::Error,
+                "failed to assert a pending LAPIC vector"
+            );
+        }
         let mut last_waker = None;
         loop {
             self.inner.interrupt.maybe_yield().await;
@@ -566,10 +572,6 @@ mod x86 {
                 ExitReason::Cpuid(info) => {
                     self.handle_cpuid(info, exit);
                     &mut self.state.exits.cpuid
-                }
-                ExitReason::Rdtsc(info) => {
-                    self.handle_rdtsc_exit(dev, info, exit)?;
-                    &mut self.state.exits.rdtsc
                 }
                 ExitReason::ApicEoi(info) => {
                     self.handle_apic_eoi(info, dev);
@@ -1238,7 +1240,10 @@ mod x86 {
             info: &whp::abi::WHV_X64_MSR_ACCESS_CONTEXT,
             exit: whp::Exit<'_>,
         ) -> Result<(), VpHaltReason> {
-            if self.handle_restored_tsc_msr_exit(dev, info, exit)? {
+            if self
+                .handle_time_abi_msr(info, exit)
+                .map_err(|error| dev.fatal_error(error.into()))?
+            {
                 return Ok(());
             }
             let handled = if info.AccessInfo.IsWrite() {
