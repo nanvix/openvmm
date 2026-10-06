@@ -3,7 +3,8 @@
 
 //! NVX time ABI v1 in the VM worker, which every microVM uses: the partition
 //! configuration, the backend preflight and rate policy, the `time-abi` state
-//! unit, the capture records, and the restore clock.
+//! unit, the capture records, the restore clock, and the TSC held by a host
+//! pause.
 
 #![cfg(guest_arch = "x86_64")]
 
@@ -615,6 +616,38 @@ pub(super) fn capture_records(
             capture_cpu_signature: virt::time_abi::surface::host_cpu_signature().unwrap_or(0),
         },
     })
+}
+
+/// Takes VP 0's TSC for a host pause, with every VP stopped.
+pub(super) fn held_tsc(
+    partition: &dyn HvlitePartition,
+    state: &TimeAbiState,
+) -> anyhow::Result<u64> {
+    let anchor = backend(partition, &state.report.hypervisor)?.capture_anchor()?;
+    tracing::info!(
+        tsc = anchor.tsc,
+        pairing_ns = anchor.pairing_ns,
+        "time ABI host pause anchor"
+    );
+    Ok(anchor.tsc)
+}
+
+/// Sets every VP's TSC to `tsc`, the value held by a host pause, before any
+/// VP runs again, so the guest observes no elapsed time across the pause.
+pub(super) fn set_held_tsc(
+    partition: &dyn HvlitePartition,
+    state: &TimeAbiState,
+    tsc: u64,
+) -> anyhow::Result<()> {
+    let set =
+        backend(partition, &state.report.hypervisor)?.set_synchronized_tsc(&mut |_| Ok(tsc))?;
+    tracing::info!(
+        target = set.target,
+        method = ?set.method,
+        vps = set.readback.len(),
+        "time ABI host resume TSC set"
+    );
+    Ok(())
 }
 
 impl LoadedVm {

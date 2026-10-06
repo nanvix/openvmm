@@ -3026,6 +3026,14 @@ async fn run_control_inner(
         tracing::info!("restoring VM from snapshot");
     }
 
+    // Serve host pause, resume, and run-state requests. The worker rejects a
+    // host pause until the VM runs. The task stops before the serial driver
+    // that backs its endpoint.
+    let state_control = microvm
+        .take_state_control()
+        .map(|endpoint| endpoint.spawn(vm_rpc.clone()))
+        .transpose()?;
+
     if !opt.paused {
         anyhow::ensure!(
             vm_rpc.call_failable(VmRpc::Resume, ()).await?,
@@ -3112,6 +3120,7 @@ async fn run_control_inner(
     // Wait for the controller task to finish (it stops the VM worker and
     // shuts down the mesh).
     let teardown = controller_task.await;
+    drop(state_control);
     drop(serial_driver);
 
     // run_repl returns the exit status: the code the guest drove via an opt-in

@@ -855,6 +855,25 @@ Serial devices can be configured to appear as different devices inside the guest
   management RPC does not expose control-console restore attachments and
   rejects these snapshots explicitly.
 
+* `--microvm-state-control <BACKEND>`: With a live authenticated
+  `--microvm-control-console`, expose a separate host endpoint to pause,
+  resume, and query the microVM. The only backend is `listen=PATH`. It is bound
+  and peer-checked like the control console endpoint and must differ from the
+  boot console and control console endpoints. Hosts authenticate with the
+  control-console capability within `--microvm-control-auth-timeout-ms`.
+
+  The endpoint serves one host at a time, and it answers while the VM is
+  paused. A pause holds guest monotonic time, so the guest observes no elapsed
+  time across it. Wall-clock time is not held: the CMOS RTC follows host UTC,
+  and the guest's system clock is behind host UTC after a resume until the
+  guest steps it. A pause is busy while a snapshot boundary or post-restore
+  gate is active, and is rejected when a vCPU has an armed periodic or
+  TSC-deadline LAPIC timer.
+
+  The endpoint is never recorded in a snapshot. A restore caller may supply a
+  fresh one. See
+  [MicroVM State-control Protocol](./state_control_protocol.md).
+
 The `BACKEND` argument is the same for all serial devices:
 
   * `none`: Serial output is dropped.

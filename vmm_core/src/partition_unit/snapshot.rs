@@ -2,8 +2,9 @@
 // Licensed under the MIT License.
 
 //! Partition unit support for snapshots: validating the instantiated VP prefix,
-//! stopping VPs at a deferred I/O boundary for capture, and the NVX time ABI's
-//! LAPIC timer checks and restore advance.
+//! stopping VPs at a deferred I/O boundary for capture, the NVX time ABI's
+//! LAPIC timer checks and restore advance, and the LAPIC state that a host
+//! pause holds while the vCPUs are stopped.
 
 use super::Error;
 use super::PartitionRequest;
@@ -21,6 +22,10 @@ pub(super) enum SnapshotRequest {
     CheckTimers(FailableRpc<(), ()>),
     #[cfg(guest_arch = "x86_64")]
     AdvanceLapic(FailableRpc<(u64, u64), ()>),
+    #[cfg(guest_arch = "x86_64")]
+    GetLapics(FailableRpc<(), Vec<virt::x86::vp::Apic>>),
+    #[cfg(guest_arch = "x86_64")]
+    SetLapics(FailableRpc<Vec<virt::x86::vp::Apic>, ()>),
     #[cfg(guest_arch = "x86_64")]
     OmitSavedTsc(mesh::rpc::Rpc<(), ()>),
 }
@@ -112,6 +117,31 @@ impl PartitionUnit {
             .await
             .unwrap();
     }
+
+    /// Reads the LAPIC state of every stopped vCPU, in VP order, so that a
+    /// host pause can set the same timer state again when it resumes.
+    #[cfg(guest_arch = "x86_64")]
+    pub async fn get_lapics(&mut self) -> anyhow::Result<Vec<virt::x86::vp::Apic>> {
+        Ok(self
+            .req_send
+            .call_failable(
+                |rpc| PartitionRequest::Snapshot(SnapshotRequest::GetLapics(rpc)),
+                (),
+            )
+            .await?)
+    }
+
+    /// Sets the LAPIC state of every stopped vCPU to `lapics`, in VP order.
+    #[cfg(guest_arch = "x86_64")]
+    pub async fn set_lapics(&mut self, lapics: Vec<virt::x86::vp::Apic>) -> anyhow::Result<()> {
+        self.req_send
+            .call_failable(
+                |rpc| PartitionRequest::Snapshot(SnapshotRequest::SetLapics(rpc)),
+                lapics,
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 impl PartitionUnitRunner {
@@ -140,6 +170,16 @@ impl PartitionUnitRunner {
                     self.vp_set.advance_lapic_timers(downtime_ns, apic_hz).await
                 })
                 .await
+            }
+            #[cfg(guest_arch = "x86_64")]
+            SnapshotRequest::GetLapics(rpc) => {
+                rpc.handle_failable(async |()| self.vp_set.get_lapics().await)
+                    .await
+            }
+            #[cfg(guest_arch = "x86_64")]
+            SnapshotRequest::SetLapics(rpc) => {
+                rpc.handle_failable(async |lapics| self.vp_set.set_lapics(lapics).await)
+                    .await
             }
             #[cfg(guest_arch = "x86_64")]
             SnapshotRequest::OmitSavedTsc(rpc) => rpc.handle_sync(|()| {

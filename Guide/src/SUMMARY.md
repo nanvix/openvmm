@@ -89,6 +89,7 @@
   - [Configuration and Management](./reference/openvmm/management.md)
     - [CLI](./reference/openvmm/management/cli.md)
     - [Control-session Protocol](./reference/openvmm/management/control_session_protocol.md)
+    - [MicroVM State-control Protocol](./reference/openvmm/management/state_control_protocol.md)
     - [Interactive Console](./reference/openvmm/management/interactive_console.md)
     - [gRPC / ttrpc](./reference/openvmm/management/grpc.md)
   - [Graphical Console](./reference/openvmm/graphical_console.md)

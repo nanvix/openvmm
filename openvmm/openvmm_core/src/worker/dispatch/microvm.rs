@@ -145,6 +145,11 @@ impl SnapshotBoundary {
             None => std::future::pending().await,
         }
     }
+
+    /// Returns whether a boundary holds the vCPUs stopped.
+    pub(super) fn is_active(&self) -> bool {
+        self.stop_guard.is_some()
+    }
 }
 
 #[cfg(guest_arch = "x86_64")]

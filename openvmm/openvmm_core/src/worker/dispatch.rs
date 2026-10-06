@@ -4,6 +4,7 @@
 mod amd_iommu_wiring;
 mod dump;
 mod ecam_config_access;
+mod host_pause;
 mod intel_vtd_wiring;
 mod ioapic_iommu_wiring;
 mod microvm;
@@ -926,6 +927,7 @@ pub(crate) struct LoadedVm {
     running: bool,
     snapshot_restore: restore::SnapshotRestore,
     snapshot_boundary: microvm::SnapshotBoundary,
+    host_pause: host_pause::HostPause,
 }
 
 struct DynamicVpciDeviceEntry {
@@ -3418,6 +3420,7 @@ impl InitializedVm {
             running: false,
             snapshot_restore,
             snapshot_boundary: Default::default(),
+            host_pause: Default::default(),
             inner: LoadedVmInner {
                 driver_source,
                 resolver,
@@ -3949,8 +3952,12 @@ impl LoadedVm {
         if self.running {
             return Ok(false);
         }
+        self.restore_held_guest_time()
+            .await
+            .context("failed to restore the guest time held by the host pause")?;
         self.start_state_units().await?;
         self.running = true;
+        self.complete_host_resume();
         Ok(true)
     }
 
@@ -4129,6 +4136,15 @@ impl LoadedVm {
                         rpc.handle_failable(async |()| self.resume().await).await
                     }
                     VmRpc::Pause(rpc) => rpc.handle(async |()| self.pause().await).await,
+                    VmRpc::MicrovmPause(rpc) => {
+                        rpc.handle(async |()| self.microvm_pause().await).await
+                    }
+                    VmRpc::MicrovmResume(rpc) => {
+                        rpc.handle(async |()| self.microvm_resume().await).await
+                    }
+                    VmRpc::MicrovmRunState(rpc) => {
+                        rpc.handle_sync(|()| self.microvm_run_status())
+                    }
                     VmRpc::Save(rpc) => {
                         rpc.handle_failable(async |()| self.save().await.map(ProtobufMessage::new))
                             .await
@@ -4701,16 +4717,27 @@ impl LoadedVm {
     async fn reset(&mut self, reload_firmware: bool) -> anyhow::Result<()> {
         let resume = self.pause().await;
 
-        self.state_units.reset().await?;
-        // TODO: _vmnic
-        // TODO: gdb?
+        // A reset reinitializes guest time, so it discards the time that a
+        // host pause held. The host pause survives only a complete reset.
+        self.host_pause.discard_held_time();
+        let reset = async {
+            self.state_units.reset().await?;
+            // TODO: _vmnic
+            // TODO: gdb?
 
-        // Load again
-        if reload_firmware {
-            // Assign PCI resources before rebuilding firmware so the ACPI
-            // tables reflect the freshly assigned bus numbers.
-            self.assign_pci_resources().await?;
-            self.inner.load_firmware(false).await?;
+            // Load again
+            if reload_firmware {
+                // Assign PCI resources before rebuilding firmware so the ACPI
+                // tables reflect the freshly assigned bus numbers.
+                self.assign_pci_resources().await?;
+                self.inner.load_firmware(false).await?;
+            }
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(error) = reset {
+            self.host_pause.abandon();
+            return Err(error);
         }
 
         if resume {

@@ -91,6 +91,14 @@ trait ControlVp: ProtobufSaveRestore {
     #[cfg(guest_arch = "x86_64")]
     fn advance_lapic_timer(&mut self, advance: time_abi::LapicAdvance) -> anyhow::Result<()>;
 
+    /// Reads the stopped vCPU's LAPIC state.
+    #[cfg(guest_arch = "x86_64")]
+    fn get_lapic(&mut self) -> anyhow::Result<virt::x86::vp::Apic>;
+
+    /// Sets the stopped vCPU's LAPIC state.
+    #[cfg(guest_arch = "x86_64")]
+    fn set_lapic(&mut self, apic: &virt::x86::vp::Apic) -> anyhow::Result<()>;
+
     #[cfg(feature = "gdb")]
     fn debug(&mut self) -> &mut dyn DebugVp;
 
@@ -196,6 +204,16 @@ where
     #[cfg(guest_arch = "x86_64")]
     fn advance_lapic_timer(&mut self, advance: time_abi::LapicAdvance) -> anyhow::Result<()> {
         advance.apply(self.vp)
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn get_lapic(&mut self) -> anyhow::Result<virt::x86::vp::Apic> {
+        time_abi::get_lapic(self.vp)
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn set_lapic(&mut self, apic: &virt::x86::vp::Apic) -> anyhow::Result<()> {
+        time_abi::set_lapic(self.vp, apic)
     }
 
     fn inspect_vp(
@@ -1137,6 +1155,10 @@ enum StateEvent {
     CheckTimers(mesh::rpc::FailableRpc<(), ()>),
     #[cfg(guest_arch = "x86_64")]
     AdvanceLapic(mesh::rpc::FailableRpc<time_abi::LapicAdvance, ()>),
+    #[cfg(guest_arch = "x86_64")]
+    GetLapic(mesh::rpc::FailableRpc<(), virt::x86::vp::Apic>),
+    #[cfg(guest_arch = "x86_64")]
+    SetLapic(mesh::rpc::FailableRpc<Box<virt::x86::vp::Apic>, ()>),
     #[cfg(feature = "dump")]
     GetDumpVpState(Rpc<Vtl, anyhow::Result<hyperv_dump::VpState>>),
     #[cfg(feature = "gdb")]
@@ -1391,6 +1413,10 @@ impl RunnerInner {
             StateEvent::AdvanceLapic(rpc) => {
                 rpc.handle_failable_sync(|advance| vp.advance_lapic_timer(advance))
             }
+            #[cfg(guest_arch = "x86_64")]
+            StateEvent::GetLapic(rpc) => rpc.handle_failable_sync(|()| vp.get_lapic()),
+            #[cfg(guest_arch = "x86_64")]
+            StateEvent::SetLapic(rpc) => rpc.handle_failable_sync(|apic| vp.set_lapic(&apic)),
             #[cfg(feature = "dump")]
             StateEvent::GetDumpVpState(rpc) => rpc.handle_sync(|vtl| vp.get_dump_vp_state(vtl)),
             #[cfg(feature = "gdb")]

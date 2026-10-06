@@ -145,6 +145,15 @@ impl WindowsPipeSerialBackend {
         }
         Ok(())
     }
+
+    /// Drops any client of `pipe`, whose connection failed, and listens on
+    /// the pipe again.
+    fn listen_again(&mut self, pipe: File) -> io::Result<()> {
+        // A pipe without a client fails to disconnect but can still listen.
+        let _ = pipe.disconnect_pipe();
+        self.state = PipeState::Listening(ListeningPipe::new(&self.driver, pipe)?);
+        Ok(())
+    }
 }
 
 impl From<WindowsPipeSerialBackend> for Resource<SerialBackendHandle> {
@@ -162,10 +171,26 @@ impl SerialIo for WindowsPipeSerialBackend {
         match &mut self.state {
             PipeState::Done => Poll::Pending,
             PipeState::Listening(accept) => {
-                let file = ready!(accept.poll_unpin(cx));
-                let file = file?;
-                self.peer_identity = Some(named_pipe_peer_identity(&file)?);
-                self.state = PipeState::Done;
+                let accepted = ready!(accept.poll_unpin(cx));
+                let PipeState::Listening(accept) =
+                    std::mem::replace(&mut self.state, PipeState::Done)
+                else {
+                    unreachable!()
+                };
+                let file = match accepted {
+                    Ok(file) => file,
+                    // A failed accept leaves the pipe with the listener.
+                    Err(error) => {
+                        return Poll::Ready(self.listen_again(accept.into_inner()).and(Err(error)));
+                    }
+                };
+                // Reject a client whose identity cannot be resolved, such as
+                // one that already exited, and listen for the next client.
+                let peer_identity = match named_pipe_peer_identity(&file) {
+                    Ok(peer_identity) => peer_identity,
+                    Err(error) => return Poll::Ready(self.listen_again(file).and(Err(error))),
+                };
+                self.peer_identity = Some(peer_identity);
                 self.state = PipeState::Connected(PolledPipe::new(&self.driver, file)?);
                 Poll::Ready(Ok(()))
             }

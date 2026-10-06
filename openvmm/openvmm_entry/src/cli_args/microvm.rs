@@ -406,6 +406,13 @@ pub struct MicrovmCli {
     )]
     pub microvm_control_auth_timeout_ms: u64,
 
+    /// authenticated host endpoint for microVM pause, resume, and run state
+    ///
+    /// Accepts listen=\<path\>. Requires a live --microvm-control-console;
+    /// hosts authenticate with the control-console capability.
+    #[clap(long, value_name = "SERIAL", requires("microvm_control_auth_stdin"))]
+    pub microvm_state_control: Option<SerialConfigCli>,
+
     /// microVM CPU profile: a pinned profile ID, `auto` (the default) to
     /// select the host's profile, or `host` to derive a development profile
     /// from this host; a restore must name the snapshot's profile
@@ -543,8 +550,9 @@ impl Options {
                     && self.microvm.restore_memory.is_none()
                     && self.microvm.memory_capacity.is_none()
                     && self.microvm.microvm_control_console.is_none()
-                    && !self.microvm.microvm_control_auth_stdin,
-                "--network-profile, --net-tap, --mount, --microvm-sandbox-block, --microvm-workload-identity, --microvm-lifecycle, --microvm-control-console, --microvm-control-auth-stdin, --restore-processors, --restore-memory, --memory-capacity, and microVM network policy require a microVM machine"
+                    && !self.microvm.microvm_control_auth_stdin
+                    && self.microvm.microvm_state_control.is_none(),
+                "--network-profile, --net-tap, --mount, --microvm-sandbox-block, --microvm-workload-identity, --microvm-lifecycle, --microvm-control-console, --microvm-control-auth-stdin, --microvm-state-control, --restore-processors, --restore-memory, --memory-capacity, and microVM network policy require a microVM machine"
             );
             return Ok(());
         }
@@ -739,6 +747,20 @@ impl Options {
             anyhow::ensure!(
                 !self.microvm.microvm_control_auth_stdin,
                 "--microvm-control-auth-stdin requires --microvm-control-console"
+            );
+        }
+        if let Some(state_control) = &self.microvm.microvm_state_control {
+            anyhow::ensure!(
+                matches!(state_control, SerialConfigCli::Pipe(_)),
+                "microVM state control requires listen=..."
+            );
+            anyhow::ensure!(
+                self.microvm
+                    .microvm_control_console
+                    .as_ref()
+                    .is_some_and(|console| matches!(console, SerialConfigCli::Pipe(_)))
+                    && self.microvm.microvm_control_auth_stdin,
+                "--microvm-state-control requires a live --microvm-control-console with --microvm-control-auth-stdin"
             );
         }
         if self.microvm.microvm_lifecycle == Some(MicrovmLifecycleCli::Managed) {
@@ -1754,6 +1776,91 @@ mod tests {
                 "--microvm-control-auth-stdin=0",
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn state_control_requires_a_live_authenticated_control_console() {
+        let (control, state) = if cfg!(windows) {
+            (
+                "listen=//./pipe/openvmm-microvm-control",
+                "listen=//./pipe/openvmm-microvm-state",
+            )
+        } else {
+            ("listen=control.sock", "listen=state.sock")
+        };
+        let base = [
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--virtio-console",
+            "none",
+            "--microvm-control-console",
+            control,
+            "--microvm-control-auth-stdin",
+        ];
+        let options =
+            Options::try_parse_from(base.into_iter().chain(["--microvm-state-control", state]))
+                .unwrap();
+        assert!(matches!(
+            options.microvm.microvm_state_control,
+            Some(SerialConfigCli::Pipe(_))
+        ));
+        assert_eq!(
+            options.validate_microvm_options().is_ok(),
+            cfg!(any(target_os = "linux", windows))
+        );
+
+        // The endpoint must listen.
+        let options =
+            Options::try_parse_from(base.into_iter().chain(["--microvm-state-control", "none"]))
+                .unwrap();
+        assert!(options.validate_microvm_options().is_err());
+
+        // It authenticates with the live control console's capability.
+        assert!(
+            Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--virtio-console",
+                "none",
+                "--microvm-state-control",
+                state,
+            ])
+            .is_err()
+        );
+        let options = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--virtio-console",
+            "none",
+            "--microvm-control-console",
+            "none",
+            "--microvm-control-auth-stdin",
+            "--microvm-state-control",
+            state,
+        ])
+        .unwrap();
+        assert!(options.validate_microvm_options().is_err());
+
+        // A standard VM has no state-control endpoint.
+        let options = Options::try_parse_from([
+            "openvmm",
+            "--microvm-control-console",
+            control,
+            "--microvm-control-auth-stdin",
+            "--microvm-state-control",
+            state,
+        ])
+        .unwrap();
+        assert!(
+            options
+                .validate_microvm_options()
+                .unwrap_err()
+                .to_string()
+                .contains("--microvm-state-control")
         );
     }
 

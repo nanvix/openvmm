@@ -90,7 +90,9 @@ pub trait TimeAbiBackend: Send + Sync {
     ///
     /// Core calls it once per restore, after every instantiated VP is bound
     /// (which creates it on MSHV) and its saved state is restored, and before
-    /// any restored VP runs. A cold boot never calls it.
+    /// any restored VP runs. A cold boot never calls it before the guest runs.
+    /// Core also calls it at every resume from a host pause, with every VP
+    /// stopped, to set back the TSC that the pause held.
     fn set_synchronized_tsc(
         &self,
         target: &mut dyn FnMut(&HostTimeSample) -> Result<u64, TimeAbiError>,

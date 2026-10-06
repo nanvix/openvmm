@@ -47,12 +47,13 @@ impl VpSet {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use crate::partition_unit::vp_set::*;
     use test_with_tracing::test;
     use vm_topology::processor::VpInfo;
 
-    fn vp_set(count: u32) -> (VpSet, Vec<VpRunner>) {
+    /// Creates a stopped set of `count` VPs and their runners.
+    pub(in crate::partition_unit::vp_set) fn vp_set(count: u32) -> (VpSet, Vec<VpRunner>) {
         let (halt, _halt_recv) = Halt::new();
         let mut vps = VpSet::new([None, None, None], Arc::new(halt), count as usize);
         let runners = (0..count)
