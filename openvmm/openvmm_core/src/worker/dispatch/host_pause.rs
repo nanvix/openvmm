@@ -8,8 +8,8 @@
 //! stopped. Resume sets every VP's TSC back to the held value with the
 //! backend's synchronized TSC set, and sets the held LAPIC state again, before
 //! any vCPU runs. VM time stops and starts with the state units. Host UTC,
-//! which the CMOS RTC follows, keeps running, so the guest's wall-clock
-//! discipline steps `CLOCK_REALTIME` at its next poll.
+//! which the CMOS RTC and the time sample follow, keeps running, so the
+//! guest's wall-clock discipline steps `CLOCK_REALTIME` at its next poll.
 //!
 //! A guest reset processed while the host holds the pause reinitializes guest
 //! time, so it discards the held time but keeps the pause: the reset VM starts

@@ -864,9 +864,9 @@ Serial devices can be configured to appear as different devices inside the guest
 
   The endpoint serves one host at a time, and it answers while the VM is
   paused. A pause holds guest monotonic time, so the guest observes no elapsed
-  time across it. Wall-clock time is not held: the CMOS RTC follows host UTC,
-  and the guest's system clock is behind host UTC after a resume until the
-  guest steps it. A pause is busy while a snapshot boundary or post-restore
+  time across it. Wall-clock time is not held: the CMOS RTC and the time
+  sample follow host UTC, and the guest's system clock is behind host UTC
+  after a resume until the guest steps it. A pause is busy while a snapshot boundary or post-restore
   gate is active, and is rejected when a vCPU has an armed periodic or
   TSC-deadline LAPIC timer.
 

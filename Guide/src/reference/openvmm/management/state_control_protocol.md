@@ -117,11 +117,12 @@ LAPIC timers, and the VM time that drives emulated timers, such as the PIT and
 the RTC's periodic and alarm interrupts, all stop with the vCPUs and continue
 from the same values.
 
-Wall-clock time is not held. The CMOS RTC's date and time follow host UTC, so
-after a resume they read the current host time. The guest's system clock is
-behind host UTC by the paused duration until the guest steps it, for example
-from the RTC. The NVX guest's wall-clock discipline does this at its next
-poll.
+Wall-clock time is not held. Host UTC keeps running, and so do the guest-visible
+sources that follow it: the CMOS RTC's date and time, and the time sample on the
+portb status port. After a resume, the guest's system clock is behind host UTC
+by the paused duration until the guest steps it from such a source. The NVX
+guest's wall-clock discipline, which reads the time sample, steps it at its
+next poll.
 
 ## Guest activity while paused
 
