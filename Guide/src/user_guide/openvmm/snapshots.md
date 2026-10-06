@@ -217,9 +217,14 @@ empty; a bound slot rejects capture before guest execution is quiesced.
 `--restore-image-slots <COUNT>` may activate a larger contiguous prefix before
 restore readiness and must satisfy
 `boot-active <= COUNT <= 4`. The target is carried in
-`OPENVMM_ENTROPY_V4` beside the online-VP target. Restored slots always begin
-empty, and no slot can be activated after readiness. ABI 2 snapshots have no
-image-slot fields and keep their existing topology and entropy packet.
+`OPENVMM_ENTROPY_V4` beside the online-VP target, and portb status bit 6
+advertises it. Version 4 also sets status bit 2 for a nonzero online-VP target
+and bits 3 and 4 when it carries expansion ranges. An
+explicit target always holds the restore gate until the guest verifies the
+active prefix and acknowledges, even when no new slot becomes active.
+Restored slots always begin empty, and no slot can be activated after
+readiness. ABI 2 snapshots have no image-slot fields and keep their existing
+topology and entropy packet.
 
 ```admonish warning
 Versions 3 through 5 do not contain or validate embedded checksums for

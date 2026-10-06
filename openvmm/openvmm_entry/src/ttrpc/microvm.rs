@@ -815,6 +815,7 @@ impl CreateVm {
             .is_some_and(|restore| restore.restore_memory_target_requested);
         let (generation_id, restore_entropy) = if self.restore_entropy
             || self.restore_online_vp_count.is_some()
+            || self.restore_active_image_slot_count.is_some()
             || restore_memory_target_requested
         {
             crate::microvm::fresh_microvm_restore_packet(
@@ -1357,6 +1358,7 @@ impl CreateVm {
             )?);
         }
         let restore_gate_timeout = (self.restore_online_vp_count.is_some()
+            || self.restore_active_image_slot_count.is_some()
             || self
                 .authoritative_restore
                 .as_ref()

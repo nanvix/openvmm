@@ -44,12 +44,14 @@ const GENERATION_ID_SELECT: u8 = 0xa6;
 const GENERATION_ID_SIZE: usize = 16;
 const RESTORE_PROCESSOR_TARGET_PACKET_HEADER: &[u8] = b"OPENVMM_ENTROPY_V2\0";
 const RESTORE_MEMORY_TARGET_PACKET_HEADER: &[u8] = b"OPENVMM_ENTROPY_V3\0";
+const RESTORE_IMAGE_SLOT_TARGET_PACKET_HEADER: &[u8] = b"OPENVMM_ENTROPY_V4\0";
 const STATUS_INPUT_AVAILABLE: u8 = 1 << 0;
 const STATUS_RESTORE_PACKET_AVAILABLE: u8 = 1 << 1;
 const STATUS_RESTORE_PROCESSOR_TARGET_AVAILABLE: u8 = 1 << 2;
 const STATUS_RESTORE_MEMORY_TARGET_AVAILABLE: u8 = 1 << 3;
 const STATUS_RESTORE_MEMORY_EXPANSION_AVAILABLE: u8 = 1 << 4;
 const STATUS_GENERATION_ID_AVAILABLE: u8 = 1 << 5;
+const STATUS_RESTORE_IMAGE_SLOT_TARGET_AVAILABLE: u8 = 1 << 6;
 const BUFFER_MAX: usize = 1024 * 1024;
 
 /// Raw bidirectional microVM portb console.
@@ -71,6 +73,7 @@ pub struct MicrovmPortb {
     restore_processor_target_available: bool,
     restore_memory_target_available: bool,
     restore_memory_expansion_available: bool,
+    restore_image_slot_target_available: bool,
     input_gated: bool,
     #[inspect(skip)]
     rx_waker: Option<Waker>,
@@ -89,17 +92,28 @@ impl MicrovmPortb {
         generation_id: [u8; GENERATION_ID_SIZE],
         restore_entropy: Vec<u8>,
     ) -> Self {
+        // Version 4 extends the version-3 fields with an image-slot target
+        // between the online-VP target and the expansion-range count.
+        let (online_vp_count, image_slot_count, range_count) =
+            if restore_entropy.starts_with(RESTORE_MEMORY_TARGET_PACKET_HEADER) {
+                let fields = &restore_entropy[RESTORE_MEMORY_TARGET_PACKET_HEADER.len()..];
+                (fields.first(), None, fields.get(1))
+            } else if restore_entropy.starts_with(RESTORE_IMAGE_SLOT_TARGET_PACKET_HEADER) {
+                let fields = &restore_entropy[RESTORE_IMAGE_SLOT_TARGET_PACKET_HEADER.len()..];
+                (fields.first(), fields.get(1), fields.get(2))
+            } else {
+                (None, None, None)
+            };
         let restore_processor_target_available = restore_entropy
             .starts_with(RESTORE_PROCESSOR_TARGET_PACKET_HEADER)
-            || (restore_entropy.starts_with(RESTORE_MEMORY_TARGET_PACKET_HEADER)
-                && restore_entropy
-                    .get(RESTORE_MEMORY_TARGET_PACKET_HEADER.len())
-                    .is_some_and(|online_vp_count| *online_vp_count != 0));
-        let restore_memory_target_available =
-            restore_entropy.starts_with(RESTORE_MEMORY_TARGET_PACKET_HEADER);
-        let restore_memory_expansion_available = restore_entropy
-            .get(RESTORE_MEMORY_TARGET_PACKET_HEADER.len() + 1)
-            .is_some_and(|range_count| restore_memory_target_available && *range_count != 0);
+            || online_vp_count.is_some_and(|online_vp_count| *online_vp_count != 0);
+        let restore_memory_target_available = restore_entropy
+            .starts_with(RESTORE_MEMORY_TARGET_PACKET_HEADER)
+            || range_count.is_some_and(|range_count| *range_count != 0);
+        let restore_memory_expansion_available =
+            range_count.is_some_and(|range_count| *range_count != 0);
+        let restore_image_slot_target_available =
+            image_slot_count.is_some_and(|image_slot_count| *image_slot_count != 0);
         Self {
             io_region: ("microvm-portb", DATA_PORT..=STATUS_PORT),
             io,
@@ -112,6 +126,7 @@ impl MicrovmPortb {
             restore_processor_target_available,
             restore_memory_target_available,
             restore_memory_expansion_available,
+            restore_image_slot_target_available,
             input_gated: false,
             rx_waker: None,
             tx_waker: None,
@@ -248,6 +263,7 @@ impl ChangeDeviceState for MicrovmPortb {
         self.restore_processor_target_available = false;
         self.restore_memory_target_available = false;
         self.restore_memory_expansion_available = false;
+        self.restore_image_slot_target_available = false;
         self.input_gated = false;
     }
 }
@@ -348,6 +364,7 @@ impl PortIoIntercept for MicrovmPortb {
                         self.restore_processor_target_available = false;
                         self.restore_memory_target_available = false;
                         self.restore_memory_expansion_available = false;
+                        self.restore_image_slot_target_available = false;
                     }
                 } else if !self.input_gated {
                     data[0] = self.rx_buffer.pop_front().unwrap_or(0);
@@ -375,6 +392,9 @@ impl PortIoIntercept for MicrovmPortb {
                 }
                 if self.restore_memory_expansion_available {
                     data[0] |= STATUS_RESTORE_MEMORY_EXPANSION_AVAILABLE;
+                }
+                if self.restore_image_slot_target_available {
+                    data[0] |= STATUS_RESTORE_IMAGE_SLOT_TARGET_AVAILABLE;
                 }
                 data[0] |= STATUS_GENERATION_ID_AVAILABLE;
             }
@@ -1288,6 +1308,67 @@ mod tests {
             [STATUS_RESTORE_PACKET_AVAILABLE
                 | STATUS_RESTORE_MEMORY_TARGET_AVAILABLE
                 | STATUS_GENERATION_ID_AVAILABLE]
+        );
+    }
+
+    #[test]
+    fn image_slot_target_restore_packet_has_distinct_status() {
+        let packet = [
+            RESTORE_IMAGE_SLOT_TARGET_PACKET_HEADER,
+            &[0, 4, 0],
+            &[0x5a; 64],
+        ]
+        .concat();
+        let mut portb =
+            MicrovmPortb::new(Box::new(Disconnected), TEST_GENERATION_ID, packet.clone());
+        let mut data = [0];
+
+        assert!(matches!(
+            portb.io_read(STATUS_PORT, &mut data),
+            IoResult::Ok
+        ));
+        assert_eq!(
+            data,
+            [STATUS_RESTORE_PACKET_AVAILABLE
+                | STATUS_RESTORE_IMAGE_SLOT_TARGET_AVAILABLE
+                | STATUS_GENERATION_ID_AVAILABLE]
+        );
+        assert!(matches!(
+            portb.io_write(STATUS_PORT, &[RESTORE_ENTROPY_SELECT]),
+            IoResult::Ok
+        ));
+        for expected in packet {
+            assert!(matches!(portb.io_read(DATA_PORT, &mut data), IoResult::Ok));
+            assert_eq!(data, [expected]);
+        }
+        assert!(matches!(
+            portb.io_read(STATUS_PORT, &mut data),
+            IoResult::Ok
+        ));
+        assert_eq!(data, [STATUS_GENERATION_ID_AVAILABLE]);
+
+        let combined_packet = [
+            RESTORE_IMAGE_SLOT_TARGET_PACKET_HEADER,
+            &[2, 3, 1],
+            &0x2000_0000_u64.to_le_bytes(),
+            &0x2000_0000_u64.to_le_bytes(),
+            &[0x5a; 64],
+        ]
+        .concat();
+        let mut portb =
+            MicrovmPortb::new(Box::new(Disconnected), TEST_GENERATION_ID, combined_packet);
+        assert!(matches!(
+            portb.io_read(STATUS_PORT, &mut data),
+            IoResult::Ok
+        ));
+        assert_eq!(
+            data,
+            [STATUS_RESTORE_PACKET_AVAILABLE
+                | STATUS_RESTORE_PROCESSOR_TARGET_AVAILABLE
+                | STATUS_RESTORE_MEMORY_TARGET_AVAILABLE
+                | STATUS_RESTORE_MEMORY_EXPANSION_AVAILABLE
+                | STATUS_GENERATION_ID_AVAILABLE
+                | STATUS_RESTORE_IMAGE_SLOT_TARGET_AVAILABLE]
         );
     }
 

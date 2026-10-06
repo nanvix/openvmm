@@ -262,9 +262,9 @@ pub(crate) fn prepare_restore(
                 manifest,
                 restore_image_slots,
             )?;
-            if restore_image_slots > contract.boot_active_image_slot_count {
-                restore_gate_required = true;
-            }
+            // The version-4 packet directs the guest to verify the active
+            // prefix and acknowledge, even when no slot becomes active.
+            restore_gate_required = true;
         }
         let restore_memory_size = opt
             .microvm
