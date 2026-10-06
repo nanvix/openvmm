@@ -91,6 +91,19 @@ generation. Linux file descriptors do not provide mandatory write exclusion;
 deployments that need authenticated or write-proof local artifacts must add a
 stronger mode such as a lease, fs-verity, or a verified artifact broker.
 
+## Externally supplied distro blocks
+
+On Linux, a snapshot-capable microVM may attach a read-only **distro** from a
+block-device node instead of a regular raw file. OpenVMM opens the node without
+following a symlink and obtains its exact length with `BLKGETSIZE64`; runtime,
+custom, and writable scratch roles remain regular files. The snapshot records
+the distro's role, geometry, and requested `generation` or `sha256` identity,
+but never copies that external distro into the snapshot directory. Diagnostic
+SHA-256 mode reads the entire block device and verifies its exact length.
+Callers must resolve, authenticate, and keep the external device generation
+alive through capture and restore. A recycled device pathname alone is not a
+valid snapshot identity.
+
 ## Scratch (`scratch.img`)
 
 The microVM block contract records every fixed role, access mode, geometry,
