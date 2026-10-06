@@ -13,6 +13,7 @@ unix_socket = { workspace = true, features = ["mesh"] }
 vm_resource.workspace = true
 
 mesh.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

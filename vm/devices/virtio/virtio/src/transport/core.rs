@@ -19,6 +19,7 @@ use crate::queue::QueueState;
 use crate::spec::VirtioDeviceFeatures;
 use crate::spec::VirtioDeviceStatus;
 use chipset_device::io::deferred::DeferredWrite;
+use futures::StreamExt;
 use guestmem::DoorbellRegistration;
 use guestmem::GuestMemory;
 use inspect::Inspect;
@@ -71,6 +72,8 @@ pub(crate) struct VirtioTransportCore {
     pub device_sender: mesh::Sender<DeviceCommand>,
     #[inspect(skip)]
     pub _device_task: Task<()>,
+    #[inspect(skip)]
+    pub config_change_recv: mesh::Receiver<()>,
     pub state: TransportState,
     pub device_feature: VirtioDeviceFeatures,
     #[inspect(hex)]
@@ -138,13 +141,15 @@ impl VirtioTransportCore {
         let restore = restore::TransportRestore::new(&*device, traits.max_queues);
 
         let (sender, receiver) = mesh::channel();
+        let (config_change_send, config_change_recv) = mesh::channel();
         let _device_task = driver.spawn("virtio-device-task", async move {
-            run_device_task(device, receiver).await;
+            run_device_task(device, receiver, config_change_send).await;
         });
 
         Ok(Self {
             device_sender: sender,
             _device_task,
+            config_change_recv,
             state: TransportState::Ready,
             device_feature,
             device_feature_select: 0,
@@ -195,6 +200,7 @@ impl VirtioTransportCore {
             // Immutable / long-lived — not reset.
             device_sender: _,
             _device_task: _,
+            config_change_recv: _,
             device_feature: _,
             supports_save_restore: _,
             guest_memory: _,
@@ -356,6 +362,10 @@ impl VirtioTransportCore {
     /// transition.
     pub fn poll_device(&mut self, ops: &mut dyn TransportOps, cx: &mut std::task::Context<'_>) {
         self.poll_waker = Some(cx.waker().clone());
+
+        while let Poll::Ready(Some(())) = self.config_change_recv.poll_next_unpin(cx) {
+            self.update_config_generation(ops);
+        }
 
         if let Poll::Ready(result) = self.state.poll(cx) {
             // Complete the deferred STATUS write before applying the

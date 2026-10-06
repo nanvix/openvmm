@@ -12,6 +12,7 @@ mod integration_tests;
 
 use anyhow::Context as _;
 use disk_backend::Disk;
+use disk_file::FileDisk;
 use futures::StreamExt;
 use guestmem::GuestMemory;
 use guestmem::ranges::PagedRange;
@@ -19,10 +20,12 @@ use inspect::Inspect;
 use inspect::InspectMut;
 use inspect_counters::Counter;
 use pal_async::wait::PolledWait;
+use parking_lot::RwLock;
 use scsi_buffers::RequestBuffers;
 use std::future::Future;
 use std::future::poll_fn;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use task_control::AsyncRun;
@@ -68,6 +71,22 @@ pub struct VirtioBlkDevice {
     read_only: bool,
     supports_discard: bool,
     config: VirtioBlkConfig,
+    media: Arc<RwLock<MediaState>>,
+    image_slot: Option<ImageSlot>,
+}
+
+#[derive(Inspect)]
+struct MediaState {
+    #[inspect(with = "Option::is_some")]
+    disk: Option<Disk>,
+    identity: Option<String>,
+}
+
+#[derive(Inspect)]
+struct ImageSlot {
+    active: bool,
+    #[inspect(skip)]
+    requests: mesh::Receiver<virtio_resources::blk::ImageSlotRequest>,
 }
 
 /// Persistent worker state. Survives across enable/disable cycles.
@@ -79,7 +98,7 @@ pub struct VirtioBlkDevice {
 /// the queue state is removed.
 #[derive(InspectMut)]
 struct BlkWorker {
-    disk: Disk,
+    media: Arc<RwLock<MediaState>>,
     read_only: bool,
     stats: WorkerStats,
     #[inspect(with = "FuturesUnordered::len")]
@@ -205,11 +224,11 @@ impl AsyncRun<BlkQueueState> for BlkWorker {
 
             match event {
                 Event::NewWork(Ok(work)) => {
-                    let disk = self.disk.clone();
+                    let disk = self.media.read().disk.clone();
                     let mem = state.memory.clone();
                     let read_only = self.read_only;
                     self.ios.push(Box::pin(async move {
-                        process_request(&disk, &mem, read_only, work).await
+                        process_request(disk.as_ref(), &mem, read_only, work).await
                     }));
                 }
                 Event::NewWork(Err(err)) => {
@@ -299,9 +318,13 @@ impl VirtioBlkDevice {
 
         let supports_discard = disk.unmap_behavior() != disk_backend::UnmapBehavior::Ignored;
 
+        let media = Arc::new(RwLock::new(MediaState {
+            disk: Some(disk),
+            identity: None,
+        }));
         Self {
             worker: TaskControl::new(BlkWorker {
-                disk,
+                media: media.clone(),
                 read_only,
                 stats: WorkerStats::default(),
                 ios: FuturesUnordered::new(),
@@ -310,7 +333,131 @@ impl VirtioBlkDevice {
             read_only,
             supports_discard,
             config,
+            media,
+            image_slot: None,
         }
+    }
+
+    /// Creates a fixed-geometry image slot with no media.
+    pub fn new_image_slot(
+        driver_source: &VmTaskDriverSource,
+        active: bool,
+        requests: mesh::Receiver<virtio_resources::blk::ImageSlotRequest>,
+    ) -> Self {
+        let media = Arc::new(RwLock::new(MediaState {
+            disk: None,
+            identity: None,
+        }));
+        let config = VirtioBlkConfig {
+            capacity: 0,
+            size_max: 0,
+            seg_max: DEFAULT_SEG_MAX,
+            geometry: VirtioBlkGeometry {
+                cylinders: 0,
+                heads: 0,
+                sectors: 0,
+            },
+            blk_size: 512,
+            topology: VirtioBlkTopology {
+                physical_block_exp: 3,
+                alignment_offset: 0,
+                min_io_size: 1,
+                opt_io_size: 0,
+            },
+            writeback: 1,
+            unused0: 0,
+            num_queues: 1,
+            max_discard_sectors: 0,
+            max_discard_seg: 0,
+            discard_sector_alignment: 0,
+            max_write_zeroes_sectors: 0,
+            max_write_zeroes_seg: 0,
+            write_zeroes_may_unmap: 0,
+            unused1: [0; 3],
+            _padding: [0; 4],
+        };
+        Self {
+            worker: TaskControl::new(BlkWorker {
+                media: media.clone(),
+                read_only: true,
+                stats: WorkerStats::default(),
+                ios: FuturesUnordered::new(),
+            }),
+            driver: driver_source.simple(),
+            read_only: true,
+            supports_discard: false,
+            config,
+            media,
+            image_slot: Some(ImageSlot { active, requests }),
+        }
+    }
+
+    fn image_slot_state(&self) -> virtio_resources::blk::ImageSlotState {
+        let media = self.media.read();
+        virtio_resources::blk::ImageSlotState {
+            identity: media.identity.clone(),
+            capacity_sectors: media.disk.as_ref().map_or(0, |disk| {
+                disk.sector_count() * (disk.sector_size() as u64 / 512)
+            }),
+        }
+    }
+
+    fn bind_image_slot(
+        &self,
+        request: virtio_resources::blk::BindImageSlotRequest,
+    ) -> Result<virtio_resources::blk::ImageSlotState, virtio_resources::blk::BindImageSlotError>
+    {
+        use virtio_resources::blk::BindImageSlotError;
+
+        if request.identity.is_empty() || request.identity.len() > 1024 {
+            return Err(BindImageSlotError::InvalidMedia(
+                "identity must contain 1 to 1024 bytes".to_owned(),
+            ));
+        }
+        if request.logical_block_size != 512 || request.physical_block_size != 4096 {
+            return Err(BindImageSlotError::GeometryMismatch);
+        }
+        let metadata = request
+            .media
+            .metadata()
+            .map_err(|error| BindImageSlotError::InvalidMedia(error.to_string()))?;
+        if !metadata.file_type().is_file()
+            || request.length == 0
+            || request.length % request.logical_block_size as u64 != 0
+            || metadata.len() != request.length
+        {
+            return Err(BindImageSlotError::InvalidMedia(
+                "media must be a nonempty aligned regular file".to_owned(),
+            ));
+        }
+
+        let mut media = self.media.write();
+        if let Some(identity) = &media.identity {
+            return if identity == &request.identity {
+                Ok(virtio_resources::blk::ImageSlotState {
+                    identity: Some(identity.clone()),
+                    capacity_sectors: media.disk.as_ref().map_or(0, Disk::sector_count),
+                })
+            } else {
+                Err(BindImageSlotError::AlreadyBound)
+            };
+        }
+        let disk = Disk::new(FileDisk::with_metadata(
+            request.media,
+            disk_file::Metadata {
+                disk_size: request.length,
+                sector_size: request.logical_block_size,
+                physical_sector_size: request.physical_block_size,
+                read_only: true,
+            },
+        ))
+        .map_err(|error| BindImageSlotError::InvalidMedia(error.to_string()))?;
+        media.disk = Some(disk);
+        media.identity = Some(request.identity);
+        Ok(virtio_resources::blk::ImageSlotState {
+            identity: media.identity.clone(),
+            capacity_sectors: request.length / 512,
+        })
     }
 }
 
@@ -332,7 +479,11 @@ impl VirtioDevice for VirtioBlkDevice {
         }
 
         DeviceTraits {
-            device_id: virtio::spec::VirtioDeviceType::BLK,
+            device_id: if self.image_slot.as_ref().is_some_and(|slot| !slot.active) {
+                virtio::spec::VirtioDeviceType(0)
+            } else {
+                virtio::spec::VirtioDeviceType::BLK
+            },
             device_features: VirtioDeviceFeatures::new()
                 .with_device_specific_low(features)
                 .with_ring_event_idx(true)
@@ -349,7 +500,11 @@ impl VirtioDevice for VirtioBlkDevice {
         // The transport reads the device config space as a sequence of u32s.
         // We serialize VirtioBlkConfig to bytes and return the requested
         // 4-byte window. Three cases:
-        let config_bytes = self.config.as_bytes();
+        let mut config = self.config.clone();
+        if self.image_slot.is_some() {
+            config.capacity = self.image_slot_state().capacity_sectors;
+        }
+        let config_bytes = config.as_bytes();
         let offset = offset as usize;
         if offset + 4 <= config_bytes.len() {
             // Normal case: full u32 within bounds.
@@ -426,6 +581,28 @@ impl VirtioDevice for VirtioBlkDevice {
     fn supports_save_restore(&self) -> bool {
         true
     }
+
+    fn poll_config_change(&mut self, cx: &mut Context<'_>) -> Poll<anyhow::Result<bool>> {
+        let Some(slot) = &mut self.image_slot else {
+            return Poll::Pending;
+        };
+        let request = match slot.requests.poll_next_unpin(cx) {
+            Poll::Ready(Some(request)) => request,
+            Poll::Ready(None) | Poll::Pending => return Poll::Pending,
+        };
+        match request {
+            virtio_resources::blk::ImageSlotRequest::Bind(rpc) => {
+                let was_empty = self.image_slot_state().identity.is_none();
+                rpc.handle_sync(|request| self.bind_image_slot(request));
+                let changed = was_empty && self.image_slot_state().identity.is_some();
+                Poll::Ready(Ok(changed))
+            }
+            virtio_resources::blk::ImageSlotRequest::Query(rpc) => {
+                rpc.handle_sync(|()| self.image_slot_state());
+                Poll::Ready(Ok(false))
+            }
+        }
+    }
 }
 
 /// Process a single virtio-blk request.
@@ -434,11 +611,25 @@ impl VirtioDevice for VirtioBlkDevice {
 /// write the used ring entry. This keeps completion in the main loop,
 /// which simplifies future queue API changes.
 async fn process_request(
-    disk: &Disk,
+    disk: Option<&Disk>,
     mem: &GuestMemory,
     read_only: bool,
     work: VirtioQueueCallbackWork,
 ) -> IoCompletion {
+    let Some(disk) = disk else {
+        if let Err(err) = write_status_byte(mem, &work, VIRTIO_BLK_S_IOERR) {
+            tracelimit::error_ratelimited!(
+                error = &err as &dyn std::error::Error,
+                "failed to write error status byte"
+            );
+        }
+        return IoCompletion {
+            work,
+            bytes_written: 1,
+            stat: IoStat::Error,
+            bounced: false,
+        };
+    };
     match process_request_inner(disk, mem, read_only, &work).await {
         Ok((bytes_written, stat, bounced)) => {
             if let Err(err) = write_status_byte(mem, &work, VIRTIO_BLK_S_OK) {
@@ -748,6 +939,11 @@ fn write_status_byte(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mesh::rpc::RpcSend;
+    use std::task::Context;
+    use std::task::Waker;
+    use test_with_tracing::test;
+    use vmcore::vm_task::SingleDriverBackend;
 
     // ---- copy_regions tests ----
 
@@ -800,5 +996,83 @@ mod tests {
         let mut buf = [0u8; 548];
         guest.read_at(0x9000, &mut buf).unwrap();
         assert!(buf.iter().all(|&b| b == 0x33));
+    }
+
+    fn image_slot(active: bool) -> VirtioBlkDevice {
+        let driver = pal_async::DefaultPool::new().driver();
+        let source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+        let (_requests, receiver) = mesh::channel();
+        VirtioBlkDevice::new_image_slot(&source, active, receiver)
+    }
+
+    fn bind_request(
+        identity: &str,
+        length: u64,
+        logical_block_size: u32,
+    ) -> virtio_resources::blk::BindImageSlotRequest {
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(length).unwrap();
+        virtio_resources::blk::BindImageSlotRequest {
+            media: file,
+            identity: identity.to_owned(),
+            length,
+            logical_block_size,
+            physical_block_size: 4096,
+        }
+    }
+
+    #[test]
+    fn inactive_image_slot_is_a_placeholder() {
+        let device = image_slot(false);
+        assert_eq!(device.traits().device_id.0, 0);
+        assert_eq!(device.image_slot_state().capacity_sectors, 0);
+    }
+
+    #[test]
+    fn image_slot_bind_once_is_idempotent_by_identity() {
+        let device = image_slot(true);
+        let state = device
+            .bind_image_slot(bind_request("image-a", 4096, 512))
+            .unwrap();
+        assert_eq!(state.capacity_sectors, 8);
+        assert_eq!(state.identity.as_deref(), Some("image-a"));
+
+        let state = device
+            .bind_image_slot(bind_request("image-a", 4096, 512))
+            .unwrap();
+        assert_eq!(state.capacity_sectors, 8);
+        assert!(matches!(
+            device.bind_image_slot(bind_request("image-b", 4096, 512)),
+            Err(virtio_resources::blk::BindImageSlotError::AlreadyBound)
+        ));
+    }
+
+    #[test]
+    fn image_slot_rejects_geometry_mismatch() {
+        let device = image_slot(true);
+        assert!(matches!(
+            device.bind_image_slot(bind_request("image-a", 4096, 4096)),
+            Err(virtio_resources::blk::BindImageSlotError::GeometryMismatch)
+        ));
+    }
+
+    #[test]
+    fn image_slot_bind_reports_configuration_change() {
+        let driver = pal_async::DefaultPool::new().driver();
+        let source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+        let (requests, receiver) = mesh::channel();
+        let mut device = VirtioBlkDevice::new_image_slot(&source, true, receiver);
+        let response = requests.call(
+            virtio_resources::blk::ImageSlotRequest::Bind,
+            bind_request("image-a", 4096, 512),
+        );
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            device.poll_config_change(&mut context),
+            Poll::Ready(Ok(true))
+        ));
+        let state = futures::executor::block_on(response).unwrap().unwrap();
+        assert_eq!(state.capacity_sectors, 8);
+        assert_eq!(futures::executor::block_on(device.read_registers_u32(0)), 8);
     }
 }

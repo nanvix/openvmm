@@ -17,6 +17,8 @@ use saved_state::DeviceStateValidator;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
 use vmcore::save_restore::RestoreError;
 use vmcore::save_restore::SaveError;
 use vmcore::save_restore::SavedStateBlob;
@@ -156,6 +158,12 @@ pub trait VirtioDevice: InspectMut + Send {
     fn device_state_validator(&self) -> DeviceStateValidator {
         saved_state::default_device_state_validator(self.supports_save_restore())
     }
+
+    /// Polls host-only device control and reports whether guest-visible
+    /// configuration changed.
+    fn poll_config_change(&mut self, _cx: &mut Context<'_>) -> Poll<anyhow::Result<bool>> {
+        Poll::Pending
+    }
 }
 
 /// Object-safe wrapper for [`VirtioDevice`].
@@ -226,6 +234,8 @@ pub trait DynVirtioDevice: InspectMut + Send {
 
     /// Return immutable validation for device-private saved state.
     fn device_state_validator(&self) -> DeviceStateValidator;
+
+    fn poll_config_change(&mut self, cx: &mut Context<'_>) -> Poll<anyhow::Result<bool>>;
 }
 
 impl<T: VirtioDevice> DynVirtioDevice for T {
@@ -312,5 +322,9 @@ impl<T: VirtioDevice> DynVirtioDevice for T {
 
     fn device_state_validator(&self) -> DeviceStateValidator {
         VirtioDevice::device_state_validator(self)
+    }
+
+    fn poll_config_change(&mut self, cx: &mut Context<'_>) -> Poll<anyhow::Result<bool>> {
+        VirtioDevice::poll_config_change(self, cx)
     }
 }
