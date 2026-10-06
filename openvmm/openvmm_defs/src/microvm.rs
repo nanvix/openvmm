@@ -1253,6 +1253,73 @@ fn validate_machine_load_mode(
     }
 }
 
+struct MicrovmVirtioInventory {
+    has_network: bool,
+    has_filesystem: bool,
+    has_console: bool,
+    has_control_console: bool,
+    block_count: usize,
+}
+
+/// Classifies the virtio-mmio inventory. The eight fixed transports and, when
+/// declared, the four image-slot transports are the only permitted devices.
+fn microvm_virtio_inventory<'a>(
+    devices: impl ExactSizeIterator<Item = (VirtioBus, &'a str)>,
+    image_slots_declared: bool,
+) -> anyhow::Result<MicrovmVirtioInventory> {
+    let image_slot_capacity = if image_slots_declared {
+        usize::from(MICROVM_IMAGE_SLOT_CAPACITY)
+    } else {
+        0
+    };
+    anyhow::ensure!(
+        devices.len() <= 8 + image_slot_capacity,
+        "microVM has too many virtio devices"
+    );
+    let mut inventory = MicrovmVirtioInventory {
+        has_network: false,
+        has_filesystem: false,
+        has_console: false,
+        has_control_console: false,
+        block_count: 0,
+    };
+    let mut image_slot_count = 0;
+    for (bus, id) in devices {
+        anyhow::ensure!(
+            bus == VirtioBus::Mmio,
+            "microVM permits only virtio-mmio devices"
+        );
+        match id {
+            "virtio-net" => anyhow::ensure!(
+                !std::mem::replace(&mut inventory.has_network, true),
+                "microVM permits only one virtio-net device"
+            ),
+            "virtiofs" => anyhow::ensure!(
+                !std::mem::replace(&mut inventory.has_filesystem, true),
+                "microVM permits only one virtio-fs device"
+            ),
+            "virtio-console" => anyhow::ensure!(
+                !std::mem::replace(&mut inventory.has_console, true),
+                "microVM permits only one virtio-console device"
+            ),
+            MICROVM_VIRTIO_CONTROL_CONSOLE_ID => {
+                anyhow::ensure!(
+                    !std::mem::replace(&mut inventory.has_control_console, true),
+                    "microVM permits only one control console"
+                );
+            }
+            "virtio-blk" => inventory.block_count += 1,
+            "virtio-blk-image-slot" if image_slots_declared => image_slot_count += 1,
+            id => anyhow::bail!("microVM does not permit virtio device '{id}'"),
+        }
+    }
+    anyhow::ensure!(
+        image_slot_count == image_slot_capacity,
+        "microVM requires exactly {image_slot_capacity} image-slot transports"
+    );
+    Ok(inventory)
+}
+
 /// Validates the microVM machine contract. Standard-machine configurations are unchanged.
 pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> anyhow::Result<()> {
     let MachineProfile::Microvm = config.machine_profile else {
@@ -1268,6 +1335,10 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
         anyhow::ensure!(
             config.microvm.sandbox_blocks.is_empty(),
             "microVM sandbox block roles require the microVM profile"
+        );
+        anyhow::ensure!(
+            config.microvm.image_slots.is_none(),
+            "microVM image slots require the microVM profile"
         );
         anyhow::ensure!(
             config.microvm.memory_capacity.is_none()
@@ -1411,43 +1482,19 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
         "microVM does not support kernel NIC or VPCI resources"
     );
 
-    anyhow::ensure!(
-        config.virtio_devices.len() <= 8,
-        "microVM has too many virtio devices"
-    );
-    let mut has_network = false;
-    let mut has_filesystem = false;
-    let mut has_console = false;
-    let mut has_control_console = false;
-    let mut block_count = 0;
-    for (bus, device) in &config.virtio_devices {
-        anyhow::ensure!(
-            *bus == VirtioBus::Mmio,
-            "microVM permits only virtio-mmio devices"
-        );
-        match device.id() {
-            "virtio-net" => anyhow::ensure!(
-                !std::mem::replace(&mut has_network, true),
-                "microVM permits only one virtio-net device"
-            ),
-            "virtiofs" => anyhow::ensure!(
-                !std::mem::replace(&mut has_filesystem, true),
-                "microVM permits only one virtio-fs device"
-            ),
-            "virtio-console" => anyhow::ensure!(
-                !std::mem::replace(&mut has_console, true),
-                "microVM permits only one virtio-console device"
-            ),
-            MICROVM_VIRTIO_CONTROL_CONSOLE_ID => {
-                anyhow::ensure!(
-                    !std::mem::replace(&mut has_control_console, true),
-                    "microVM permits only one control console"
-                );
-            }
-            "virtio-blk" => block_count += 1,
-            id => anyhow::bail!("microVM does not permit virtio device '{id}'"),
-        }
-    }
+    let MicrovmVirtioInventory {
+        has_network,
+        has_filesystem,
+        has_console,
+        has_control_console,
+        block_count,
+    } = microvm_virtio_inventory(
+        config
+            .virtio_devices
+            .iter()
+            .map(|(bus, device)| (*bus, device.id())),
+        config.microvm.image_slots.is_some(),
+    )?;
     anyhow::ensure!(
         !has_control_console || has_console,
         "microVM control console requires the boot console"
@@ -1827,6 +1874,43 @@ mod tests {
                 },
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn microvm_virtio_inventory_admits_declared_image_slots() {
+        const FIXED: [&str; 8] = [
+            "virtio-net",
+            "virtiofs",
+            "virtio-console",
+            MICROVM_VIRTIO_CONTROL_CONSOLE_ID,
+            "virtio-blk",
+            "virtio-blk",
+            "virtio-blk",
+            "virtio-blk",
+        ];
+        const SLOT: &str = "virtio-blk-image-slot";
+        let inventory = |ids: &[&'static str], declared: bool| {
+            microvm_virtio_inventory(ids.iter().map(|id| (VirtioBus::Mmio, *id)), declared)
+        };
+
+        let full = [&FIXED[..], &[SLOT; 4]].concat();
+        let classified = inventory(&full, true).unwrap();
+        assert!(classified.has_network && classified.has_filesystem);
+        assert!(classified.has_console && classified.has_control_console);
+        assert_eq!(classified.block_count, 4);
+        assert!(inventory(&["virtio-console", SLOT, SLOT, SLOT, SLOT], true).is_ok());
+        assert!(inventory(&FIXED, false).is_ok());
+
+        assert!(inventory(&["virtio-console", SLOT, SLOT, SLOT, SLOT], false).is_err());
+        assert!(inventory(&["virtio-console", SLOT, SLOT, SLOT], true).is_err());
+        assert!(inventory(&["virtio-console"], true).is_err());
+        assert!(inventory(&[&FIXED[..], &[SLOT; 5]].concat(), true).is_err());
+        assert!(inventory(&[&FIXED[..], &["virtio-blk"]].concat(), false).is_err());
+        assert!(inventory(&["virtio-console", "virtio-rng"], false).is_err());
+        assert!(
+            microvm_virtio_inventory([(VirtioBus::Pci, "virtio-console")].into_iter(), false)
+                .is_err()
         );
     }
 }
