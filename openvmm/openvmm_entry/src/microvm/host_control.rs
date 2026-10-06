@@ -152,21 +152,25 @@ impl MicrovmHostControlServer {
         );
 
         loop {
-            let request = self.read_request().await?;
+            let Some(request) = self.read_request().await? else {
+                return Ok(());
+            };
             let response = self.handle_request(request).await;
             self.write_response(&response).await?;
         }
     }
 
-    async fn read_request(&mut self) -> anyhow::Result<Request> {
-        let mut length = [0; 4];
-        CancelContext::new()
+    async fn read_request(&mut self) -> anyhow::Result<Option<Request>> {
+        let Some(length) = CancelContext::new()
             .with_timeout(IDLE_TIMEOUT)
-            .until_cancelled(self.io.read_exact(&mut length))
+            .until_cancelled(read_frame_length(&mut self.io))
             .await
             .context("host-control connection was idle")?
-            .context("failed to read host-control frame length")?;
-        let length = u32::from_le_bytes(length) as usize;
+            .context("failed to read host-control frame length")?
+        else {
+            return Ok(None);
+        };
+        let length = length as usize;
         anyhow::ensure!(
             (1..=MAX_FRAME_SIZE).contains(&length),
             "host-control frame length is invalid"
@@ -176,7 +180,9 @@ impl MicrovmHostControlServer {
             .read_exact(&mut payload)
             .await
             .context("failed to read host-control frame")?;
-        serde_json::from_slice(&payload).context("host-control request is invalid JSON")
+        serde_json::from_slice(&payload)
+            .map(Some)
+            .context("host-control request is invalid JSON")
     }
 
     async fn write_response(&mut self, response: &Response) -> anyhow::Result<()> {
@@ -343,6 +349,31 @@ fn capability_matches(left: &[u8; 32], right: &[u8; 32]) -> bool {
         == 0
 }
 
+/// Reads a little-endian frame length. Returns `None` when the peer closed the connection
+/// at a frame boundary, which is how a client ends a session.
+async fn read_frame_length(
+    io: &mut (impl futures::AsyncRead + Unpin),
+) -> std::io::Result<Option<u32>> {
+    let mut length = [0; 4];
+    let mut filled = 0;
+    while filled < length.len() {
+        let count = match io.read(&mut length[filled..]).await {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if count == 0 {
+            return if filled == 0 {
+                Ok(None)
+            } else {
+                Err(std::io::ErrorKind::UnexpectedEof.into())
+            };
+        }
+        filled += count;
+    }
+    Ok(Some(u32::from_le_bytes(length)))
+}
+
 fn open_read_only_media(path: &Path) -> anyhow::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -377,4 +408,33 @@ fn open_read_only_media(path: &Path) -> anyhow::Result<std::fs::File> {
         "image media length must be nonzero and 512-byte aligned"
     );
     Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_frame_length;
+    use futures::executor::block_on;
+    use futures::io::Cursor;
+
+    #[test]
+    fn close_at_frame_boundary_ends_the_session() {
+        let mut io = Cursor::new(Vec::new());
+        assert_eq!(block_on(read_frame_length(&mut io)).unwrap(), None);
+    }
+
+    #[test]
+    fn frame_length_is_little_endian() {
+        let mut io = Cursor::new(vec![0x34, 0x12, 0, 0, 0xff]);
+        assert_eq!(block_on(read_frame_length(&mut io)).unwrap(), Some(0x1234));
+        assert_eq!(io.position(), 4);
+    }
+
+    #[test]
+    fn close_inside_frame_length_is_an_error() {
+        let mut io = Cursor::new(vec![1, 0]);
+        assert_eq!(
+            block_on(read_frame_length(&mut io)).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
 }
