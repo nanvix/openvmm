@@ -36,6 +36,15 @@ pub(crate) struct MicrovmSandboxBlockSource {
     pub(crate) file: std::fs::File,
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn supports_raw_block_device(
+    role: MicrovmSandboxBlockRole,
+    read_only: bool,
+    create_with_len: Option<u64>,
+) -> bool {
+    role == MicrovmSandboxBlockRole::Distro && read_only && create_with_len.is_none()
+}
+
 pub(crate) fn capture_snapshot_block_contract(
     sources: &[MicrovmSandboxBlockSource],
     scratch_policy: chipset_resources::microvm::MicrovmSnapshotScratchPolicy,
@@ -240,11 +249,27 @@ impl StorageBuilder {
         let metadata = file
             .metadata()
             .with_context(|| format!("failed to inspect sandbox block {}", path.display()))?;
+        #[cfg(target_os = "linux")]
+        let raw_distro = {
+            use std::os::unix::fs::FileTypeExt;
+            metadata.file_type().is_block_device()
+                && supports_raw_block_device(role, read_only, *create_with_len)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let raw_distro = false;
         anyhow::ensure!(
-            metadata.file_type().is_file(),
-            "microVM sandbox block is not a regular file: {}",
+            metadata.file_type().is_file() || raw_distro,
+            "microVM sandbox block must be a regular file or a read-only distro block device: {}",
             path.display()
         );
+        #[cfg(target_os = "linux")]
+        let length = if raw_distro {
+            disk_blockdevice::query_block_device_size_in_bytes(&file)
+                .context("failed to query read-only microVM distro block length")?
+        } else {
+            metadata.len()
+        };
+        #[cfg(not(target_os = "linux"))]
         let length = metadata.len();
         anyhow::ensure!(
             length != 0 && length % 512 == 0,
@@ -329,6 +354,7 @@ impl StorageBuilder {
                     resources.microvm.sandbox_block_sources.push(source);
                 }
             }
+
             config.virtio_devices.push((
                 VirtioBus::Mmio,
                 VirtioBlkHandle {
@@ -339,5 +365,37 @@ impl StorageBuilder {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn block_devices_are_only_valid_as_existing_read_only_distro_sources() {
+        assert!(supports_raw_block_device(
+            MicrovmSandboxBlockRole::Distro,
+            true,
+            None
+        ));
+        assert!(!supports_raw_block_device(
+            MicrovmSandboxBlockRole::Distro,
+            false,
+            None
+        ));
+        assert!(!supports_raw_block_device(
+            MicrovmSandboxBlockRole::Distro,
+            true,
+            Some(512)
+        ));
+        for role in [
+            MicrovmSandboxBlockRole::Runtime,
+            MicrovmSandboxBlockRole::Custom,
+            MicrovmSandboxBlockRole::Scratch,
+        ] {
+            assert!(!supports_raw_block_device(role, true, None));
+        }
     }
 }

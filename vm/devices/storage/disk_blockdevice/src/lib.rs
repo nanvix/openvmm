@@ -11,6 +11,7 @@
 #![expect(unsafe_code)]
 
 mod ioctl;
+pub use ioctl::query_block_device_size_in_bytes;
 mod nvme;
 pub mod resolver;
 
