@@ -195,6 +195,7 @@ impl VmController {
             VncWorker(WorkerEvent),
             Halt(HaltReason),
             SnapshotRequest(chipset_resources::microvm::MicrovmSnapshotScratchPolicy),
+            HostControl(anyhow::Result<()>),
         }
 
         let mut quit = false;
@@ -220,8 +221,19 @@ impl VmController {
                     futures::stream::iter(self.microvm.snapshot_requests.as_mut())
                         .flatten()
                         .map(Event::SnapshotRequest);
+                let host_control =
+                    futures::stream::iter(self.microvm.resources.host_control.iter().cloned())
+                        .then(|server| Box::pin(async move { server.lock().await.run().await }))
+                        .map(Event::HostControl);
 
-                (rpc.into_stream(), vm, vnc, halt, snapshot_request)
+                (
+                    rpc.into_stream(),
+                    vm,
+                    vnc,
+                    halt,
+                    snapshot_request,
+                    host_control,
+                )
                     .merge()
                     .next()
                     .await
@@ -357,6 +369,20 @@ impl VmController {
                         event_send.send(VmControllerEvent::ExitRequested { code: exit_code });
                         break;
                     }
+                }
+                Event::HostControl(result) => {
+                    let error = result
+                        .err()
+                        .unwrap_or_else(|| anyhow::anyhow!("host-control service stopped"));
+                    tracing::error!(
+                        error = error.as_ref() as &dyn std::error::Error,
+                        "microVM host-control service failed"
+                    );
+                    self.vm_worker.stop();
+                    quit = true;
+                    event_send.send(VmControllerEvent::ExitFailed {
+                        error: format!("microVM host-control service failed: {error:#}"),
+                    });
                 }
             }
         }

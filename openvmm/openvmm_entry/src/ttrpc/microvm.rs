@@ -77,6 +77,10 @@ pub(super) struct CreateVm {
     snapshot_destination: Option<PathBuf>,
     restore_entropy: bool,
     restore_online_vp_count: Option<u32>,
+    image_slots: Option<openvmm_defs::microvm::MicrovmImageSlotsConfig>,
+    restore_active_image_slot_count: Option<u8>,
+    host_control_path: Option<PathBuf>,
+    host_control_capability: Option<[u8; 32]>,
     restore_gate_timeout: Duration,
     snapshot_quiesce_timeout: Duration,
     memory_capacity_bytes: u64,
@@ -122,9 +126,46 @@ impl CreateVm {
             restore_gate_timeout_ms,
             memory_capacity_bytes,
             restore_memory_bytes,
+            image_slots,
+            image_slot_boot_count,
+            restore_image_slot_count,
+            host_control_path,
+            host_control_capability,
         } = microvm_snapshot.unwrap_or_default();
         let restore_online_vp_count =
             (restore_processor_count != 0).then_some(restore_processor_count);
+        let image_slot_boot_count = u8::try_from(image_slot_boot_count)
+            .context("image_slot_boot_count does not fit in u8")?;
+        let restore_active_image_slot_count = (restore_image_slot_count != 0)
+            .then(|| u8::try_from(restore_image_slot_count))
+            .transpose()
+            .context("restore_image_slot_count does not fit in u8")?;
+        let mut image_slots =
+            image_slots.then_some(openvmm_defs::microvm::MicrovmImageSlotsConfig {
+                boot_count: if image_slot_boot_count == 0 {
+                    1
+                } else {
+                    image_slot_boot_count
+                },
+                active_count: if image_slot_boot_count == 0 {
+                    1
+                } else {
+                    image_slot_boot_count
+                },
+            });
+        if let Some(image_slots) = image_slots {
+            image_slots.validate()?;
+        }
+        let host_control_path =
+            (!host_control_path.is_empty()).then(|| PathBuf::from(host_control_path));
+        let host_control_capability =
+            if host_control_capability.is_empty() {
+                None
+            } else {
+                Some(host_control_capability.try_into().map_err(|_| {
+                    anyhow::anyhow!("host_control_capability must be exactly 32 bytes")
+                })?)
+            };
         let restore_gate_timeout = Duration::from_millis(if restore_gate_timeout_ms == 0 {
             60_000
         } else {
@@ -158,6 +199,22 @@ impl CreateVm {
         anyhow::ensure!(
             restore_online_vp_count.is_none() || restore_path.is_some(),
             "restore_processor_count requires restore_path"
+        );
+        anyhow::ensure!(
+            restore_active_image_slot_count.is_none() || restore_path.is_some(),
+            "restore_image_slot_count requires restore_path"
+        );
+        anyhow::ensure!(
+            image_slots.is_none() || restore_path.is_none(),
+            "image_slots configures cold boot and cannot be combined with restore_path"
+        );
+        anyhow::ensure!(
+            host_control_path.is_some() == host_control_capability.is_some(),
+            "host_control_path and host_control_capability must be supplied together"
+        );
+        anyhow::ensure!(
+            image_slots.is_none() || host_control_path.is_some(),
+            "image slots require host control"
         );
         anyhow::ensure!(
             restore_gate_timeout_ms == 0 || restore_path.is_some(),
@@ -232,6 +289,27 @@ impl CreateVm {
                     manifest,
                     restore_online_vp_count,
                 )?;
+            }
+            if machine_contract.microvm_image_slot_capacity != 0 {
+                let active_count = restore_active_image_slot_count
+                    .unwrap_or(machine_contract.boot_active_image_slot_count);
+                openvmm_helpers::snapshot::microvm::validate_restore_active_image_slot_count(
+                    manifest,
+                    active_count,
+                )?;
+                anyhow::ensure!(
+                    host_control_path.is_some(),
+                    "restoring image slots requires host control"
+                );
+                image_slots = Some(openvmm_defs::microvm::MicrovmImageSlotsConfig {
+                    boot_count: machine_contract.boot_active_image_slot_count,
+                    active_count,
+                });
+            } else {
+                anyhow::ensure!(
+                    restore_active_image_slot_count.is_none(),
+                    "snapshot does not declare image slots"
+                );
             }
             let machine_contract = machine_contract.clone();
             Some(AuthoritativeRestore {
@@ -337,6 +415,10 @@ impl CreateVm {
                 snapshot_destination,
                 restore_entropy,
                 restore_online_vp_count,
+                image_slots,
+                restore_active_image_slot_count,
+                host_control_path,
+                host_control_capability,
                 restore_gate_timeout,
                 snapshot_quiesce_timeout,
                 memory_capacity_bytes,
@@ -737,6 +819,7 @@ impl CreateVm {
         {
             crate::microvm::fresh_microvm_restore_packet(
                 self.restore_online_vp_count,
+                self.restore_active_image_slot_count,
                 restore_memory_target_requested,
                 restore_memory_ranges,
             )?
@@ -1098,7 +1181,11 @@ impl CreateVm {
 
     /// Finalizes the fixed virtio-mmio device inventory and discovery command
     /// line.
-    pub(super) fn finish_devices(&self, config: &mut Config) -> anyhow::Result<()> {
+    pub(super) fn finish_devices(
+        &mut self,
+        config: &mut Config,
+        driver: &pal_async::DefaultDriver,
+    ) -> anyhow::Result<()> {
         if self.filesystem_slot
             && !config
                 .virtio_devices
@@ -1116,6 +1203,42 @@ impl CreateVm {
                 }
                 .into_resource(),
             ));
+        }
+        config.microvm.image_slots = self.image_slots;
+        if let Some(image_slots) = self.image_slots {
+            self.resources.image_slot_requests.clear();
+            for index in 0..openvmm_defs::microvm::MICROVM_IMAGE_SLOT_CAPACITY {
+                let (requests, receiver) = mesh::channel();
+                let active = index < image_slots.active_count;
+                config.virtio_devices.push((
+                    openvmm_defs::config::VirtioBus::Mmio,
+                    virtio_resources::blk::VirtioBlkImageSlotHandle {
+                        active,
+                        requests: receiver,
+                    }
+                    .into_resource(),
+                ));
+                self.resources
+                    .image_slot_requests
+                    .push(active.then_some(requests));
+            }
+        }
+        if let (Some(path), Some(capability)) = (
+            self.host_control_path.as_deref(),
+            self.host_control_capability,
+        ) {
+            let authentication =
+                crate::microvm::microvm_control_authentication_from_capability(capability, 5000)?;
+            let mut server =
+                crate::microvm::MicrovmHostControlServer::bind(path, driver, authentication)?;
+            server.set_image_slots(
+                self.resources.image_slot_requests.clone(),
+                self.resources.image_slot_transition.clone(),
+            );
+            self.resources.host_control =
+                Some(std::sync::Arc::new(futures::lock::Mutex::new(server)));
+            self.resources.host_control_socket_cleanup =
+                crate::microvm::microvm_console_socket_cleanup(path.to_owned())?;
         }
 
         if self.active && self.authoritative_restore.is_none() {
@@ -1141,6 +1264,7 @@ impl CreateVm {
                     device.id() == openvmm_defs::microvm::MICROVM_VIRTIO_CONTROL_CONSOLE_ID
                 }),
                 &config.microvm.sandbox_blocks,
+                config.microvm.image_slots,
             )?;
         }
         Ok(())
@@ -1270,6 +1394,7 @@ impl CreateVm {
                 network: None,
                 filesystem_slot: self.filesystem_slot,
                 filesystem: self.filesystem,
+                image_slots: self.image_slots,
                 snapshot_memory_file: self.snapshot_memory_file,
                 _private_scratch_dir: None,
             },

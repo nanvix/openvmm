@@ -786,6 +786,16 @@ message MicrovmSnapshotConfig {
     uint64 memory_capacity_bytes = 8;
     // Per-launch total RAM target for restore. Zero selects the snapshot base.
     uint64 restore_memory_bytes = 9;
+    // Declare the fixed four-slot ABI 3 topology on a cold boot.
+    bool image_slots = 10;
+    // Cold-boot active image-slot count. Zero selects one when image_slots is true.
+    uint32 image_slot_boot_count = 11;
+    // Restore active image-slot count. Zero preserves the captured boot count.
+    uint32 restore_image_slot_count = 12;
+    // Host-only control endpoint path.
+    string host_control_path = 13;
+    // Exact 32-byte host-control capability carried by the authenticated management RPC.
+    bytes host_control_capability = 14;
 }
 
 message CreateVMRequest {

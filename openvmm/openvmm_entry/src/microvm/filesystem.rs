@@ -461,6 +461,7 @@ mod tests {
             false,
             false,
             &[],
+            None,
         )
         .unwrap();
         openvmm_helpers::snapshot::microvm::microvm_machine_contract(
@@ -509,6 +510,7 @@ mod tests {
             false,
             false,
             &[],
+            None,
         )
         .unwrap();
         openvmm_helpers::snapshot::microvm::microvm_machine_contract(

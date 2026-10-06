@@ -34,6 +34,7 @@ pub(crate) struct MicrovmLaunch {
     network: Option<MicrovmNetworkConfig>,
     filesystem_slot: bool,
     filesystem: Option<MicrovmFilesystemConfig>,
+    image_slots: Option<openvmm_defs::microvm::MicrovmImageSlotsConfig>,
     snapshot_destination: Option<PathBuf>,
     snapshot_memory_file: Option<tempfile::NamedTempFile>,
     snapshot_memory_handle: Option<std::fs::File>,
@@ -138,6 +139,7 @@ impl MicrovmLaunch {
             network: vm_config.microvm.network.clone(),
             filesystem_slot,
             filesystem: vm_config.microvm.filesystem.clone(),
+            image_slots: vm_config.microvm.image_slots,
             snapshot_destination,
             snapshot_memory_file,
             snapshot_memory_handle,
@@ -274,6 +276,7 @@ impl MicrovmLaunch {
             network: self.network,
             filesystem_slot: self.filesystem_slot,
             filesystem: self.filesystem,
+            image_slots: self.image_slots,
             snapshot_memory_file: self.snapshot_memory_file,
             _private_scratch_dir: self.restore.private_scratch_dir,
         }

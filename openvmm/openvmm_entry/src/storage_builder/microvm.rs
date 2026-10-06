@@ -17,6 +17,7 @@ use openvmm_defs::microvm::MicrovmSandboxBlockConfig;
 use openvmm_defs::microvm::MicrovmSandboxBlockRole;
 use std::time::Duration;
 use virtio_resources::blk::VirtioBlkHandle;
+use virtio_resources::blk::VirtioBlkImageSlotHandle;
 use vm_resource::IntoResource;
 use vm_resource::Resource;
 
@@ -87,6 +88,22 @@ pub(crate) fn snapshot_block_contract(
 }
 
 impl StorageBuilder {
+    /// Declares the fixed image-slot capacity for the microVM profile.
+    pub fn add_microvm_image_slots(
+        &mut self,
+        image_slots: Option<openvmm_defs::microvm::MicrovmImageSlotsConfig>,
+    ) -> anyhow::Result<()> {
+        if let Some(image_slots) = image_slots {
+            image_slots.validate()?;
+        }
+        anyhow::ensure!(
+            self.microvm_image_slots.is_none(),
+            "microVM image slots were configured more than once"
+        );
+        self.microvm_image_slots = image_slots;
+        Ok(())
+    }
+
     /// Adds a fixed-role microVM sandbox block device.
     pub async fn add_microvm_sandbox_block(
         &mut self,
@@ -259,6 +276,26 @@ impl StorageBuilder {
                 }
                 .into_resource(),
             ));
+        }
+        config.microvm.image_slots = self.microvm_image_slots;
+        resources.microvm.image_slot_requests.clear();
+        if let Some(image_slots) = self.microvm_image_slots {
+            for index in 0..openvmm_defs::microvm::MICROVM_IMAGE_SLOT_CAPACITY {
+                let (requests, receiver) = mesh::channel();
+                let active = index < image_slots.active_count;
+                config.virtio_devices.push((
+                    VirtioBus::Mmio,
+                    VirtioBlkImageSlotHandle {
+                        active,
+                        requests: receiver,
+                    }
+                    .into_resource(),
+                ));
+                resources
+                    .microvm
+                    .image_slot_requests
+                    .push(active.then_some(requests));
+            }
         }
         Ok(())
     }

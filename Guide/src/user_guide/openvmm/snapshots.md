@@ -211,6 +211,16 @@ Snapshots without the explicit capture-time `maxcpus` opt-in, including legacy
 snapshots, reject a restore target. This is not a post-readiness hotplug API and
 cannot add VPs absent from the saved topology.
 
+MicroVM ABI 3 snapshots record a fixed capacity of four image slots and the
+active cold-boot prefix. Capture is accepted only while every active slot is
+empty; a bound slot rejects capture before guest execution is quiesced.
+`--restore-image-slots <COUNT>` may activate a larger contiguous prefix before
+restore readiness and must satisfy
+`boot-active <= COUNT <= 4`. The target is carried in
+`OPENVMM_ENTROPY_V4` beside the online-VP target. Restored slots always begin
+empty, and no slot can be activated after readiness. ABI 2 snapshots have no
+image-slot fields and keep their existing topology and entropy packet.
+
 ```admonish warning
 Versions 3 through 5 do not contain or validate embedded checksums for
 `state.bin` or `memory.bin`. Restore still requires regular files, bounded

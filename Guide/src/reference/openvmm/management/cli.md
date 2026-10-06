@@ -70,6 +70,23 @@ describes the source definitions.
   boot-before-control discovery order and rejects user overrides that could
   change it.
 
+  `--microvm-image-slots` selects microVM ABI 3 and declares four permanent
+  read-only image-slot transports named `image0` through `image3`. Their MMIO
+  windows are `0xd0008000` through `0xd000b000`, their edge-triggered IRQs are
+  1, 13, 14, and 15, and their shared interrupt-status words are at offsets
+  `0x20` through `0x2c` in the existing shared-status page. The
+  `microvm_image_slots=4` discovery token records the fixed capacity.
+  `--microvm-image-slot-boot-count <COUNT>` selects the active prefix and
+  defaults to one. Active slots are empty virtio-blk devices with 512-byte
+  logical blocks; inactive slots report virtio device ID 0. A machine that
+  omits `--microvm-image-slots` remains ABI 2 with the original device
+  topology.
+
+  Image slots require `--microvm-host-control listen=<PATH>` and
+  `--microvm-control-auth-stdin`. The host-control service uses the same
+  capability and local peer identity as the control console. See
+  [Host-control Protocol](./host_control_protocol.md).
+
   `microvm` uses one socket and one die,
   with one core per vCPU, no SMT, xAPIC mode, and contiguous APIC IDs from 0.
   Guest-requested snapshot capture and new-process restore are available for
@@ -78,7 +95,8 @@ describes the source definitions.
   ```admonish warning title="microVM migration"
   The canonical `microvm` spelling now selects the contract formerly exposed
   as `microvm-v2`; the `microvm-v2` selector and the former ABI-v1 behavior are
-  removed. Snapshot ABI and boot layout remain numeric value 2.
+  removed. Machines without image slots retain snapshot ABI 2. Declaring
+  image slots selects snapshot ABI 3; the boot-layout version is unchanged.
   ```
 * `--net <IPv4/PREFIX>`: With `--machine microvm`, attach one virtio-net NIC
   at MMIO `0xd0000000`. KVM and MSHV use IRQ 10; WHP uses IRQ 5. Prefixes
