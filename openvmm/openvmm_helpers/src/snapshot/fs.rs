@@ -397,6 +397,51 @@ pub(super) fn copy_exact(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn reflink_exact(
+    source_file: &std::fs::File,
+    destination_path: &Path,
+    expected_length: u64,
+    source_description: &str,
+    destination_description: &str,
+) -> anyhow::Result<()> {
+    let source_metadata = source_file
+        .metadata()
+        .with_context(|| format!("failed to inspect {source_description}"))?;
+    anyhow::ensure!(
+        source_metadata.file_type().is_file() && source_metadata.len() == expected_length,
+        "{source_description} does not match the expected regular-file generation"
+    );
+    let destination = create_file(destination_path, destination_description)?;
+    pal::unix::fs::reflink(source_file, &destination).with_context(|| {
+        format!("{destination_description} requires filesystem reflink support")
+    })?;
+
+    anyhow::ensure!(
+        destination
+            .metadata()
+            .with_context(|| format!("failed to inspect {destination_description}"))?
+            .len()
+            == expected_length,
+        "{destination_description} length does not match {source_description}",
+    );
+    destination
+        .sync_all()
+        .with_context(|| format!("failed to flush {destination_description}"))?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn reflink_exact(
+    _source_file: &std::fs::File,
+    _destination_path: &Path,
+    _expected_length: u64,
+    _source_description: &str,
+    destination_description: &str,
+) -> anyhow::Result<()> {
+    anyhow::bail!("{destination_description} copy-on-write cloning is unsupported on this platform")
+}
+
 fn size_empty_file(file: &std::fs::File, length: u64, description: &str) -> anyhow::Result<()> {
     file.set_len(0)
         .with_context(|| format!("failed to reset {description}"))?;
@@ -1077,7 +1122,7 @@ pub(super) fn read_bounded_open_file(
     Ok(bytes)
 }
 
-/// Computes SHA-256 over an exact-length regular file handle.
+/// Computes SHA-256 over an exact-length file or prevalidated read-only block handle.
 pub fn file_sha256(
     file: &std::fs::File,
     expected_length: u64,
@@ -1088,14 +1133,23 @@ pub fn file_sha256(
         .with_context(|| format!("failed to duplicate {description} handle"))?;
     file.seek(SeekFrom::Start(0))
         .with_context(|| format!("failed to rewind {description}"))?;
-    let actual_length = file
+    let metadata = file
         .metadata()
-        .with_context(|| format!("failed to inspect {description}"))?
-        .len();
-    anyhow::ensure!(
-        actual_length == expected_length,
-        "{description} size ({actual_length} bytes) doesn't match expected ({expected_length} bytes)"
-    );
+        .with_context(|| format!("failed to inspect {description}"))?;
+    #[cfg(target_os = "linux")]
+    let block_device = {
+        use std::os::unix::fs::FileTypeExt;
+        metadata.file_type().is_block_device()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let block_device = false;
+    if !block_device {
+        let actual_length = metadata.len();
+        anyhow::ensure!(
+            actual_length == expected_length,
+            "{description} size ({actual_length} bytes) doesn't match expected ({expected_length} bytes)"
+        );
+    }
     let mut digest = sha2::Sha256::new();
     let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
     let mut total = 0_u64;

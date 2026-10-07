@@ -7,6 +7,7 @@ use super::StorageBuilder;
 use super::VirtioBlkDisk;
 use crate::VmResources;
 use crate::cli_args::DiskCliKind;
+use crate::cli_args::microvm::SnapshotBlockIdentityCli;
 use crate::disk_open;
 use anyhow::Context;
 use mesh::CellUpdater;
@@ -36,9 +37,21 @@ pub(crate) struct MicrovmSandboxBlockSource {
     pub(crate) file: std::fs::File,
 }
 
-pub(crate) fn snapshot_block_contract(
+#[cfg(any(target_os = "linux", test))]
+fn supports_raw_block_device(
+    role: MicrovmSandboxBlockRole,
+    read_only: bool,
+    create_with_len: Option<u64>,
+) -> bool {
+    role == MicrovmSandboxBlockRole::Distro && read_only && create_with_len.is_none()
+}
+
+pub(crate) fn capture_snapshot_block_contract(
     sources: &[MicrovmSandboxBlockSource],
     scratch_policy: chipset_resources::microvm::MicrovmSnapshotScratchPolicy,
+    identity_mode: SnapshotBlockIdentityCli,
+    generation_id: Option<[u8; 16]>,
+    scratch_restore_mode: &str,
 ) -> anyhow::Result<Vec<openvmm_helpers::snapshot::microvm::SnapshotMicrovmSandboxBlock>> {
     sources
         .iter()
@@ -57,19 +70,28 @@ pub(crate) fn snapshot_block_contract(
             {
                 ("fresh", Vec::new(), String::new())
             } else {
-                (
-                    "sha256",
-                    openvmm_helpers::snapshot::fs::file_sha256(
-                        &source.file,
-                        source.length,
-                        &format!("microVM {} block", source.role.as_str()),
-                    )?,
-                    if source.role == MicrovmSandboxBlockRole::Scratch {
-                        openvmm_helpers::snapshot::format::SCRATCH_FILE_NAME.to_owned()
-                    } else {
-                        String::new()
-                    },
-                )
+                let (identity_kind, identity) = match identity_mode {
+                    SnapshotBlockIdentityCli::Sha256 => (
+                        openvmm_helpers::snapshot::microvm::SNAPSHOT_BLOCK_IDENTITY_SHA256,
+                        openvmm_helpers::snapshot::fs::file_sha256(
+                            &source.file,
+                            source.length,
+                            &format!("microVM {} block", source.role.as_str()),
+                        )?,
+                    ),
+                    SnapshotBlockIdentityCli::Generation => (
+                        openvmm_helpers::snapshot::microvm::SNAPSHOT_BLOCK_IDENTITY_GENERATION,
+                        generation_id
+                            .context("generation identity requires a snapshot generation ID")?
+                            .to_vec(),
+                    ),
+                };
+                let artifact = if source.role == MicrovmSandboxBlockRole::Scratch {
+                    openvmm_helpers::snapshot::format::SCRATCH_FILE_NAME.to_owned()
+                } else {
+                    String::new()
+                };
+                (identity_kind, identity, artifact)
             };
             Ok(
                 openvmm_helpers::snapshot::microvm::SnapshotMicrovmSandboxBlock {
@@ -81,6 +103,71 @@ pub(crate) fn snapshot_block_contract(
                     artifact,
                     logical_block_size: source.logical_block_size,
                     physical_block_size: source.physical_block_size,
+                    restore_mode: if source.role == MicrovmSandboxBlockRole::Scratch
+                        && scratch_policy
+                            == chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Paired
+                    {
+                        scratch_restore_mode.to_owned()
+                    } else {
+                        String::new()
+                    },
+                },
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn restore_snapshot_block_contract(
+    sources: &[MicrovmSandboxBlockSource],
+    scratch_policy: chipset_resources::microvm::MicrovmSnapshotScratchPolicy,
+    saved_blocks: &[openvmm_helpers::snapshot::microvm::SnapshotMicrovmSandboxBlock],
+) -> anyhow::Result<Vec<openvmm_helpers::snapshot::microvm::SnapshotMicrovmSandboxBlock>> {
+    sources
+        .iter()
+        .map(|source| {
+            let saved = saved_blocks
+                .iter()
+                .find(|block| block.role == source.role.as_str())
+                .with_context(|| {
+                    format!(
+                        "snapshot is missing the microVM {} block contract",
+                        source.role.as_str()
+                    )
+                })?;
+            let identity = match saved.identity_kind.as_str() {
+                openvmm_helpers::snapshot::microvm::SNAPSHOT_BLOCK_IDENTITY_SHA256 => {
+                    openvmm_helpers::snapshot::fs::file_sha256(
+                        &source.file,
+                        source.length,
+                        &format!("microVM {} block", source.role.as_str()),
+                    )?
+                }
+                openvmm_helpers::snapshot::microvm::SNAPSHOT_BLOCK_IDENTITY_GENERATION
+                | "unbound"
+                | "fresh" => saved.identity.clone(),
+                other => anyhow::bail!(
+                    "snapshot microVM {} block identity kind '{other}' is unsupported",
+                    source.role.as_str()
+                ),
+            };
+            Ok(
+                openvmm_helpers::snapshot::microvm::SnapshotMicrovmSandboxBlock {
+                    role: source.role.as_str().to_owned(),
+                    read_only: source.read_only,
+                    length: source.length,
+                    identity_kind: saved.identity_kind.clone(),
+                    identity,
+                    artifact: if source.role == MicrovmSandboxBlockRole::Scratch
+                        && scratch_policy
+                            == chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Paired
+                    {
+                        openvmm_helpers::snapshot::format::SCRATCH_FILE_NAME.to_owned()
+                    } else {
+                        String::new()
+                    },
+                    logical_block_size: source.logical_block_size,
+                    physical_block_size: source.physical_block_size,
+                    restore_mode: saved.restore_mode.clone(),
                 },
             )
         })
@@ -179,11 +266,27 @@ impl StorageBuilder {
         let metadata = file
             .metadata()
             .with_context(|| format!("failed to inspect sandbox block {}", path.display()))?;
+        #[cfg(target_os = "linux")]
+        let raw_distro = {
+            use std::os::unix::fs::FileTypeExt;
+            metadata.file_type().is_block_device()
+                && supports_raw_block_device(role, read_only, *create_with_len)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let raw_distro = false;
         anyhow::ensure!(
-            metadata.file_type().is_file(),
-            "microVM sandbox block is not a regular file: {}",
+            metadata.file_type().is_file() || raw_distro,
+            "microVM sandbox block must be a regular file or a read-only distro block device: {}",
             path.display()
         );
+        #[cfg(target_os = "linux")]
+        let length = if raw_distro {
+            disk_blockdevice::query_block_device_size_in_bytes(&file)
+                .context("failed to query read-only microVM distro block length")?
+        } else {
+            metadata.len()
+        };
+        #[cfg(not(target_os = "linux"))]
         let length = metadata.len();
         anyhow::ensure!(
             length != 0 && length % 512 == 0,
@@ -268,6 +371,7 @@ impl StorageBuilder {
                     resources.microvm.sandbox_block_sources.push(source);
                 }
             }
+
             config.virtio_devices.push((
                 VirtioBus::Mmio,
                 VirtioBlkHandle {
@@ -298,5 +402,37 @@ impl StorageBuilder {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn block_devices_are_only_valid_as_existing_read_only_distro_sources() {
+        assert!(supports_raw_block_device(
+            MicrovmSandboxBlockRole::Distro,
+            true,
+            None
+        ));
+        assert!(!supports_raw_block_device(
+            MicrovmSandboxBlockRole::Distro,
+            false,
+            None
+        ));
+        assert!(!supports_raw_block_device(
+            MicrovmSandboxBlockRole::Distro,
+            true,
+            Some(512)
+        ));
+        for role in [
+            MicrovmSandboxBlockRole::Runtime,
+            MicrovmSandboxBlockRole::Custom,
+            MicrovmSandboxBlockRole::Scratch,
+        ] {
+            assert!(!supports_raw_block_device(role, true, None));
+        }
     }
 }
