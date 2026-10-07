@@ -49,7 +49,8 @@ describes the source definitions.
 
   One virtio-fs slot is exposed at MMIO `0xd0001000`, IRQ 6 and remains
   dormant when `--mount` is omitted; `--mount` binds HostFs to it, and a
-  second `--mount` adds a second slot at MMIO `0xd0008000`, IRQ 13;
+  second `--mount` adds a second slot at MMIO `0xd0008000`, IRQ 13, unless
+  image slots claim them;
   one optional `--virtio-console <BACKEND>` is exposed at MMIO `0xd0002000`,
   IRQ 7 as the boot/log console (`hvc1`); and `--microvm-sandbox-block`
   exposes fixed distro, runtime, custom, and scratch slots starting at MMIO
@@ -71,6 +72,25 @@ describes the source definitions.
   boot-before-control discovery order and rejects user overrides that could
   change it.
 
+  `--microvm-image-slots` selects microVM ABI 3 and declares four permanent
+  read-only image-slot transports named `image0` through `image3`. Their MMIO
+  windows are `0xd0008000` through `0xd000b000`, their edge-triggered IRQs are
+  1, 13, 14, and 15, and their shared interrupt-status words are at offsets
+  `0x20` through `0x2c` in the existing shared-status page. The first slot
+  uses the second virtio-fs slot's window and status word, and the second slot
+  its IRQ 13, so a machine with image slots accepts at most one `--mount`. The
+  `microvm_image_slots=4` discovery token records the fixed capacity.
+  `--microvm-image-slot-boot-count <COUNT>` selects the active prefix and
+  defaults to one. Active slots are empty virtio-blk devices with 512-byte
+  logical blocks; inactive slots report virtio device ID 0. A machine that
+  omits `--microvm-image-slots` remains ABI 2 with the original device
+  topology.
+
+  Image slots require `--microvm-host-control listen=<PATH>` and
+  `--microvm-control-auth-stdin`. The host-control service uses the same
+  capability and local peer identity as the control console. See
+  [Host-control Protocol](./host_control_protocol.md).
+
   `microvm` uses one socket and one die,
   with one core per vCPU, no SMT, xAPIC mode, and contiguous APIC IDs from 0.
   Guest-requested snapshot capture and new-process restore are available for
@@ -88,7 +108,8 @@ describes the source definitions.
   ```admonish warning title="microVM migration"
   The canonical `microvm` spelling now selects the contract formerly exposed
   as `microvm-v2`; the `microvm-v2` selector and the former ABI-v1 behavior are
-  removed. Snapshot ABI and boot layout remain numeric value 2.
+  removed. Machines without image slots retain snapshot ABI 2. Declaring
+  image slots selects snapshot ABI 3; the boot-layout version is unchanged.
   ```
 * `--net <IPv4/PREFIX>`: With `--machine microvm`, attach one virtio-net NIC
   at MMIO `0xd0000000`. KVM and MSHV use IRQ 10; WHP uses IRQ 5. Prefixes
@@ -200,7 +221,8 @@ describes the source definitions.
 * `--mount <GUEST_TARGET,HOST_PATH[,ro|rw]>`: With `--machine microvm`, attach
   one no-DAX HostFs device at MMIO `0xd0001000`, IRQ 6, with tag `microvm`.
   Repeat it once to attach a second device at MMIO `0xd0008000`, IRQ 13, with
-  tag `microvm1`; each share has its own guest target, access mode, and
+  tag `microvm1`, unless `--microvm-image-slots` claims that window and IRQ;
+  each share has its own guest target, access mode, and
   denied paths. The default mode is read-only; `rw` must be explicit. The
   guest target must be an absolute, non-root Linux path without dot, parent,
   empty, whitespace, backslash, or `=` components. Guest targets and host
@@ -405,8 +427,9 @@ describes the source definitions.
 * `--restore-entropy`: Accepted for compatibility; it has no effect. Every
   microVM restore makes restore packet version 4 available on the private
   portb restore channel. The packet carries 64 bytes of fresh entropy, the
-  online-VP target, the memory-expansion ranges, the downtime, and the TSC
-  rate deviation; the guest must consume it and explicitly reseed its RNG.
+  online-VP and image-slot targets, the memory-expansion ranges, the downtime,
+  and the TSC rate deviation; the guest must consume it and explicitly reseed
+  its RNG.
   [Snapshots](../../../user_guide/openvmm/snapshots.md) documents its format,
   the portb status bits, and the time sample.
   Every microVM portb device also reports generation-ID support in status bit
@@ -427,6 +450,11 @@ describes the source definitions.
   validating the full saved VP inventory; that reduced-prefix process cannot
   be saved again. MSHV restores without this option, and KVM and WHP restores,
   instantiate the full VP capacity.
+* `--restore-image-slots <COUNT>`: For an image-slot (ABI 3) microVM snapshot,
+  activate the contiguous slot prefix `image0` through `image{COUNT-1}` before
+  restore readiness. `COUNT` must satisfy `boot-active <= COUNT <= 4`. This
+  option sets the restore packet's image-slot target and implies the
+  post-restore gate. Snapshots without image slots reject it.
 * `--restore-gate-timeout-ms <MILLISECONDS>`: Bound microVM guest repair and
   gate acknowledgement after restore. The default is 60000 milliseconds.
 * `--cpu-profile <ID>`: Select the microVM's pinned CPU profile, `auto`

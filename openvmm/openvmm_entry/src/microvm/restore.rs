@@ -122,6 +122,7 @@ impl MicrovmRestore {
     pub(crate) fn time_abi_restore_packet(
         &self,
         restore_online_vp_count: Option<u32>,
+        restore_active_image_slot_count: Option<u8>,
     ) -> anyhow::Result<([u8; 16], RestorePacketBase)> {
         let (time, _) = self
             .time_abi_records()
@@ -129,6 +130,7 @@ impl MicrovmRestore {
         restore_packet_base(
             time,
             restore_online_vp_count,
+            restore_active_image_slot_count,
             self.memory_target_requested,
             &self.memory_ranges,
             self.gate_required,
@@ -140,10 +142,12 @@ impl MicrovmRestore {
 /// ABI restore of a snapshot with the time contract `time`, and the
 /// generation ID they imply: restore step 7 of the specification. The
 /// generation counter is the snapshot's plus one, and `ack_required` makes
-/// the guest acknowledge the restore through port `0x605`.
+/// the guest acknowledge the restore through port `0x605`. An explicit
+/// image-slot target occupies header byte 7.
 pub(crate) fn restore_packet_base(
     time: &SnapshotTimeContract,
     restore_online_vp_count: Option<u32>,
+    restore_active_image_slot_count: Option<u8>,
     memory_target_requested: bool,
     memory_ranges: &[SnapshotMemoryExpansionRange],
     ack_required: bool,
@@ -167,6 +171,7 @@ pub(crate) fn restore_packet_base(
             .transpose()
             .context("restore-online VP count does not fit in u8")?
             .unwrap_or(0),
+        image_slot_target: restore_active_image_slot_count.unwrap_or(0),
         memory_target: memory_target_requested,
         ack_required,
         generation,
@@ -232,6 +237,16 @@ pub(crate) fn prepare_restore(
                 manifest,
                 restore_processors,
             )?;
+            restore_gate_required = true;
+        }
+        if let Some(restore_image_slots) = opt.microvm.restore_image_slots {
+            openvmm_helpers::snapshot::microvm::validate_restore_active_image_slot_count(
+                manifest,
+                restore_image_slots,
+            )?;
+            // The restore packet's image-slot target directs the guest to
+            // verify the active prefix and acknowledge, even when no slot
+            // becomes active.
             restore_gate_required = true;
         }
         let restore_memory_size = opt
@@ -497,24 +512,32 @@ pub(crate) fn validate_restore_contract(
     } else {
         Vec::new()
     };
-    let mut expected_contract = openvmm_helpers::snapshot::microvm::microvm_machine_contract(
-        expected_hypervisor,
-        openvmm_helpers::snapshot::microvm::MICROVM_BOOT_LAYOUT_VERSION,
-        effective_command_line.to_owned(),
-        network,
-        filesystem_slot,
-        filesystems,
-        console_attachment.cloned(),
-        control_console_attachment.cloned(),
-        sandbox_blocks,
-        expected_vp_count,
-        expected_memory_size,
-        (saved_contract.memory_expansion_version != 0)
-            .then_some(saved_contract.memory_capacity_bytes),
-        saved_contract.state_unit_names.clone(),
-        contract,
-        cpu_profile,
-    )?;
+    let image_slots = (saved_contract.microvm_image_slot_capacity != 0).then_some(
+        openvmm_defs::microvm::MicrovmImageSlotsConfig {
+            boot_count: saved_contract.boot_active_image_slot_count,
+            active_count: saved_contract.boot_active_image_slot_count,
+        },
+    );
+    let mut expected_contract =
+        openvmm_helpers::snapshot::microvm::microvm_machine_contract_with_image_slots(
+            expected_hypervisor,
+            openvmm_helpers::snapshot::microvm::MICROVM_BOOT_LAYOUT_VERSION,
+            effective_command_line.to_owned(),
+            network,
+            filesystem_slot,
+            filesystems,
+            console_attachment.cloned(),
+            control_console_attachment.cloned(),
+            sandbox_blocks,
+            image_slots,
+            expected_vp_count,
+            expected_memory_size,
+            (saved_contract.memory_expansion_version != 0)
+                .then_some(saved_contract.memory_capacity_bytes),
+            saved_contract.state_unit_names.clone(),
+            contract,
+            cpu_profile,
+        )?;
     align_legacy_network_policy_contract(saved_contract, &mut expected_contract);
     align_restore_console_listener_contract(saved_contract, &mut expected_contract);
     openvmm_helpers::snapshot::microvm::validate_microvm_machine_contract(
@@ -676,7 +699,7 @@ pub(crate) mod tests {
     #[test]
     fn time_abi_restore_packet_carries_the_controller_fields() {
         let restore = time_abi_restore(6);
-        let (generation_id, base) = restore.time_abi_restore_packet(Some(4)).unwrap();
+        let (generation_id, base) = restore.time_abi_restore_packet(Some(4), None).unwrap();
         assert_eq!(base.generation, 7);
         assert_eq!(base.online_vp_count, 4);
         assert!(base.memory_target && base.ack_required);
@@ -688,13 +711,14 @@ pub(crate) mod tests {
             }]
         );
         assert_eq!(generation_id, microvm_generation_id(&base.entropy));
-        let (_, other) = restore.time_abi_restore_packet(None).unwrap();
+        assert_eq!(base.image_slot_target, 0);
+        let (_, other) = restore.time_abi_restore_packet(None, None).unwrap();
         assert_eq!(other.online_vp_count, 0);
         assert_ne!(other.entropy, base.entropy);
 
-        assert!(restore.time_abi_restore_packet(Some(3)).is_err());
+        assert!(restore.time_abi_restore_packet(Some(3), None).is_err());
         let err = time_abi_restore(u32::MAX)
-            .time_abi_restore_packet(None)
+            .time_abi_restore_packet(None, None)
             .unwrap_err();
         assert!(
             format!("{err:#}").contains("[E_GENERATION_EXHAUSTED]"),
@@ -702,8 +726,47 @@ pub(crate) mod tests {
         );
         assert!(
             MicrovmRestore::default()
-                .time_abi_restore_packet(None)
+                .time_abi_restore_packet(None, None)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn time_abi_restore_packet_carries_the_image_slot_target() {
+        let restore = time_abi_restore(6);
+        let (_, base) = restore.time_abi_restore_packet(None, Some(3)).unwrap();
+        assert_eq!(base.image_slot_target, 3);
+        assert_eq!(base.online_vp_count, 0);
+        assert!(base.ack_required);
+        let packet = chipset_resources::microvm_time::RestorePacketV4 {
+            base,
+            time: RestoreTimeRecord {
+                downtime_ns: 0,
+                downtime_utc: false,
+                rate_deviation: 0,
+                test_hooks: false,
+            },
+            utc_ns: 0,
+        }
+        .encode()
+        .unwrap();
+        assert_ne!(
+            packet[4] & chipset_resources::microvm_time::FLAG_IMAGE_SLOT_TARGET,
+            0
+        );
+        assert_eq!(packet[7], 3);
+
+        assert!(
+            restore
+                .time_abi_restore_packet(
+                    None,
+                    Some(openvmm_defs::microvm::MICROVM_IMAGE_SLOT_CAPACITY + 1)
+                )
+                .is_err()
+        );
+        assert_eq!(
+            chipset_resources::microvm_time::MAX_IMAGE_SLOT_TARGET,
+            openvmm_defs::microvm::MICROVM_IMAGE_SLOT_CAPACITY
         );
     }
 }

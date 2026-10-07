@@ -158,6 +158,11 @@ restore flow over both transports:
   rejected for snapshots without a RAM capacity contract. A nonzero value sets
   the memory-target flag of restore packet version 4, with the expansion
   ranges (none at the base size); zero leaves the flag clear.
+* `restore_image_slot_count` requests restore-time activation of the
+  contiguous image-slot prefix, as for `--restore-image-slots`. Zero preserves
+  the captured boot prefix. A nonzero value is valid only for an image-slot
+  snapshot, sets the restore packet's image-slot target, and implies the
+  post-restore gate.
 * `restore_gate_timeout_ms` bounds gated guest repair. Zero selects the
   60-second default; a nonzero value is valid only with `restore_path`.
 * `restore_ready_path` names an existing Unix domain socket on Linux or a

@@ -66,6 +66,7 @@ impl From<MicrovmConfig> for MicrovmManifest {
             network: _,
             filesystems: _,
             sandbox_blocks,
+            image_slots: _,
             filesystem_bootstrap: _,
             memory_capacity,
             snapshot_memory_ranges,
@@ -476,6 +477,7 @@ fn virtio_mmio_config(
     sandbox_blocks: &[openvmm_defs::microvm::MicrovmSandboxBlockConfig],
     sandbox_block_index: &mut usize,
     filesystem_index: &mut usize,
+    image_slot_index: &mut usize,
     chipset_mmio: ChipsetMmioRanges,
 ) -> anyhow::Result<(u64, u64, u32, u64, VirtioMmioInterruptMode)> {
     let (start, irq) = match id {
@@ -506,6 +508,15 @@ fn virtio_mmio_config(
             *sandbox_block_index += 1;
             (block.role.mmio_base(), block.role.irq())
         }
+        "virtio-blk-image-slot" => {
+            let index = *image_slot_index;
+            let base = *openvmm_defs::microvm::MICROVM_IMAGE_SLOT_MMIO_BASES
+                .get(index)
+                .context("microVM has too many image-slot devices")?;
+            let irq = openvmm_defs::microvm::MICROVM_IMAGE_SLOT_IRQS[index];
+            *image_slot_index += 1;
+            (base, irq)
+        }
         _ => anyhow::bail!("unsupported microVM virtio device '{id}' reached worker construction"),
     };
     let len = openvmm_defs::microvm::MICROVM_VIRTIO_MMIO_LEN;
@@ -526,6 +537,7 @@ fn virtio_mmio_config(
                 .context("microVM block slot has no role")?;
             !openvmm_defs::microvm::microvm_sandbox_block_features(block.role)
         }
+        "virtio-blk-image-slot" => !openvmm_defs::microvm::microvm_image_slot_features(),
         _ => 1 << 34,
     };
     let interrupt_mode = VirtioMmioInterruptMode::SharedStatus {
@@ -541,6 +553,7 @@ pub(super) struct VirtioMmioSlots<'a> {
     sandbox_blocks: &'a [openvmm_defs::microvm::MicrovmSandboxBlockConfig],
     sandbox_block_index: usize,
     filesystem_index: usize,
+    image_slot_index: usize,
     chipset_mmio: ChipsetMmioRanges,
 }
 
@@ -553,6 +566,7 @@ impl<'a> VirtioMmioSlots<'a> {
             sandbox_blocks,
             sandbox_block_index: 0,
             filesystem_index: 0,
+            image_slot_index: 0,
             chipset_mmio,
         }
     }
@@ -572,6 +586,7 @@ impl<'a> VirtioMmioSlots<'a> {
             self.sandbox_blocks,
             &mut self.sandbox_block_index,
             &mut self.filesystem_index,
+            &mut self.image_slot_index,
             self.chipset_mmio,
         )?;
         let id = format!("{id}-{mmio_start}");

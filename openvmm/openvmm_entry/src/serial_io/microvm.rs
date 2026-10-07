@@ -18,6 +18,11 @@ use vm_resource::kind::SerialBackendHandle;
 
 #[cfg(target_os = "linux")]
 pub fn bind_control_serial(path: &Path) -> io::Result<Resource<SerialBackendHandle>> {
+    Ok(OpenSocketSerialConfig::from(bind_control_listener(path)?).into_resource())
+}
+
+#[cfg(target_os = "linux")]
+fn bind_control_listener(path: &Path) -> io::Result<UnixListener> {
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
@@ -69,13 +74,19 @@ pub fn bind_control_serial(path: &Path) -> io::Result<Resource<SerialBackendHand
         }
         return Err(error);
     }
-    Ok(OpenSocketSerialConfig::from(listener).into_resource())
+    Ok(listener)
 }
 
 #[cfg(windows)]
 pub fn bind_control_serial(path: &Path) -> io::Result<Resource<SerialBackendHandle>> {
-    use pal::windows::security::LocalSecurityDescriptor;
     use serial_socket::windows::OpenWindowsPipeSerialConfig;
+
+    Ok(OpenWindowsPipeSerialConfig::from(bind_control_pipe(path)?).into_resource())
+}
+
+#[cfg(windows)]
+fn bind_control_pipe(path: &Path) -> io::Result<File> {
+    use pal::windows::security::LocalSecurityDescriptor;
 
     const NAMED_PIPE_PREFIX: &str = "//./pipe/";
 
@@ -104,7 +115,7 @@ pub fn bind_control_serial(path: &Path) -> io::Result<Resource<SerialBackendHand
         pal::windows::pipe::PipeMode::Byte,
         &descriptor,
     )?;
-    Ok(OpenWindowsPipeSerialConfig::from(pipe).into_resource())
+    Ok(pipe)
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
@@ -112,6 +123,41 @@ pub fn bind_control_serial(_path: &Path) -> io::Result<Resource<SerialBackendHan
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "secure control-console local endpoints are only supported on Linux",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+pub fn bind_host_control(
+    path: &Path,
+    driver: &pal_async::DefaultDriver,
+) -> io::Result<Box<dyn serial_core::SerialIo>> {
+    Ok(Box::new(serial_socket::net::SocketSerialBackend::new(
+        Box::new(driver.clone()),
+        OpenSocketSerialConfig::from(bind_control_listener(path)?),
+    )?))
+}
+
+#[cfg(windows)]
+pub fn bind_host_control(
+    path: &Path,
+    driver: &pal_async::DefaultDriver,
+) -> io::Result<Box<dyn serial_core::SerialIo>> {
+    Ok(Box::new(
+        serial_socket::windows::WindowsPipeSerialBackend::new(
+            Box::new(driver.clone()),
+            serial_socket::windows::OpenWindowsPipeSerialConfig::from(bind_control_pipe(path)?),
+        )?,
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+pub fn bind_host_control(
+    _path: &Path,
+    _driver: &pal_async::DefaultDriver,
+) -> io::Result<Box<dyn serial_core::SerialIo>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure host-control endpoints are only supported on Linux and Windows",
     ))
 }
 

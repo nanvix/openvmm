@@ -978,6 +978,7 @@ mod tests {
             false,
             false,
             &[],
+            None,
         )
         .unwrap();
         let mut state_unit_names = [

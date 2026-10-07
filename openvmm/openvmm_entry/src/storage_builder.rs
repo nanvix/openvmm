@@ -135,6 +135,7 @@ pub(super) struct StorageBuilder {
     underhill_scsi_luns: Vec<Lun>,
     underhill_nvme_luns: Vec<Lun>,
     vtl0_virtio_blk_disks: Vec<VirtioBlkDisk>,
+    microvm_image_slots: Option<openvmm_defs::microvm::MicrovmImageSlotsConfig>,
     openhcl_vtl: Option<DeviceVtl>,
 }
 
@@ -201,6 +202,7 @@ impl StorageBuilder {
             underhill_scsi_luns: Vec::new(),
             underhill_nvme_luns: Vec::new(),
             vtl0_virtio_blk_disks: Vec::new(),
+            microvm_image_slots: None,
             openhcl_vtl,
         }
     }

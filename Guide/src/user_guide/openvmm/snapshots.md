@@ -192,9 +192,10 @@ from the data port. Its 32-byte little-endian header holds:
 - the magic `OVR` and version 4;
 - flags: bit 0, the downtime came from host UTC; bit 1, a memory target;
   bit 2, the guest must acknowledge the restore through port `0x605`; bit 3,
-  a test hook is active;
-- the online-VP target (0 for none), the memory-range count, and a reserved
-  zero byte;
+  a test hook is active; bit 4, an image-slot target;
+- the online-VP target (0 for none), the memory-range count, and the active
+  image-slot target (0 for none; flag bit 4 is set exactly when it is
+  nonzero);
 - the generation counter (`u32`), which is 0 at cold boot and one more than
   the snapshot's at each restore;
 - the TSC rate deviation (`i32`, ppm scaled by 2^16);
@@ -235,6 +236,20 @@ RDTSC is never trapped or emulated.
 Snapshots without the explicit capture-time `maxcpus` opt-in reject a restore
 target. This is not a post-readiness hotplug API and cannot add VPs absent
 from the saved topology.
+
+MicroVM ABI 3 snapshots record a fixed capacity of four image slots and the
+active cold-boot prefix. Capture is accepted only while every active slot is
+empty; a bound slot rejects capture before guest execution is quiesced.
+`--restore-image-slots <COUNT>` may activate a larger contiguous prefix before
+restore readiness and must satisfy
+`boot-active <= COUNT <= 4`. The restore packet carries the target in header
+byte 7 and sets flag bit 4; no status bit advertises it. An
+explicit target always holds the restore gate, so the packet also sets flag
+bit 2: the guest verifies the active prefix and acknowledges, even when no new
+slot becomes active.
+Restored slots always begin empty, and no slot can be activated after
+readiness. ABI 2 snapshots have no image-slot fields, and their restore packet
+leaves header byte 7 zero.
 
 ```admonish warning
 Snapshots do not contain or validate embedded checksums for

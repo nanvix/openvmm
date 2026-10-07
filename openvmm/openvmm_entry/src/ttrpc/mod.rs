@@ -1328,7 +1328,7 @@ impl VmService {
             }
         }
 
-        microvm.finish_devices(&mut config)?;
+        microvm.finish_devices(&mut config, &self.driver)?;
 
         if let Some(hvsocket_config) = req_config.hvsocket_config {
             let vmbus = config

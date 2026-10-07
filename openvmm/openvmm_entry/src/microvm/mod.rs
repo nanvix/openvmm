@@ -6,6 +6,7 @@
 mod config;
 mod console;
 mod filesystem;
+mod host_control;
 mod launch;
 mod network;
 pub(crate) mod output;
@@ -29,6 +30,7 @@ pub(crate) use console::microvm_console_attachment_from_cli;
 pub(crate) use console::microvm_console_attachment_from_snapshot;
 #[cfg(any(feature = "ttrpc", feature = "grpc"))]
 pub(crate) use console::microvm_console_socket_cleanup;
+pub(crate) use console::microvm_control_authentication_from_capability;
 #[cfg(any(feature = "ttrpc", feature = "grpc"))]
 pub(crate) use console::validate_microvm_console_attachment_namespace;
 #[cfg(any(feature = "ttrpc", feature = "grpc"))]
@@ -38,6 +40,7 @@ pub(crate) use filesystem::microvm_filesystem_from_snapshot;
 #[cfg(any(feature = "ttrpc", feature = "grpc"))]
 pub(crate) use filesystem::microvm_filesystem_slot_from_snapshot;
 pub(crate) use filesystem::validate_microvm_filesystem_private_storage;
+pub(crate) use host_control::MicrovmHostControlServer;
 pub(crate) use launch::MicrovmLaunch;
 pub(crate) use restore::ExpectedRestoreContract;
 pub(crate) use restore::MicrovmRestore;
@@ -58,6 +61,8 @@ use net_backend_resources::egress::EgressPolicy;
 use openvmm_helpers::snapshot::microvm::SnapshotAttachment;
 use output::MicrovmOutputDrain;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 /// Host-side microVM resources produced while building the VM configuration
 /// and consumed by the snapshot, restore, and teardown paths.
@@ -69,6 +74,15 @@ pub(crate) struct MicrovmResources {
     pub(crate) snapshot_requests: Option<mesh::Receiver<MicrovmSnapshotBoundaryRequest>>,
     /// Snapshot sources of the fixed-role sandbox blocks, in role order.
     pub(crate) sandbox_block_sources: Vec<MicrovmSandboxBlockSource>,
+    /// Host control channels for active image slots; inactive entries are absent.
+    pub(crate) image_slot_requests:
+        Vec<Option<mesh::Sender<virtio_resources::blk::ImageSlotRequest>>>,
+    /// Excludes image binding while capture or another lifecycle transition begins.
+    pub(crate) image_slot_transition: Arc<AtomicBool>,
+    /// Authenticated versioned host-control service.
+    pub(crate) host_control: Option<Arc<futures::lock::Mutex<MicrovmHostControlServer>>>,
+    /// Removes the host-control Unix socket on teardown.
+    pub(crate) host_control_socket_cleanup: Option<MicrovmConsoleSocketCleanup>,
     /// Snapshot identity of the boot virtio-console endpoint.
     pub(crate) console_attachment: Option<SnapshotAttachment>,
     /// Removes the boot console Unix socket on teardown.
