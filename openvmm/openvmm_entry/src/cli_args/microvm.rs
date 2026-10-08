@@ -293,7 +293,7 @@ impl From<MachineProfileCli> for MachineProfile {
 /// Options of the microVM machine profile.
 #[derive(clap::Args)]
 pub struct MicrovmCli {
-    /// Declare the four bind-once read-only image slots of microVM ABI 3.
+    /// Declare four optional bind-once read-only image slots in microVM ABI 2.
     #[clap(long)]
     pub microvm_image_slots: bool,
 

@@ -237,8 +237,8 @@ Snapshots without the explicit capture-time `maxcpus` opt-in reject a restore
 target. This is not a post-readiness hotplug API and cannot add VPs absent
 from the saved topology.
 
-MicroVM ABI 3 snapshots record a fixed capacity of four image slots and the
-active cold-boot prefix. Capture is accepted only while every active slot is
+MicroVM ABI 2 snapshots with image slots record a fixed capacity of four and
+the active cold-boot prefix. Capture is accepted only while every active slot is
 empty; a bound slot rejects capture before guest execution is quiesced.
 `--restore-image-slots <COUNT>` may activate a larger contiguous prefix before
 restore readiness and must satisfy
@@ -248,8 +248,8 @@ explicit target always holds the restore gate, so the packet also sets flag
 bit 2: the guest verifies the active prefix and acknowledges, even when no new
 slot becomes active.
 Restored slots always begin empty, and no slot can be activated after
-readiness. ABI 2 snapshots have no image-slot fields, and their restore packet
-leaves header byte 7 zero.
+readiness. Snapshots without image slots record zero capacity and boot-active
+count, and their restore packet leaves header byte 7 zero.
 
 ```admonish warning
 Snapshots do not contain or validate embedded checksums for

@@ -485,10 +485,10 @@ pub struct SnapshotMachineContract {
     /// which requires a filesystem in the first slot.
     #[mesh(33)]
     pub microvm_additional_filesystems: Vec<SnapshotMicrovmFilesystem>,
-    /// Fixed image-slot capacity, or zero for ABI 2.
+    /// Fixed image-slot capacity when declared, or zero without image slots.
     #[mesh(34)]
     pub microvm_image_slot_capacity: u32,
-    /// Image slots active on the captured cold boot.
+    /// Image slots active on the captured cold boot, or zero without slots.
     #[mesh(35)]
     pub boot_active_image_slot_count: u8,
 }
@@ -552,6 +552,47 @@ fn microvm_boot_online_vp_count(
     Ok(boot_online_vp_count.unwrap_or(0))
 }
 
+fn validate_microvm_image_slot_contract(contract: &SnapshotMachineContract) -> anyhow::Result<()> {
+    let capacity = u32::from(openvmm_defs::microvm::MICROVM_IMAGE_SLOT_CAPACITY);
+    match contract.microvm_image_slot_capacity {
+        0 => anyhow::ensure!(
+            contract.boot_active_image_slot_count == 0,
+            "snapshot without image slots has a boot-active image-slot count"
+        ),
+        declared if declared == capacity => {
+            anyhow::ensure!(
+                (1..=openvmm_defs::microvm::MICROVM_IMAGE_SLOT_CAPACITY)
+                    .contains(&contract.boot_active_image_slot_count),
+                "snapshot boot-active image-slot count is invalid"
+            );
+            anyhow::ensure!(
+                contract.microvm_additional_filesystems.is_empty(),
+                "snapshot image slots cannot coexist with the second virtio-fs slot"
+            );
+        }
+        declared => anyhow::bail!(
+            "snapshot image-slot capacity {declared} is unsupported; expected 0 or {capacity}"
+        ),
+    }
+    let mut tokens = contract
+        .effective_command_line
+        .split_ascii_whitespace()
+        .filter(|token| token.starts_with("microvm_image_slots="));
+    if contract.microvm_image_slot_capacity == 0 {
+        anyhow::ensure!(
+            tokens.next().is_none(),
+            "snapshot without image slots has a discovery token"
+        );
+    } else {
+        let discovery = format!("microvm_image_slots={capacity}");
+        anyhow::ensure!(
+            tokens.next() == Some(discovery.as_str()) && tokens.next().is_none(),
+            "snapshot image-slot discovery token does not match the declared capacity"
+        );
+    }
+    Ok(())
+}
+
 /// Validates a restore-time online VP target against an opt-in snapshot contract.
 pub fn validate_restore_online_vp_count(
     manifest: &SnapshotManifest,
@@ -562,41 +603,7 @@ pub fn validate_restore_online_vp_count(
         .as_ref()
         .context("snapshot is missing the authoritative machine contract")?;
     validate_supported_microvm_contract(contract)?;
-    match contract.microvm_abi_version {
-        openvmm_defs::microvm::MICROVM_ABI_VERSION_2 => {
-            anyhow::ensure!(
-                contract.microvm_image_slot_capacity == 0
-                    && contract.boot_active_image_slot_count == 0,
-                "snapshot ABI 2 must not declare image slots"
-            );
-        }
-        openvmm_defs::microvm::MICROVM_ABI_VERSION_3 => {
-            anyhow::ensure!(
-                contract.microvm_image_slot_capacity
-                    == u32::from(openvmm_defs::microvm::MICROVM_IMAGE_SLOT_CAPACITY),
-                "snapshot ABI 3 image-slot capacity is invalid"
-            );
-            anyhow::ensure!(
-                (1..=openvmm_defs::microvm::MICROVM_IMAGE_SLOT_CAPACITY)
-                    .contains(&contract.boot_active_image_slot_count),
-                "snapshot ABI 3 boot-active image-slot count is invalid"
-            );
-            anyhow::ensure!(
-                contract
-                    .effective_command_line
-                    .split_ascii_whitespace()
-                    .any(|token| {
-                        token
-                            == format!(
-                                "microvm_image_slots={}",
-                                openvmm_defs::microvm::MICROVM_IMAGE_SLOT_CAPACITY
-                            )
-                    }),
-                "snapshot ABI 3 image-slot discovery token is invalid"
-            );
-        }
-        _ => unreachable!("supported microVM ABI was validated above"),
-    }
+    validate_microvm_image_slot_contract(contract)?;
     anyhow::ensure!(
         contract.boot_online_vp_count != 0,
         "snapshot does not declare restore-time VP activation support"
@@ -618,7 +625,7 @@ pub fn validate_restore_online_vp_count(
     Ok(())
 }
 
-/// Validates a restore-time active image-slot target against ABI 3.
+/// Validates a restore-time active image-slot target against the snapshot.
 pub fn validate_restore_active_image_slot_count(
     manifest: &SnapshotManifest,
     restore_active_image_slot_count: u8,
@@ -628,6 +635,7 @@ pub fn validate_restore_active_image_slot_count(
         .as_ref()
         .context("snapshot is missing the authoritative machine contract")?;
     validate_supported_microvm_contract(contract)?;
+    validate_microvm_image_slot_contract(contract)?;
     anyhow::ensure!(
         contract.microvm_image_slot_capacity
             == u32::from(openvmm_defs::microvm::MICROVM_IMAGE_SLOT_CAPACITY),
@@ -870,7 +878,7 @@ pub fn microvm_machine_contract(
     )
 }
 
-/// Builds the authoritative microVM machine contract with optional ABI 3
+/// Builds the authoritative microVM ABI 2 machine contract with optional
 /// image slots, which use the second virtio-fs slot's window and interrupt.
 pub fn microvm_machine_contract_with_image_slots(
     source_hypervisor: &str,
@@ -1360,11 +1368,7 @@ pub fn microvm_machine_contract_with_image_slots(
 
     let mut contract = SnapshotMachineContract {
         machine_profile: "microvm".to_owned(),
-        microvm_abi_version: if image_slots.is_some() {
-            openvmm_defs::microvm::MICROVM_ABI_VERSION_3
-        } else {
-            openvmm_defs::microvm::MICROVM_ABI_VERSION_2
-        },
+        microvm_abi_version: openvmm_defs::microvm::MICROVM_ABI_VERSION_2,
         source_hypervisor: source_hypervisor.to_owned(),
         effective_command_line: String::new(),
         effective_command_line_sha256: Vec::new(),
@@ -1406,11 +1410,7 @@ pub fn microvm_machine_contract_with_image_slots(
 /// Returns whether restore must hold external device input until guest repair completes.
 pub fn requires_post_restore_gate(manifest: &SnapshotManifest) -> bool {
     manifest.machine_contract.as_ref().is_some_and(|contract| {
-        matches!(
-            contract.microvm_abi_version,
-            openvmm_defs::microvm::MICROVM_ABI_VERSION_2
-                | openvmm_defs::microvm::MICROVM_ABI_VERSION_3
-        )
+        contract.microvm_abi_version == openvmm_defs::microvm::MICROVM_ABI_VERSION_2
     }) && !manifest.snapshot_tier.is_empty()
 }
 
@@ -1430,15 +1430,10 @@ pub fn validate_supported_microvm_contract(
     contract: &SnapshotMachineContract,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
-        matches!(
-            contract.microvm_abi_version,
-            openvmm_defs::microvm::MICROVM_ABI_VERSION_2
-                | openvmm_defs::microvm::MICROVM_ABI_VERSION_3
-        ),
-        "snapshot microVM ABI version {} is unsupported; this OpenVMM supports versions {} and {}",
+        contract.microvm_abi_version == openvmm_defs::microvm::MICROVM_ABI_VERSION_2,
+        "snapshot microVM ABI version {} is unsupported; this OpenVMM supports version {}",
         contract.microvm_abi_version,
         openvmm_defs::microvm::MICROVM_ABI_VERSION_2,
-        openvmm_defs::microvm::MICROVM_ABI_VERSION_3,
     );
     anyhow::ensure!(
         contract.boot_layout_version == MICROVM_BOOT_LAYOUT_VERSION,
@@ -1571,6 +1566,7 @@ pub(super) fn validate_machine_contract_shape(
     vp_count: u32,
 ) -> anyhow::Result<()> {
     validate_supported_microvm_contract(contract)?;
+    validate_microvm_image_slot_contract(contract)?;
     anyhow::ensure!(
         contract.virtio_interrupt_mode == MICROVM_SHARED_STATUS_INTERRUPT_MODE
             && contract.virtio_shared_status_page_gpa
@@ -2243,6 +2239,7 @@ fn platform_command_line_token_is_invariant(token: &str) -> bool {
             | "nvx_sandbox=1"
             | "nvx_config=0xd0010000,65536"
             | "nvx_snapshot_tier=platform"
+            | "microvm_image_slots=4"
     ) || token.starts_with("nr_cpus=")
         || token == openvmm_defs::microvm::MICROVM_CONTROL_TTY_COMMAND_LINE
         || [
@@ -2439,10 +2436,14 @@ mod tests {
     fn restore_image_slot_count_is_bounded_by_template() {
         let mut manifest = test_manifest();
         let mut contract = test_machine_contract();
-        contract.microvm_abi_version = openvmm_defs::microvm::MICROVM_ABI_VERSION_3;
         contract.microvm_image_slot_capacity =
             openvmm_defs::microvm::MICROVM_IMAGE_SLOT_CAPACITY.into();
         contract.boot_active_image_slot_count = 2;
+        contract.set_effective_command_line("console=hvc0 microvm_image_slots=4".to_owned());
+        assert_eq!(
+            contract.microvm_abi_version,
+            openvmm_defs::microvm::MICROVM_ABI_VERSION_2
+        );
         manifest.machine_contract = Some(contract);
 
         for target in [2, 3, 4] {
@@ -2451,6 +2452,127 @@ mod tests {
         for target in [0, 1, 5] {
             assert!(validate_restore_active_image_slot_count(&manifest, target).is_err());
         }
+    }
+
+    #[test]
+    fn generated_image_slots_use_abi_two() {
+        use openvmm_defs::microvm::{
+            MICROVM_BASE_COMMAND_LINE, MICROVM_IMAGE_SLOT_MMIO_BASES, MicrovmImageSlotsConfig,
+            append_microvm_virtio_discovery,
+        };
+
+        for image_slots in [
+            None,
+            Some(MicrovmImageSlotsConfig {
+                boot_count: 1,
+                active_count: 1,
+            }),
+        ] {
+            let mut command_line = MICROVM_BASE_COMMAND_LINE.to_owned();
+            append_microvm_virtio_discovery(
+                &mut command_line,
+                None,
+                false,
+                &[],
+                false,
+                false,
+                &[],
+                image_slots,
+            )
+            .unwrap();
+            let mut state_unit_names = [
+                "partition",
+                "vmtime",
+                "pic",
+                "ioapic",
+                "pit",
+                "rtc",
+                "microvm-portb",
+                "microvm-shutdown",
+                "microvm-snapshot-request",
+            ]
+            .map(str::to_owned)
+            .to_vec();
+            if image_slots.is_some() {
+                state_unit_names.extend(
+                    MICROVM_IMAGE_SLOT_MMIO_BASES
+                        .iter()
+                        .map(|base| format!("virtio-blk-image-slot-{base}")),
+                );
+            }
+
+            let contract = microvm_machine_contract_with_image_slots(
+                "whp",
+                MICROVM_BOOT_LAYOUT_VERSION,
+                command_line,
+                None,
+                false,
+                Vec::new(),
+                None,
+                None,
+                Vec::new(),
+                image_slots,
+                1,
+                1024,
+                None,
+                state_unit_names,
+                crate::snapshot::time::tests::test_time_contract(),
+                crate::snapshot::time::tests::test_cpu_profile(),
+            )
+            .unwrap();
+            assert_eq!(
+                contract.microvm_abi_version,
+                openvmm_defs::microvm::MICROVM_ABI_VERSION_2
+            );
+            assert_eq!(
+                contract.microvm_image_slot_capacity,
+                if image_slots.is_some() { 4 } else { 0 }
+            );
+            assert_eq!(
+                contract.boot_active_image_slot_count,
+                image_slots.map_or(0, |slots| slots.boot_count)
+            );
+            assert_eq!(
+                contract
+                    .devices
+                    .iter()
+                    .filter(|device| device.kind == "virtio-blk-image-slot")
+                    .count(),
+                if image_slots.is_some() { 4 } else { 0 }
+            );
+        }
+    }
+
+    #[test]
+    fn abi_two_image_slots_require_canonical_metadata() {
+        let mut contract = test_machine_contract();
+        validate_microvm_image_slot_contract(&contract).unwrap();
+
+        contract.boot_active_image_slot_count = 1;
+        assert!(validate_microvm_image_slot_contract(&contract).is_err());
+        contract.microvm_image_slot_capacity =
+            openvmm_defs::microvm::MICROVM_IMAGE_SLOT_CAPACITY.into();
+        assert!(validate_microvm_image_slot_contract(&contract).is_err());
+        contract.set_effective_command_line("console=hvc0 microvm_image_slots=4".to_owned());
+        validate_microvm_image_slot_contract(&contract).unwrap();
+        assert!(platform_command_line_token_is_invariant(
+            "microvm_image_slots=4"
+        ));
+        assert!(!platform_command_line_token_is_invariant(
+            "microvm_image_slots=3"
+        ));
+
+        contract.boot_active_image_slot_count = 0;
+        assert!(validate_microvm_image_slot_contract(&contract).is_err());
+        contract.boot_active_image_slot_count = 5;
+        assert!(validate_microvm_image_slot_contract(&contract).is_err());
+        contract.boot_active_image_slot_count = 1;
+        contract.set_effective_command_line(
+            "console=hvc0 microvm_image_slots=4 microvm_image_slots=4".to_owned(),
+        );
+        assert!(validate_microvm_image_slot_contract(&contract).is_err());
+        contract.microvm_image_slot_capacity = 0;
+        assert!(validate_microvm_image_slot_contract(&contract).is_err());
     }
 
     fn microvm_console_attachment() -> SnapshotAttachment {
@@ -3563,11 +3685,16 @@ mod tests {
     fn validate_microvm_machine_contract_rejects_abi() {
         let mut manifest = test_manifest();
         let expected = test_machine_contract();
-        let mut contract = expected.clone();
-        contract.microvm_abi_version = 1;
-        manifest.machine_contract = Some(contract);
-        let err = validate_microvm_machine_contract(&manifest, &expected).unwrap_err();
-        assert!(err.to_string().contains("ABI version 1 is unsupported"));
+        for version in [1, 3] {
+            let mut contract = expected.clone();
+            contract.microvm_abi_version = version;
+            manifest.machine_contract = Some(contract);
+            let err = validate_microvm_machine_contract(&manifest, &expected).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("ABI version {version} is unsupported"))
+            );
+        }
     }
 
     #[test]

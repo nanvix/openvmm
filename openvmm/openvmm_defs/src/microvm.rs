@@ -21,11 +21,9 @@ use net_backend_resources::mac_address::MacAddress;
 use std::fmt::Write as _;
 use vmotherboard::options::BaseChipsetManifest;
 
-/// The persisted microVM ABI version.
+/// The persisted microVM ABI version, including optional image slots.
 pub const MICROVM_ABI_VERSION_2: u32 = 2;
-/// MicroVM ABI with four bind-once image slots.
-pub const MICROVM_ABI_VERSION_3: u32 = 3;
-/// Fixed image-slot capacity of microVM ABI 3.
+/// Fixed image-slot capacity when enabled.
 pub const MICROVM_IMAGE_SLOT_CAPACITY: u8 = 4;
 /// Linux memory-block granularity used for microVM restore-time expansion.
 pub const MICROVM_MEMORY_BLOCK_SIZE_BYTES: u64 = 128 * 1024 * 1024;
@@ -312,7 +310,7 @@ pub fn microvm_image_slot_name(index: u8) -> anyhow::Result<String> {
     Ok(format!("image{index}"))
 }
 
-/// Guest-visible activation contract for microVM ABI 3 image slots.
+/// Guest-visible activation contract for optional microVM image slots.
 #[derive(MeshPayload, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MicrovmImageSlotsConfig {
     /// Number of slots active on the captured cold boot.
@@ -1198,12 +1196,12 @@ fn validate_microvm_command_line(
         image_slots.validate()?;
         anyhow::ensure!(
             image_slot_count == MICROVM_IMAGE_SLOT_CAPACITY as usize,
-            "microVM ABI 3 requires exactly {MICROVM_IMAGE_SLOT_CAPACITY} image-slot transports"
+            "microVM requires exactly {MICROVM_IMAGE_SLOT_CAPACITY} configured image-slot transports"
         );
     } else {
         anyhow::ensure!(
             image_slot_count == 0,
-            "microVM ABI 2 does not permit image-slot transports"
+            "microVM does not permit image-slot transports without image-slot configuration"
         );
     }
     anyhow::ensure!(
@@ -1549,7 +1547,7 @@ pub struct MicrovmConfig {
     pub filesystems: Vec<MicrovmFilesystemConfig>,
     /// Stable sandbox block-device roles in virtio-blk device order.
     pub sandbox_blocks: Vec<MicrovmSandboxBlockConfig>,
-    /// Fixed-capacity image slots, when ABI 3 is selected.
+    /// Optional fixed-capacity image slots within microVM ABI 2.
     pub image_slots: Option<MicrovmImageSlotsConfig>,
     /// Whether the effective command line bootstraps every attached microVM
     /// filesystem.
