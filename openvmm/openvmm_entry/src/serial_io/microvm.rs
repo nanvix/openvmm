@@ -18,6 +18,12 @@ use vm_resource::kind::SerialBackendHandle;
 
 #[cfg(target_os = "linux")]
 pub fn bind_control_serial(path: &Path) -> io::Result<Resource<SerialBackendHandle>> {
+    Ok(bind_control_endpoint(path)?.into_resource())
+}
+
+/// Binds an owned, private Unix socket for a control endpoint.
+#[cfg(target_os = "linux")]
+pub fn bind_control_endpoint(path: &Path) -> io::Result<OpenSocketSerialConfig> {
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
@@ -69,11 +75,19 @@ pub fn bind_control_serial(path: &Path) -> io::Result<Resource<SerialBackendHand
         }
         return Err(error);
     }
-    Ok(OpenSocketSerialConfig::from(listener).into_resource())
+    Ok(OpenSocketSerialConfig::from(listener))
 }
 
 #[cfg(windows)]
 pub fn bind_control_serial(path: &Path) -> io::Result<Resource<SerialBackendHandle>> {
+    Ok(bind_control_endpoint(path)?.into_resource())
+}
+
+/// Creates a protected named pipe for a control endpoint.
+#[cfg(windows)]
+pub fn bind_control_endpoint(
+    path: &Path,
+) -> io::Result<serial_socket::windows::OpenWindowsPipeSerialConfig> {
     use pal::windows::security::LocalSecurityDescriptor;
     use serial_socket::windows::OpenWindowsPipeSerialConfig;
 
@@ -104,7 +118,7 @@ pub fn bind_control_serial(path: &Path) -> io::Result<Resource<SerialBackendHand
         pal::windows::pipe::PipeMode::Byte,
         &descriptor,
     )?;
-    Ok(OpenWindowsPipeSerialConfig::from(pipe).into_resource())
+    Ok(OpenWindowsPipeSerialConfig::from(pipe))
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]

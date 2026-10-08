@@ -5,6 +5,7 @@
 
 use chipset_resources::microvm::MicrovmSnapshotBoundaryRequest;
 use mesh::error::RemoteError;
+use openvmm_defs::rpc::MicrovmHostPauseError;
 use openvmm_defs::rpc::PulseSaveRestoreError;
 use openvmm_defs::rpc::VmRpc;
 
@@ -35,7 +36,11 @@ pub(super) fn filter(message: VmRpc, boundary_active: bool) -> Option<VmRpc> {
         message @ (VmRpc::QuiesceForSnapshot(_)
         | VmRpc::ResumeAfterFailedSnapshot(_)
         | VmRpc::ReleaseSnapshotBoundary(_)
-        | VmRpc::ReadMemory(_)) => return Some(message),
+        | VmRpc::ReadMemory(_)
+        | VmRpc::MicrovmRunState(_)) => return Some(message),
+        VmRpc::MicrovmPause(rpc) | VmRpc::MicrovmResume(rpc) => {
+            rpc.complete(Err(MicrovmHostPauseError::Busy))
+        }
         VmRpc::Save(rpc) => rpc.fail(SnapshotBoundaryActive),
         VmRpc::Resume(rpc) => rpc.fail(SnapshotBoundaryActive),
         VmRpc::Reset(rpc) => rpc.fail(SnapshotBoundaryActive),
@@ -166,9 +171,45 @@ mod tests {
             VmRpc::Reset(Rpc::detached(())),
             VmRpc::Resume(Rpc::detached(())),
             VmRpc::Pause(Rpc::detached(())),
+            VmRpc::MicrovmPause(Rpc::detached(())),
+            VmRpc::MicrovmResume(Rpc::detached(())),
+            VmRpc::MicrovmRunState(Rpc::detached(())),
         ] {
             assert!(filter(message, false).is_some());
         }
+    }
+
+    #[test]
+    fn host_pause_is_busy_during_boundary_but_run_state_reaches_dispatch() {
+        use openvmm_defs::rpc::MicrovmHostPauseError;
+        use openvmm_defs::rpc::MicrovmRunState;
+        use openvmm_defs::rpc::MicrovmRunStatus;
+
+        let (send, mut recv) = mesh::channel();
+        let pause = send.call(VmRpc::MicrovmPause, ());
+        let resume = send.call(VmRpc::MicrovmResume, ());
+        for _ in 0..2 {
+            assert!(filter(recv.try_recv().unwrap(), true).is_none());
+        }
+        for result in [block_on(pause), block_on(resume)] {
+            assert!(matches!(result.unwrap(), Err(MicrovmHostPauseError::Busy)));
+        }
+
+        let status = send.call(VmRpc::MicrovmRunState, ());
+        let Some(VmRpc::MicrovmRunState(rpc)) = filter(recv.try_recv().unwrap(), true) else {
+            panic!("run state was blocked during the boundary");
+        };
+        rpc.complete(MicrovmRunStatus {
+            state: MicrovmRunState::Busy,
+            transitions: 3,
+        });
+        assert_eq!(
+            block_on(status).unwrap(),
+            MicrovmRunStatus {
+                state: MicrovmRunState::Busy,
+                transitions: 3,
+            }
+        );
     }
 
     #[test]

@@ -443,6 +443,15 @@ impl VmController {
                     );
                     return GuestSnapshotAction::Terminate { exit_code: 1 };
                 }
+                if let Some(cleanup) = self.microvm.resources.state_control_socket_cleanup.take()
+                    && let Err(error) = cleanup.remove_if_owned()
+                {
+                    tracing::error!(
+                        error = error.as_ref() as &dyn std::error::Error,
+                        "snapshot committed but the source state-control socket could not be removed"
+                    );
+                    return GuestSnapshotAction::Terminate { exit_code: 1 };
+                }
                 tracing::info!(
                     path = %destination.display(),
                     "microVM snapshot committed; terminating source process"
@@ -468,6 +477,15 @@ impl VmController {
                         tracing::error!(
                             error = cleanup_error.as_ref() as &dyn std::error::Error,
                             "committed snapshot control console socket could not be removed"
+                        );
+                    }
+                    if let Some(cleanup) =
+                        self.microvm.resources.state_control_socket_cleanup.take()
+                        && let Err(cleanup_error) = cleanup.remove_if_owned()
+                    {
+                        tracing::error!(
+                            error = cleanup_error.as_ref() as &dyn std::error::Error,
+                            "committed snapshot state-control socket could not be removed"
                         );
                     }
                     tracing::error!(

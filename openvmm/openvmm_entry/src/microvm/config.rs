@@ -22,6 +22,8 @@ use super::output::MicrovmOutputDrain;
 use super::output::OutputCompletion;
 use super::output::spawn_output;
 use super::restore::fresh_microvm_generation_id;
+use super::state_control::StateControlConfig;
+use super::state_control::StateControlEndpoint;
 use crate::ConsoleState;
 use crate::Options;
 use crate::VmResources;
@@ -75,6 +77,7 @@ pub(crate) struct MicrovmConfigBuilder<'a> {
     control_console: Option<ConsoleEndpoint>,
     control_broker_config: Option<VirtioControlConsoleBrokerConfig>,
     control_console_backend: Option<Resource<SerialBackendHandle>>,
+    state_control: Option<StateControlConfig>,
     portb: Option<(Resource<SerialBackendHandle>, OutputCompletion)>,
     resources: MicrovmResources,
 }
@@ -162,6 +165,27 @@ impl<'a> MicrovmConfigBuilder<'a> {
             .as_ref()
             .map(|(endpoint, _, _)| microvm_control_broker_config(opt, endpoint))
             .transpose()?;
+        let state_control = match (&opt.microvm.microvm_state_control, &control_console) {
+            (None, _) => None,
+            (Some(SerialConfigCli::Pipe(path)), Some((SerialConfigCli::Pipe(control), _, _))) => {
+                anyhow::ensure!(
+                    path != control
+                        && !matches!(
+                            console.as_ref(),
+                            Some((SerialConfigCli::Pipe(boot), _, _)) if boot == path
+                        ),
+                    "microVM state control requires its own endpoint"
+                );
+                let broker = control_broker_config
+                    .as_ref()
+                    .context("microVM state control requires the control-console broker")?;
+                Some(StateControlConfig::new(path.clone(), broker))
+            }
+            (Some(SerialConfigCli::Pipe(_)), _) => {
+                bail!("microVM state control requires a live --microvm-control-console")
+            }
+            (Some(_), _) => bail!("microVM state control requires listen=..."),
+        };
         anyhow::ensure!(
             control_console.is_none() || console.is_some(),
             "microVM control console requires the boot virtio-console"
@@ -223,6 +247,7 @@ impl<'a> MicrovmConfigBuilder<'a> {
             control_console,
             control_broker_config,
             control_console_backend: None,
+            state_control,
             portb: None,
             resources,
         })
@@ -356,6 +381,11 @@ impl<'a> MicrovmConfigBuilder<'a> {
                 SerialConfigCli::None => Some(DisconnectedSerialBackendHandle.into_resource()),
                 _ => unreachable!("microVM control console backend was validated"),
             };
+        }
+        if let Some(config) = self.state_control.take() {
+            let path = config.path().to_owned();
+            self.resources.state_control = Some(StateControlEndpoint::bind(config, serial_driver)?);
+            self.resources.state_control_socket_cleanup = microvm_console_socket_cleanup(path)?;
         }
         Ok(virtio_console_backend)
     }

@@ -11,6 +11,7 @@ mod network;
 pub(crate) mod output;
 pub(crate) mod report;
 mod restore;
+mod state_control;
 mod verify;
 
 pub(crate) use config::MicrovmConfigBuilder;
@@ -49,6 +50,7 @@ pub(crate) use restore::prepare_restore;
 #[cfg(any(feature = "ttrpc", feature = "grpc"))]
 pub(crate) use restore::restore_packet_base;
 pub(crate) use restore::validate_restore_contract;
+pub(crate) use state_control::StateControlEndpoint;
 pub(crate) use verify::fatal_error_message;
 pub(crate) use verify::report_time_abi_verification;
 
@@ -77,6 +79,10 @@ pub(crate) struct MicrovmResources {
     pub(crate) control_console_attachment: Option<SnapshotAttachment>,
     /// Removes the control console Unix socket on teardown.
     pub(crate) control_console_socket_cleanup: Option<MicrovmConsoleSocketCleanup>,
+    /// The bound host state-control endpoint, until it is served.
+    pub(crate) state_control: Option<StateControlEndpoint>,
+    /// Removes the state-control Unix socket on teardown.
+    pub(crate) state_control_socket_cleanup: Option<MicrovmConsoleSocketCleanup>,
     /// Snapshot identity of the portable network attachment.
     pub(crate) network_attachment: Option<SnapshotAttachment>,
     /// The bound run-scoped egress policy.

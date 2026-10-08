@@ -29,6 +29,15 @@ pub enum VmRpc {
     ReleaseSnapshotBoundary(FailableRpc<(), ()>),
     Resume(FailableRpc<(), bool>),
     Pause(Rpc<(), bool>),
+    /// Pause a running microVM for its host while holding guest time, so the
+    /// guest observes no elapsed time across the pause. Returns `false` if the
+    /// host already paused it.
+    MicrovmPause(Rpc<(), Result<bool, MicrovmHostPauseError>>),
+    /// Resume a microVM that its host paused, restoring the held guest time.
+    /// Returns `false` if the VM is already running.
+    MicrovmResume(Rpc<(), Result<bool, MicrovmHostPauseError>>),
+    /// Report the host-visible run state of the VM.
+    MicrovmRunState(Rpc<(), MicrovmRunStatus>),
     ClearHalt(Rpc<(), bool>),
     Reset(FailableRpc<(), ()>),
     Nmi(Rpc<u32, ()>),
@@ -88,6 +97,48 @@ pub enum SnapshotQuiesceError {
     Uncertain(#[source] RemoteError),
 }
 
+/// Host-visible run state of a microVM.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, MeshPayload)]
+pub enum MicrovmRunState {
+    /// The guest is running.
+    Running,
+    /// The host paused the guest with [`VmRpc::MicrovmPause`] and holds its
+    /// time until [`VmRpc::MicrovmResume`].
+    Paused,
+    /// The VM is stopped for another reason, such as before its first start.
+    Stopped,
+    /// A snapshot boundary or post-restore gate is active. Host pause is
+    /// unavailable until it ends.
+    Busy,
+}
+
+/// The run state of a VM and the number of times it entered or left the
+/// host-paused state since it was launched.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, MeshPayload)]
+pub struct MicrovmRunStatus {
+    /// The run state.
+    pub state: MicrovmRunState,
+    /// How many times the VM entered or left the host-paused state. It is odd
+    /// exactly while the host holds a pause.
+    pub transitions: u64,
+}
+
+/// Failure of a [`VmRpc::MicrovmPause`] or [`VmRpc::MicrovmResume`] request.
+#[derive(Debug, MeshPayload, thiserror::Error)]
+pub enum MicrovmHostPauseError {
+    /// A snapshot boundary or post-restore gate is active. The VM is unchanged.
+    #[error("host pause is unavailable while a snapshot boundary or restore gate is active")]
+    Busy,
+    /// The request was rejected and the VM keeps its run state, apart from a
+    /// brief vCPU stop when a pause is rejected after the vCPUs stopped.
+    #[error("the request was rejected and the VM keeps its run state")]
+    Rejected(#[source] RemoteError),
+    /// The VM could not start again. Its state is uncertain and it must be
+    /// torn down.
+    #[error("the VM could not start again and its state is uncertain")]
+    Uncertain(#[source] RemoteError),
+}
+
 #[derive(Debug, MeshPayload, thiserror::Error)]
 pub enum PulseSaveRestoreError {
     #[error("reset not supported")]
@@ -114,6 +165,9 @@ impl fmt::Debug for VmRpc {
             VmRpc::ReleaseSnapshotBoundary(_) => "ReleaseSnapshotBoundary",
             VmRpc::Resume(_) => "Resume",
             VmRpc::Pause(_) => "Pause",
+            VmRpc::MicrovmPause(_) => "MicrovmPause",
+            VmRpc::MicrovmResume(_) => "MicrovmResume",
+            VmRpc::MicrovmRunState(_) => "MicrovmRunState",
             VmRpc::ClearHalt(_) => "ClearHalt",
             VmRpc::Nmi(_) => "Nmi",
             VmRpc::AddVmbusDevice(_) => "AddVmbusDevice",

@@ -179,6 +179,12 @@ impl MicrovmLaunch {
         self.resources.restore_packet_selected.take()
     }
 
+    /// Takes the bound host state-control endpoint, to serve it once the VM
+    /// worker runs.
+    pub(crate) fn take_state_control(&mut self) -> Option<super::StateControlEndpoint> {
+        self.resources.state_control.take()
+    }
+
     /// Creates the channels that carry guest-requested snapshot boundaries from
     /// the VM worker to the VM controller.
     pub(crate) fn snapshot_channels(
