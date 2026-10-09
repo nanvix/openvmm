@@ -11,6 +11,7 @@
 #![expect(unsafe_code)]
 
 mod ioctl;
+pub use ioctl::query_block_device_size_in_bytes;
 mod nvme;
 pub mod resolver;
 
@@ -314,7 +315,7 @@ impl BlockDevice {
                 break Ok(());
             }
 
-            let size_in_bytes = ioctl::query_block_device_size_in_bytes(&self.file)?;
+            let size_in_bytes = query_block_device_size_in_bytes(&self.file)?;
 
             let new_sector_count = size_in_bytes / self.sector_size as u64;
             let original_sector_count = self.sector_count.load(Ordering::SeqCst);

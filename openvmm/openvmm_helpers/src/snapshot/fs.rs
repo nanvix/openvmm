@@ -1122,7 +1122,7 @@ pub(super) fn read_bounded_open_file(
     Ok(bytes)
 }
 
-/// Computes SHA-256 over an exact-length regular file handle.
+/// Computes SHA-256 over an exact-length file or prevalidated read-only block handle.
 pub fn file_sha256(
     file: &std::fs::File,
     expected_length: u64,
@@ -1133,14 +1133,23 @@ pub fn file_sha256(
         .with_context(|| format!("failed to duplicate {description} handle"))?;
     file.seek(SeekFrom::Start(0))
         .with_context(|| format!("failed to rewind {description}"))?;
-    let actual_length = file
+    let metadata = file
         .metadata()
-        .with_context(|| format!("failed to inspect {description}"))?
-        .len();
-    anyhow::ensure!(
-        actual_length == expected_length,
-        "{description} size ({actual_length} bytes) doesn't match expected ({expected_length} bytes)"
-    );
+        .with_context(|| format!("failed to inspect {description}"))?;
+    #[cfg(target_os = "linux")]
+    let block_device = {
+        use std::os::unix::fs::FileTypeExt;
+        metadata.file_type().is_block_device()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let block_device = false;
+    if !block_device {
+        let actual_length = metadata.len();
+        anyhow::ensure!(
+            actual_length == expected_length,
+            "{description} size ({actual_length} bytes) doesn't match expected ({expected_length} bytes)"
+        );
+    }
     let mut digest = sha2::Sha256::new();
     let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
     let mut total = 0_u64;
