@@ -788,7 +788,8 @@ message MicrovmSnapshotConfig {
     uint64 restore_memory_bytes = 9;
     // Declare the fixed four-slot microVM ABI 2 topology on a cold boot.
     bool image_slots = 10;
-    // Cold-boot active image-slot count. Zero selects one when image_slots is true.
+    // Cold-boot active image-slot count. Zero selects one when image_slots is
+    // true; a nonzero count requires image_slots.
     uint32 image_slot_boot_count = 11;
     // Restore active image-slot count. Zero preserves the captured boot count.
     uint32 restore_image_slot_count = 12;

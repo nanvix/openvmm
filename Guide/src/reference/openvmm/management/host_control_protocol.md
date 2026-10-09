@@ -15,7 +15,10 @@ argv or the environment.
 After connecting, the client writes the raw 32-byte capability. Authentication
 must complete within the configured control-auth timeout. Requests and
 responses then use a little-endian `u32` byte length followed by UTF-8 JSON.
-Frames are limited to 64 KiB, and an idle connection closes after 60 seconds.
+Frames in both directions are limited to 64 KiB; a response that would exceed
+the limit is replaced by a `response_too_large` error. A connection closes
+after 60 seconds without a new request or while a request frame is incomplete.
+The management RPC never logs the capability.
 Every request contains `version: 1`, a caller-selected `request_id`, and an
 `operation`. Responses repeat the protocol version and request ID and contain
 either `status: "ok"` or a stable error code and message.

@@ -64,6 +64,25 @@ struct RestoredFilesystem {
     attachment: openvmm_helpers::snapshot::microvm::SnapshotAttachment,
 }
 
+/// Formats a create request without its host-control capability, which
+/// authenticates a host-only endpoint and must never reach logs.
+pub(super) struct RedactedCreateVmRequest<'a>(pub(super) &'a vmservice::CreateVmRequest);
+
+impl std::fmt::Debug for RedactedCreateVmRequest<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut request = self.0.clone();
+        let redacted = request
+            .microvm_snapshot
+            .as_mut()
+            .is_some_and(|config| !std::mem::take(&mut config.host_control_capability).is_empty());
+        std::fmt::Debug::fmt(&request, f)?;
+        if redacted {
+            f.write_str(" (host_control_capability redacted)")?;
+        }
+        Ok(())
+    }
+}
+
 /// MicroVM state accumulated while a management-RPC VM is being created.
 pub(super) struct CreateVm {
     active: bool,
@@ -135,6 +154,10 @@ impl CreateVm {
             (restore_processor_count != 0).then_some(restore_processor_count);
         let image_slot_boot_count = u8::try_from(image_slot_boot_count)
             .context("image_slot_boot_count does not fit in u8")?;
+        anyhow::ensure!(
+            image_slots || image_slot_boot_count == 0,
+            "image_slot_boot_count requires image_slots"
+        );
         let restore_active_image_slot_count = (restore_image_slot_count != 0)
             .then(|| u8::try_from(restore_image_slot_count))
             .transpose()
@@ -1791,5 +1814,47 @@ mod tests {
                 processor_count
             ));
         }
+    }
+
+    #[test]
+    fn create_request_debug_redacts_the_host_control_capability() {
+        let request = vmservice::CreateVmRequest {
+            microvm_snapshot: Some(vmservice::MicrovmSnapshotConfig {
+                host_control_path: "host-control".to_owned(),
+                host_control_capability: vec![0x5a; 32],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let capability = format!("{:?}", vec![0x5a_u8; 32]);
+        assert!(format!("{request:?}").contains(&capability));
+        let redacted = format!("{:?}", RedactedCreateVmRequest(&request));
+        assert!(!redacted.contains(&capability));
+        assert!(redacted.contains("host-control"));
+        assert!(redacted.contains("host_control_capability redacted"));
+
+        let request = vmservice::CreateVmRequest::default();
+        assert_eq!(
+            format!("{:?}", RedactedCreateVmRequest(&request)),
+            format!("{request:?}")
+        );
+    }
+
+    #[test]
+    fn image_slot_boot_count_requires_image_slots() {
+        let error = CreateVm::new(vmservice::CreateVmRequest {
+            microvm_snapshot: Some(vmservice::MicrovmSnapshotConfig {
+                image_slot_boot_count: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .err()
+        .expect("a boot count without image slots must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("image_slot_boot_count requires image_slots")
+        );
     }
 }

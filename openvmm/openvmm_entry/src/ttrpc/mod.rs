@@ -729,7 +729,12 @@ enum HandleAction {
 
 impl VmService {
     async fn handle(&mut self, ctx: mesh::CancelContext, request: vmservice::Vm) -> HandleAction {
-        tracing::debug!(?request, "request");
+        if let vmservice::Vm::CreateVm(create, _) = &request {
+            let request = microvm::RedactedCreateVmRequest(create);
+            tracing::debug!(?request, "create VM request");
+        } else {
+            tracing::debug!(?request, "request");
+        }
         match request {
             vmservice::Vm::CreateVm(request, response) => {
                 response.send(map_grpc(self.create_vm(request).await))

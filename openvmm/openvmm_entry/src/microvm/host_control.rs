@@ -175,19 +175,14 @@ impl MicrovmHostControlServer {
             (1..=MAX_FRAME_SIZE).contains(&length),
             "host-control frame length is invalid"
         );
-        let mut payload = vec![0; length];
-        self.io
-            .read_exact(&mut payload)
-            .await
-            .context("failed to read host-control frame")?;
+        let payload = read_frame_payload(&mut self.io, length, IDLE_TIMEOUT).await?;
         serde_json::from_slice(&payload)
             .map(Some)
             .context("host-control request is invalid JSON")
     }
 
     async fn write_response(&mut self, response: &Response) -> anyhow::Result<()> {
-        let payload =
-            serde_json::to_vec(response).context("failed to encode host-control response")?;
+        let payload = encode_response(response)?;
         let length = u32::try_from(payload.len()).context("host-control response is too large")?;
         self.io
             .write_all(&length.to_le_bytes())
@@ -374,6 +369,41 @@ async fn read_frame_length(
     Ok(Some(u32::from_le_bytes(length)))
 }
 
+/// Reads a frame payload. A peer that stalls inside a frame is treated like an idle
+/// peer, so it cannot hold the single-connection endpoint.
+async fn read_frame_payload(
+    io: &mut (impl futures::AsyncRead + Unpin),
+    length: usize,
+    timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    let mut payload = vec![0; length];
+    CancelContext::new()
+        .with_timeout(timeout)
+        .until_cancelled(io.read_exact(&mut payload))
+        .await
+        .context("host-control frame stalled")?
+        .context("failed to read host-control frame")?;
+    Ok(payload)
+}
+
+/// Encodes a response within the frame limit. Error messages can echo request
+/// input, so a response that would exceed the limit becomes a bounded error.
+fn encode_response(response: &Response) -> anyhow::Result<Vec<u8>> {
+    let payload = serde_json::to_vec(response).context("failed to encode host-control response")?;
+    if payload.len() <= MAX_FRAME_SIZE {
+        return Ok(payload);
+    }
+    serde_json::to_vec(&Response {
+        version: PROTOCOL_VERSION,
+        request_id: response.request_id,
+        result: ResponseResult::Error {
+            code: "response_too_large",
+            message: format!("host-control response exceeds the {MAX_FRAME_SIZE}-byte frame limit"),
+        },
+    })
+    .context("failed to encode host-control response")
+}
+
 fn open_read_only_media(path: &Path) -> anyhow::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -412,9 +442,76 @@ fn open_read_only_media(path: &Path) -> anyhow::Result<std::fs::File> {
 
 #[cfg(test)]
 mod tests {
+    use super::IDLE_TIMEOUT;
+    use super::MAX_FRAME_SIZE;
+    use super::PROTOCOL_VERSION;
+    use super::Response;
+    use super::ResponseResult;
+    use super::encode_response;
     use super::read_frame_length;
+    use super::read_frame_payload;
     use futures::executor::block_on;
     use futures::io::Cursor;
+    use std::pin::Pin;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::time::Duration;
+
+    fn error_response(request_id: u64, message: String) -> Response {
+        Response {
+            version: PROTOCOL_VERSION,
+            request_id,
+            result: ResponseResult::Error {
+                code: "invalid_media",
+                message,
+            },
+        }
+    }
+
+    #[test]
+    fn oversized_responses_become_bounded_errors() {
+        let payload = encode_response(&error_response(7, "x".repeat(MAX_FRAME_SIZE))).unwrap();
+        assert!(payload.len() <= MAX_FRAME_SIZE);
+        let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(value["request_id"], 7);
+        assert_eq!(value["status"], "error");
+        assert_eq!(value["code"], "response_too_large");
+
+        let payload = encode_response(&error_response(8, "short".to_owned())).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(value["request_id"], 8);
+        assert_eq!(value["code"], "invalid_media");
+        assert_eq!(value["message"], "short");
+    }
+
+    #[test]
+    fn stalled_frame_payload_times_out() {
+        struct Stalled;
+
+        impl futures::AsyncRead for Stalled {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut [u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Pending
+            }
+        }
+
+        let error = block_on(read_frame_payload(
+            &mut Stalled,
+            4,
+            Duration::from_millis(10),
+        ))
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("host-control frame stalled"));
+
+        let mut io = Cursor::new(b"{}".to_vec());
+        assert_eq!(
+            block_on(read_frame_payload(&mut io, 2, IDLE_TIMEOUT)).unwrap(),
+            b"{}"
+        );
+    }
 
     #[test]
     fn close_at_frame_boundary_ends_the_session() {
