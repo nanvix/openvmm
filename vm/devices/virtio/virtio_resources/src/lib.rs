@@ -118,6 +118,8 @@ pub mod rng {
 
 pub mod blk {
     use mesh::MeshPayload;
+    use mesh::rpc::Rpc;
+    use std::fs::File;
     use vm_resource::Resource;
     use vm_resource::ResourceId;
     use vm_resource::kind::DiskHandleKind;
@@ -131,6 +133,47 @@ pub mod blk {
 
     impl ResourceId<VirtioDeviceHandle> for VirtioBlkHandle {
         const ID: &'static str = "virtio-blk";
+    }
+
+    #[derive(Debug, MeshPayload)]
+    pub struct BindImageSlotRequest {
+        pub media: File,
+        pub identity: String,
+        pub length: u64,
+        pub logical_block_size: u32,
+        pub physical_block_size: u32,
+    }
+
+    #[derive(Clone, Debug, MeshPayload, PartialEq, Eq)]
+    pub struct ImageSlotState {
+        pub identity: Option<String>,
+        pub capacity_sectors: u64,
+    }
+
+    #[derive(Clone, Debug, MeshPayload, thiserror::Error, PartialEq, Eq)]
+    pub enum BindImageSlotError {
+        #[error("image slot is already bound to a different identity")]
+        AlreadyBound,
+        #[error("image slot media geometry does not match the slot")]
+        GeometryMismatch,
+        #[error("image slot media is invalid: {0}")]
+        InvalidMedia(String),
+    }
+
+    #[derive(MeshPayload)]
+    pub enum ImageSlotRequest {
+        Bind(Rpc<BindImageSlotRequest, Result<ImageSlotState, BindImageSlotError>>),
+        Query(Rpc<(), ImageSlotState>),
+    }
+
+    #[derive(MeshPayload)]
+    pub struct VirtioBlkImageSlotHandle {
+        pub active: bool,
+        pub requests: mesh::Receiver<ImageSlotRequest>,
+    }
+
+    impl ResourceId<VirtioDeviceHandle> for VirtioBlkImageSlotHandle {
+        const ID: &'static str = "virtio-blk-image-slot";
     }
 }
 

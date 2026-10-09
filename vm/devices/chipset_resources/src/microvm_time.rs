@@ -35,8 +35,15 @@ pub const FLAG_MEMORY_TARGET: u8 = 1 << 1;
 pub const FLAG_ACK_REQUIRED: u8 = 1 << 2;
 /// A test hook altered time ABI behavior.
 pub const FLAG_TEST_HOOKS: u8 = 1 << 3;
-const RESTORE_PACKET_FLAGS: u8 =
-    FLAG_DOWNTIME_UTC | FLAG_MEMORY_TARGET | FLAG_ACK_REQUIRED | FLAG_TEST_HOOKS;
+/// An image-slot target occupies header byte 7.
+pub const FLAG_IMAGE_SLOT_TARGET: u8 = 1 << 4;
+const RESTORE_PACKET_FLAGS: u8 = FLAG_DOWNTIME_UTC
+    | FLAG_MEMORY_TARGET
+    | FLAG_ACK_REQUIRED
+    | FLAG_TEST_HOOKS
+    | FLAG_IMAGE_SLOT_TARGET;
+/// The largest image-slot target.
+pub const MAX_IMAGE_SLOT_TARGET: u8 = 4;
 
 /// The portb selector of the restore packet.
 pub const RESTORE_PACKET_SELECT: u8 = 0xa5;
@@ -71,6 +78,12 @@ pub enum RestorePacketError {
     /// The online VP target is not 0, 1, 2, 4, or 8.
     #[error("invalid online VP target {0}")]
     OnlineVpCount(u8),
+    /// The image-slot target is above [`MAX_IMAGE_SLOT_TARGET`].
+    #[error("invalid image-slot target {0}")]
+    ImageSlotTarget(u8),
+    /// An image-slot target without [`FLAG_ACK_REQUIRED`].
+    #[error("image-slot target {0} requires an acknowledgement")]
+    ImageSlotTargetUnacknowledged(u8),
     /// Memory ranges without a memory target, or too many ranges.
     #[error("invalid memory range count {0}")]
     MemoryRanges(usize),
@@ -104,6 +117,9 @@ pub struct RestoreMemoryRange {
 pub struct RestorePacketBase {
     /// The online VP target: 0 for none, else 1, 2, 4, or 8.
     pub online_vp_count: u8,
+    /// The active image-slot target: 0 for none, else 1 to
+    /// [`MAX_IMAGE_SLOT_TARGET`].
+    pub image_slot_target: u8,
     /// Whether an explicit RAM target was requested.
     pub memory_target: bool,
     /// Whether the guest must acknowledge through port `0x605`.
@@ -121,6 +137,15 @@ impl RestorePacketBase {
     pub fn validate(&self) -> Result<(), RestorePacketError> {
         if !VALID_ONLINE_VP_COUNTS.contains(&self.online_vp_count) {
             return Err(RestorePacketError::OnlineVpCount(self.online_vp_count));
+        }
+        if self.image_slot_target > MAX_IMAGE_SLOT_TARGET {
+            return Err(RestorePacketError::ImageSlotTarget(self.image_slot_target));
+        }
+        // The guest verifies the active prefix before it acknowledges.
+        if self.image_slot_target != 0 && !self.ack_required {
+            return Err(RestorePacketError::ImageSlotTargetUnacknowledged(
+                self.image_slot_target,
+            ));
         }
         if self.ranges.len() > MAX_RESTORE_RANGES
             || (!self.memory_target && !self.ranges.is_empty())
@@ -178,6 +203,7 @@ impl RestorePacketV4 {
             (self.base.memory_target, FLAG_MEMORY_TARGET),
             (self.base.ack_required, FLAG_ACK_REQUIRED),
             (self.time.test_hooks, FLAG_TEST_HOOKS),
+            (self.base.image_slot_target != 0, FLAG_IMAGE_SLOT_TARGET),
         ] {
             if set {
                 flags |= flag;
@@ -190,7 +216,7 @@ impl RestorePacketV4 {
             flags,
             self.base.online_vp_count,
             self.base.ranges.len() as u8,
-            0,
+            self.base.image_slot_target,
         ]);
         bytes.extend_from_slice(&self.base.generation.to_le_bytes());
         bytes.extend_from_slice(&self.time.rate_deviation.to_le_bytes());
@@ -218,7 +244,10 @@ impl RestorePacketV4 {
             return Err(RestorePacketError::Version(header[3]));
         }
         let flags = header[4];
-        if flags & !RESTORE_PACKET_FLAGS != 0 || header[7] != 0 {
+        // The image-slot flag and header byte 7 must agree.
+        if flags & !RESTORE_PACKET_FLAGS != 0
+            || (flags & FLAG_IMAGE_SLOT_TARGET != 0) != (header[7] != 0)
+        {
             return Err(RestorePacketError::Reserved);
         }
         let range_count = usize::from(header[6]);
@@ -247,6 +276,7 @@ impl RestorePacketV4 {
         let packet = Self {
             base: RestorePacketBase {
                 online_vp_count: header[5],
+                image_slot_target: header[7],
                 memory_target: flags & FLAG_MEMORY_TARGET != 0,
                 ack_required: flags & FLAG_ACK_REQUIRED != 0,
                 generation: u32_at(8),
@@ -327,6 +357,7 @@ mod tests {
         RestorePacketV4 {
             base: RestorePacketBase {
                 online_vp_count: 2,
+                image_slot_target: 0,
                 memory_target: false,
                 ack_required: true,
                 generation: 7,
@@ -347,6 +378,7 @@ mod tests {
         RestorePacketV4 {
             base: RestorePacketBase {
                 online_vp_count: 0,
+                image_slot_target: 0,
                 memory_target: true,
                 ack_required: false,
                 generation: 1,
@@ -411,6 +443,36 @@ mod tests {
     }
 
     #[test]
+    fn golden_packet_with_image_slot_target() {
+        let mut packet = packet_without_ranges();
+        packet.base.image_slot_target = 3;
+        let mut expected = vec![
+            b'O', b'V', b'R', 4, 0x15, 2, 0, 3, // header
+            7, 0, 0, 0, // generation
+            0xfe, 0xff, 0xff, 0xff, // rate deviation
+            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // downtime
+            0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // UTC
+        ];
+        expected.extend(entropy());
+        let bytes = packet.encode().unwrap();
+        assert_eq!(bytes, expected);
+        assert_eq!(RestorePacketV4::decode(&bytes).unwrap(), packet);
+
+        let mut bytes = bytes;
+        bytes[7] = MAX_IMAGE_SLOT_TARGET + 1;
+        assert_eq!(
+            RestorePacketV4::decode(&bytes).unwrap_err(),
+            RestorePacketError::ImageSlotTarget(MAX_IMAGE_SLOT_TARGET + 1)
+        );
+        bytes[4] &= !FLAG_ACK_REQUIRED;
+        bytes[7] = 3;
+        assert_eq!(
+            RestorePacketV4::decode(&bytes).unwrap_err(),
+            RestorePacketError::ImageSlotTargetUnacknowledged(3)
+        );
+    }
+
+    #[test]
     fn decode_rejects_malformed_packets() {
         let good = packet_with_ranges().encode().unwrap();
         let mutate = |offset: usize, value: u8| {
@@ -420,6 +482,8 @@ mod tests {
         };
         assert_eq!(mutate(0, b'X'), RestorePacketError::Magic);
         assert_eq!(mutate(3, 3), RestorePacketError::Version(3));
+        assert_eq!(mutate(4, 0x2a), RestorePacketError::Reserved);
+        // An image-slot flag without a target, and a target without the flag.
         assert_eq!(mutate(4, 0x1a), RestorePacketError::Reserved);
         assert_eq!(mutate(7, 1), RestorePacketError::Reserved);
         assert_eq!(mutate(5, 3), RestorePacketError::OnlineVpCount(3));
@@ -454,6 +518,20 @@ mod tests {
         assert_eq!(
             packet.encode().unwrap_err(),
             RestorePacketError::MemoryRanges(2)
+        );
+
+        let mut packet = packet_without_ranges();
+        packet.base.image_slot_target = MAX_IMAGE_SLOT_TARGET + 1;
+        assert_eq!(
+            packet.encode().unwrap_err(),
+            RestorePacketError::ImageSlotTarget(MAX_IMAGE_SLOT_TARGET + 1)
+        );
+
+        let mut packet = packet_with_ranges();
+        packet.base.image_slot_target = 1;
+        assert_eq!(
+            packet.encode().unwrap_err(),
+            RestorePacketError::ImageSlotTargetUnacknowledged(1)
         );
 
         let mut packet = packet_without_ranges();

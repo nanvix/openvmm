@@ -6,10 +6,12 @@
 use super::MicrovmResources;
 use super::MicrovmRestore;
 use super::console::ConsoleEndpoint;
+use super::console::MicrovmControlAuthentication;
 use super::console::effective_microvm_console;
 use super::console::effective_microvm_control_console;
 use super::console::microvm_console_attachments_share_endpoint;
 use super::console::microvm_console_socket_cleanup;
+use super::console::microvm_control_authentication;
 use super::console::microvm_control_broker_config;
 use super::console::validate_microvm_console_attachment_namespace;
 use super::filesystem::EffectiveMicrovmFilesystem;
@@ -70,11 +72,14 @@ pub(crate) struct MicrovmConfigBuilder<'a> {
     network: Option<EffectiveMicrovmNetwork>,
     filesystem_slot: bool,
     filesystems: Vec<EffectiveMicrovmFilesystem>,
+    image_slots: Option<openvmm_defs::microvm::MicrovmImageSlotsConfig>,
     gateway_dns: bool,
     console: Option<ConsoleEndpoint>,
     control_console: Option<ConsoleEndpoint>,
     control_broker_config: Option<VirtioControlConsoleBrokerConfig>,
+    control_authentication: Option<MicrovmControlAuthentication>,
     control_console_backend: Option<Resource<SerialBackendHandle>>,
+    host_control: Option<super::host_control::MicrovmHostControlServer>,
     portb: Option<(Resource<SerialBackendHandle>, OutputCompletion)>,
     resources: MicrovmResources,
 }
@@ -119,6 +124,46 @@ impl<'a> MicrovmConfigBuilder<'a> {
         } else {
             Vec::new()
         };
+        let image_slots = if active {
+            if let Some(contract) = restore_machine_contract {
+                if contract.microvm_image_slot_capacity == 0 {
+                    anyhow::ensure!(
+                        opt.microvm.restore_image_slots.is_none(),
+                        "snapshot does not declare restore-time image-slot activation support"
+                    );
+                    None
+                } else {
+                    let active_count = opt
+                        .microvm
+                        .restore_image_slots
+                        .unwrap_or(contract.boot_active_image_slot_count);
+                    let config = openvmm_defs::microvm::MicrovmImageSlotsConfig {
+                        boot_count: contract.boot_active_image_slot_count,
+                        active_count,
+                    };
+                    config.validate()?;
+                    Some(config)
+                }
+            } else if opt.microvm.microvm_image_slots {
+                let boot_count = opt.microvm.microvm_image_slot_boot_count.unwrap_or(1);
+                Some(openvmm_defs::microvm::MicrovmImageSlotsConfig {
+                    boot_count,
+                    active_count: boot_count,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        anyhow::ensure!(
+            image_slots.is_none() || opt.microvm.microvm_host_control.is_some(),
+            "microVM image slots require --microvm-host-control"
+        );
+        anyhow::ensure!(
+            image_slots.is_none() || filesystems.len() <= 1,
+            "microVM image slots use the second virtio-fs slot's window; attach at most one filesystem"
+        );
         if opt.microvm.snapshot_destination.is_some() {
             for filesystem in &filesystems {
                 tracing::warn!(
@@ -157,10 +202,21 @@ impl<'a> MicrovmConfigBuilder<'a> {
         } else {
             None
         };
+        let live_control_console = control_console
+            .as_ref()
+            .is_some_and(|(config, _, _)| !matches!(config, SerialConfigCli::None));
+        let control_authentication =
+            if active && (live_control_console || opt.microvm.microvm_host_control.is_some()) {
+                Some(microvm_control_authentication(opt)?)
+            } else {
+                None
+            };
         opt.validate_control_stdin_console(console.as_ref().map(|(config, _, _)| config))?;
         let control_broker_config = control_console
             .as_ref()
-            .map(|(endpoint, _, _)| microvm_control_broker_config(opt, endpoint))
+            .map(|(endpoint, _, _)| {
+                microvm_control_broker_config(opt, endpoint, control_authentication.as_ref())
+            })
             .transpose()?;
         anyhow::ensure!(
             control_console.is_none() || console.is_some(),
@@ -218,11 +274,14 @@ impl<'a> MicrovmConfigBuilder<'a> {
             network,
             filesystem_slot,
             filesystems,
+            image_slots,
             gateway_dns,
             console,
             control_console,
             control_broker_config,
+            control_authentication,
             control_console_backend: None,
+            host_control: None,
             portb: None,
             resources,
         })
@@ -357,6 +416,19 @@ impl<'a> MicrovmConfigBuilder<'a> {
                 _ => unreachable!("microVM control console backend was validated"),
             };
         }
+        if let Some(host_control) = &self.opt.microvm.microvm_host_control {
+            let authentication = self
+                .control_authentication
+                .clone()
+                .context("microVM host control is missing shared authentication")?;
+            self.host_control = Some(super::host_control::MicrovmHostControlServer::bind(
+                &host_control.path,
+                serial_driver,
+                authentication,
+            )?);
+            self.resources.host_control_socket_cleanup =
+                microvm_console_socket_cleanup(host_control.path.clone())?;
+        }
         Ok(virtio_console_backend)
     }
 
@@ -388,6 +460,7 @@ impl<'a> MicrovmConfigBuilder<'a> {
                 )
                 .await?;
         }
+        storage.add_microvm_image_slots(self.image_slots)?;
         Ok(())
     }
 
@@ -403,9 +476,10 @@ impl<'a> MicrovmConfigBuilder<'a> {
         let (drain, output_drain) = MicrovmOutputDrain::new(Some(output_completion));
         self.resources.output_drain = Some(drain);
         let (generation_id, time_abi_restore) = if self.restore.machine_contract.is_some() {
-            let (generation_id, base) = self
-                .restore
-                .time_abi_restore_packet(opt.microvm.restore_processors)?;
+            let (generation_id, base) = self.restore.time_abi_restore_packet(
+                opt.microvm.restore_processors,
+                opt.microvm.restore_image_slots,
+            )?;
             (
                 generation_id,
                 Some(self.resources.time_abi_restore_packet(base)),
@@ -676,6 +750,10 @@ impl<'a> MicrovmConfigBuilder<'a> {
             .map(|contract| contract.microvm_filesystem.is_some())
             .unwrap_or_else(|| !microvm_filesystems.is_empty());
         cfg.microvm.filesystems = microvm_filesystems;
+        anyhow::ensure!(
+            cfg.microvm.image_slots == self.image_slots,
+            "microVM image-slot configuration changed during storage construction"
+        );
         cfg.microvm.memory_capacity = restore_machine_contract
             .and_then(|contract| {
                 (contract.memory_expansion_version != 0).then_some(contract.memory_capacity_bytes)
@@ -786,13 +864,26 @@ impl<'a> MicrovmConfigBuilder<'a> {
                 has_console,
                 has_control_console,
                 &cfg.microvm.sandbox_blocks,
+                cfg.microvm.image_slots,
             )?;
         }
         openvmm_defs::microvm::validate_machine_config(cfg, requested_hypervisor)?;
 
         let sandbox_block_sources = std::mem::take(&mut resources.microvm.sandbox_block_sources);
+        let image_slot_requests = std::mem::take(&mut resources.microvm.image_slot_requests);
+        if let Some(host_control) = self.host_control.as_mut() {
+            host_control.set_image_slots(
+                image_slot_requests.clone(),
+                self.resources.image_slot_transition.clone(),
+            );
+        }
+        self.resources.host_control = self
+            .host_control
+            .take()
+            .map(|server| std::sync::Arc::new(futures::lock::Mutex::new(server)));
         resources.microvm = MicrovmResources {
             sandbox_block_sources,
+            image_slot_requests,
             ..std::mem::take(&mut self.resources)
         };
         Ok(())

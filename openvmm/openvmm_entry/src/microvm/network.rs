@@ -215,6 +215,7 @@ pub(crate) mod tests {
             false,
             false,
             &[],
+            None,
         )
         .unwrap();
         openvmm_helpers::snapshot::microvm::microvm_machine_contract(

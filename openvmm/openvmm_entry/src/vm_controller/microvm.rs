@@ -11,6 +11,9 @@ use mesh::rpc::RpcSend;
 use openvmm_defs::rpc::SnapshotQuiesceError;
 use openvmm_defs::rpc::VmRpc;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 /// MicroVM state owned by the VM controller.
@@ -51,6 +54,8 @@ pub(crate) struct MicrovmController {
     /// Guest-visible policies of the active microVM filesystems, in virtio-fs
     /// slot order.
     pub(crate) filesystems: Vec<openvmm_defs::microvm::MicrovmFilesystemConfig>,
+    /// Fixed image-slot activation contract.
+    pub(crate) image_slots: Option<openvmm_defs::microvm::MicrovmImageSlotsConfig>,
     /// Automatic RAM backing created for snapshot capture.
     pub(crate) snapshot_memory_file: Option<tempfile::NamedTempFile>,
     /// Private copy of a paired scratch image, kept alive for the VM lifetime.
@@ -97,6 +102,34 @@ pub(super) enum GuestSnapshotAction {
     Terminate { exit_code: i32 },
 }
 
+struct ImageSlotTransitionGuard(Arc<AtomicBool>);
+
+impl Drop for ImageSlotTransitionGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+async fn ensure_image_slot_channels_empty(
+    slots: &[Option<mesh::Sender<virtio_resources::blk::ImageSlotRequest>>],
+) -> anyhow::Result<()> {
+    for (index, requests) in slots.iter().enumerate() {
+        let Some(requests) = requests else {
+            continue;
+        };
+        let state = requests
+            .call(virtio_resources::blk::ImageSlotRequest::Query, ())
+            .await
+            .with_context(|| format!("image slot {index} did not answer"))?;
+        anyhow::ensure!(
+            state.identity.is_none(),
+            "image slot {index} is bound to '{}'",
+            state.identity.as_deref().unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
 async fn guest_exit_event(
     code: i32,
     drain: Option<crate::microvm::output::MicrovmOutputDrain>,
@@ -128,12 +161,34 @@ impl VmController {
         &mut self,
         scratch_policy: chipset_resources::microvm::MicrovmSnapshotScratchPolicy,
     ) -> GuestSnapshotAction {
+        let _image_slot_guard = if self.microvm.image_slots.is_some() {
+            let transition = self.microvm.resources.image_slot_transition.clone();
+            if transition
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                tracelimit::warn_ratelimited!(
+                    "ignoring microVM snapshot request because an image-slot transition is active"
+                );
+                return self.release_snapshot_boundary_without_capture().await;
+            }
+            Some(ImageSlotTransitionGuard(transition))
+        } else {
+            None
+        };
         let Some(destination) = self.microvm.snapshot_destination.clone() else {
             tracelimit::warn_ratelimited!(
                 "ignoring microVM snapshot request because no destination is configured"
             );
             return self.release_snapshot_boundary_without_capture().await;
         };
+        if let Err(error) = self.ensure_image_slots_empty().await {
+            tracing::error!(
+                error = error.as_ref() as &dyn std::error::Error,
+                "microVM snapshot preflight rejected bound image slots; guest continues"
+            );
+            return self.release_snapshot_boundary_without_capture().await;
+        }
 
         let preflight = (|| -> anyhow::Result<()> {
             anyhow::ensure!(
@@ -310,23 +365,25 @@ impl VmController {
                     block.identity.clear();
                 }
             }
-            let machine_contract = openvmm_helpers::snapshot::microvm::microvm_machine_contract(
-                &self.microvm.source_hypervisor,
-                openvmm_helpers::snapshot::microvm::MICROVM_BOOT_LAYOUT_VERSION,
-                command_line,
-                network,
-                self.microvm.filesystem_slot,
-                filesystems,
-                self.microvm.resources.console_attachment.clone(),
-                self.microvm.resources.control_console_attachment.clone(),
-                blocks,
-                self.processors,
-                self.memory,
-                self.microvm.memory_capacity,
-                response.state_unit_names,
-                response.time.time,
-                response.time.cpu_profile,
-            )?;
+            let machine_contract =
+                openvmm_helpers::snapshot::microvm::microvm_machine_contract_with_image_slots(
+                    &self.microvm.source_hypervisor,
+                    openvmm_helpers::snapshot::microvm::MICROVM_BOOT_LAYOUT_VERSION,
+                    command_line,
+                    network,
+                    self.microvm.filesystem_slot,
+                    filesystems,
+                    self.microvm.resources.console_attachment.clone(),
+                    self.microvm.resources.control_console_attachment.clone(),
+                    blocks,
+                    self.microvm.image_slots,
+                    self.processors,
+                    self.memory,
+                    self.microvm.memory_capacity,
+                    response.state_unit_names,
+                    response.time.time,
+                    response.time.cpu_profile,
+                )?;
             let manifest = openvmm_helpers::snapshot::SnapshotManifest {
                 version: openvmm_helpers::snapshot::MANIFEST_VERSION,
                 created_at: std::time::SystemTime::now().into(),
@@ -453,6 +510,15 @@ impl VmController {
                     );
                     return GuestSnapshotAction::Terminate { exit_code: 1 };
                 }
+                if let Some(cleanup) = self.microvm.resources.host_control_socket_cleanup.take()
+                    && let Err(error) = cleanup.remove_if_owned()
+                {
+                    tracing::error!(
+                        error = error.as_ref() as &dyn std::error::Error,
+                        "snapshot committed but the source host-control socket could not be removed"
+                    );
+                    return GuestSnapshotAction::Terminate { exit_code: 1 };
+                }
                 tracing::info!(
                     path = %destination.display(),
                     "microVM snapshot committed; terminating source process"
@@ -469,6 +535,14 @@ impl VmController {
                         tracing::error!(
                             error = cleanup_error.as_ref() as &dyn std::error::Error,
                             "committed snapshot console socket could not be removed"
+                        );
+                    }
+                    if let Some(cleanup) = self.microvm.resources.host_control_socket_cleanup.take()
+                        && let Err(error) = cleanup.remove_if_owned()
+                    {
+                        tracing::error!(
+                            error = error.as_ref() as &dyn std::error::Error,
+                            "committed snapshot host-control socket could not be removed"
                         );
                     }
                     if let Some(cleanup) =
@@ -497,6 +571,10 @@ impl VmController {
                 }
             }
         }
+    }
+
+    async fn ensure_image_slots_empty(&self) -> anyhow::Result<()> {
+        ensure_image_slot_channels_empty(&self.microvm.resources.image_slot_requests).await
     }
 
     async fn rollback_failed_guest_snapshot(
@@ -580,5 +658,27 @@ mod tests {
             VmControllerEvent::ExitFailed { error }
                 if error.contains("failed to drain microVM console output")
         ));
+    }
+
+    #[test]
+    fn bound_image_slot_rejects_capture_preflight() {
+        block_on(async {
+            let (requests, mut receiver) = mesh::channel();
+            let slots = vec![Some(requests)];
+            let (result, ()) = futures::join!(ensure_image_slot_channels_empty(&slots), async {
+                match receiver.recv().await.unwrap() {
+                    virtio_resources::blk::ImageSlotRequest::Query(rpc) => {
+                        rpc.handle_sync(|()| virtio_resources::blk::ImageSlotState {
+                            identity: Some("image-a".to_owned()),
+                            capacity_sectors: 8,
+                        });
+                    }
+                    virtio_resources::blk::ImageSlotRequest::Bind(_) => {
+                        panic!("capture preflight must only query image slots")
+                    }
+                }
+            });
+            assert!(result.unwrap_err().to_string().contains("is bound"));
+        });
     }
 }

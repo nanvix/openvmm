@@ -10,10 +10,13 @@ rust-version.workspace = true
 vm_resource.workspace = true
 
 disk_backend.workspace = true
+disk_file.workspace = true
 guestmem.workspace = true
 inspect.workspace = true
 inspect_counters.workspace = true
+mesh.workspace = true
 pal_async.workspace = true
+parking_lot.workspace = true
 scsi_buffers.workspace = true
 task_control.workspace = true
 tracelimit.workspace = true
@@ -34,6 +37,7 @@ pal_async.workspace = true
 pal_event.workspace = true
 parking_lot.workspace = true
 test_with_tracing.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true
