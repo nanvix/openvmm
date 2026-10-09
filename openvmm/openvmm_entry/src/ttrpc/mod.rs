@@ -1910,6 +1910,7 @@ fn parse_nic_config(
                 Some(consomme.cidr)
             },
             static_ipv4: None,
+            static_ipv6: None,
             ports: consomme
                 .ports
                 .into_iter()
@@ -2533,6 +2534,7 @@ fn build_nic_backend(
             net_backend_resources::consomme::ConsommeHandle {
                 cidr: (!cidr.is_empty()).then_some(cidr),
                 static_ipv4: None,
+                static_ipv6: None,
                 ports: ports
                     .into_iter()
                     .map(parse_port_config)
