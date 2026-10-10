@@ -425,19 +425,7 @@ impl PartitionUnitRunner {
                 // client does not have to deal with multiple halt reasons
                 // due to race conditions.
                 if self.halt_reason.is_none() {
-                    self.halt_reason = Some(reason.clone());
-
-                    // Report the halt to the debugger.
-                    #[cfg(feature = "gdb")]
-                    let reported = self.debugger_state.report_halt_to_debugger(&reason);
-                    #[cfg(not(feature = "gdb"))]
-                    let reported = false;
-
-                    // If the debugger is not attached, then report the halt
-                    // to the client.
-                    if !reported {
-                        self.client_notify_send.send(reason);
-                    }
+                    self.record_halt(reason);
                 } else {
                     // Clear this specific halt.
                     self.vp_set.clear_halt();
@@ -465,6 +453,22 @@ impl PartitionUnitRunner {
                 self.vp_set.clear_halt();
                 self.try_start();
             }
+        }
+    }
+
+    fn record_halt(&mut self, reason: HaltReason) {
+        assert!(self.halt_reason.is_none());
+        self.halt_reason = Some(reason.clone());
+
+        // Report the halt to the debugger.
+        #[cfg(feature = "gdb")]
+        let reported = self.debugger_state.report_halt_to_debugger(&reason);
+        #[cfg(not(feature = "gdb"))]
+        let reported = false;
+
+        // If the debugger is not attached, then report the halt to the client.
+        if !reported {
+            self.client_notify_send.send(reason);
         }
     }
 
@@ -631,7 +635,6 @@ impl StateUnit for PartitionUnitRunner {
     }
 
     async fn restore(&mut self, buffer: SavedStateBlob) -> Result<(), RestoreError> {
-        // TODO: restore halted state
         self.needs_reset = true;
         self.restore(buffer.parse()?).await?;
         Ok(())
@@ -656,7 +659,8 @@ mod save_restore {
             pub(super) partition: SavedStateBlob,
             #[mesh(2)]
             pub(super) vps: Vec<Vp>,
-            // TODO: save halted state
+            #[mesh(3)]
+            pub(super) halt_reason: Option<Vec<u8>>,
         }
 
         #[derive(Protobuf)]
@@ -680,12 +684,31 @@ mod save_restore {
                     data,
                 })
                 .collect();
+            let halt_reason = self.halt_reason.clone().map(mesh::payload::encode);
 
-            Ok(state::Partition { partition, vps })
+            Ok(state::Partition {
+                partition,
+                vps,
+                halt_reason,
+            })
         }
 
         pub async fn restore(&mut self, state: state::Partition) -> Result<(), RestoreError> {
-            let state::Partition { partition, vps } = state;
+            let state::Partition {
+                partition,
+                vps,
+                halt_reason,
+            } = state;
+            let halt_reason = halt_reason
+                .as_deref()
+                .map(mesh::payload::decode)
+                .transpose()?;
+            if self.halt_reason.is_some() {
+                return Err(RestoreError::Other(anyhow::anyhow!(
+                    "cannot restore over an existing partition halt"
+                )));
+            }
+            self.vp_set.validate_restore_halt()?;
             self.partition.restore(partition)?;
             let vps = vps
                 .into_iter()
@@ -700,7 +723,48 @@ mod save_restore {
                 })
                 .collect::<Result<Vec<_>, RestoreError>>()?;
             self.vp_set.restore(vps).await?;
+            self.vp_set.restore_halt(halt_reason.is_some())?;
+            if let Some(reason) = halt_reason {
+                self.record_halt(reason);
+            }
             Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::state;
+        use vmcore::save_restore::NoSavedState;
+        use vmcore::save_restore::SavedStateBlob;
+        use vmm_core_defs::HaltReason;
+
+        fn encoded_partition(halt_reason: Option<HaltReason>) -> SavedStateBlob {
+            SavedStateBlob::new(state::Partition {
+                partition: SavedStateBlob::new(NoSavedState),
+                vps: Vec::new(),
+                halt_reason: halt_reason.map(mesh::payload::encode),
+            })
+        }
+
+        #[test]
+        fn partition_state_preserves_halt_reason() {
+            let decoded: state::Partition = encoded_partition(Some(HaltReason::PowerOff))
+                .parse()
+                .unwrap();
+
+            assert_eq!(
+                decoded
+                    .halt_reason
+                    .map(|reason| mesh::payload::decode(&reason).unwrap()),
+                Some(HaltReason::PowerOff)
+            );
+        }
+
+        #[test]
+        fn partition_state_without_halt_reason_is_not_halted() {
+            let decoded: state::Partition = encoded_partition(None).parse().unwrap();
+
+            assert!(decoded.halt_reason.is_none());
         }
     }
 }
