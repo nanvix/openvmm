@@ -346,6 +346,8 @@ pub struct VmTimeKeeper {
     builder: VmTimeSourceBuilder,
     #[inspect(skip)]
     time: TimeState,
+    #[inspect(skip)]
+    stop_wall_clock: Option<mesh::payload::Timestamp>,
 }
 
 // UNSAFETY: Needed to derive SavedStateRoot in the same crate it is declared
@@ -359,14 +361,30 @@ mod saved_state {
     pub struct SavedState {
         #[mesh(1)]
         pub(super) vmtime: VmTime,
+        #[mesh(2)]
+        pub(super) stop_wall_clock: Option<mesh::payload::Timestamp>,
     }
 
     impl SavedState {
         /// Create a new instance of `SavedState` from an existing `VmTime`.
         pub fn from_vmtime(vmtime: VmTime) -> Self {
-            SavedState { vmtime }
+            SavedState {
+                vmtime,
+                stop_wall_clock: None,
+            }
+        }
+
+        /// Returns the wall-clock sample paired with stopped VM time.
+        pub fn stop_wall_clock(&self) -> Option<mesh::payload::Timestamp> {
+            self.stop_wall_clock
         }
     }
+}
+
+#[derive(Debug, MeshPayload, Copy, Clone)]
+struct StoppedTime {
+    vmtime: VmTime,
+    stop_wall_clock: mesh::payload::Timestamp,
 }
 
 #[derive(Debug, MeshPayload, Copy, Clone)]
@@ -462,6 +480,7 @@ impl VmTimeKeeper {
         });
         Self {
             time,
+            stop_wall_clock: None,
             req_send,
             builder: VmTimeSourceBuilder { new_send },
             _task: task,
@@ -472,12 +491,16 @@ impl VmTimeKeeper {
     pub fn save(&self) -> SavedState {
         SavedState {
             vmtime: self.time.stop_time().expect("should be stopped"),
+            stop_wall_clock: self.stop_wall_clock,
         }
     }
 
     /// Restores the time state.
     pub async fn restore(&mut self, state: SavedState) {
-        let SavedState { vmtime } = state;
+        let SavedState {
+            vmtime,
+            stop_wall_clock: _,
+        } = state;
         self.reset_to(vmtime).await
     }
 
@@ -493,6 +516,7 @@ impl VmTimeKeeper {
 
     async fn reset_to(&mut self, vmtime: VmTime) {
         assert!(!self.time.is_started(), "should be stopped");
+        self.stop_wall_clock = None;
         self.time = TimeState::Stopped(vmtime);
         self.req_send
             .call(KeeperRequest::Reset, vmtime)
@@ -508,6 +532,7 @@ impl VmTimeKeeper {
     /// Starts the timer, so that the current time will increase.
     pub async fn start(&mut self) {
         let vmtime = self.time.stop_time().expect("should be stopped");
+        self.stop_wall_clock = None;
         let timestamp = Timestamp::new(vmtime, Instant::now());
         self.time = TimeState::Started(timestamp);
         self.req_send
@@ -520,7 +545,8 @@ impl VmTimeKeeper {
     pub async fn stop(&mut self) {
         assert!(self.time.is_started(), "should be running");
         let stop_time = self.req_send.call(KeeperRequest::Stop, ()).await.unwrap();
-        self.time = TimeState::Stopped(stop_time);
+        self.time = TimeState::Stopped(stop_time.vmtime);
+        self.stop_wall_clock = Some(stop_time.stop_wall_clock);
     }
 
     /// Returns a time source builder, which can be used to spawn tasks that
@@ -607,7 +633,7 @@ struct PrimaryKeeper {
 #[derive(MeshPayload)]
 enum KeeperRequest {
     Start(Rpc<Timestamp, ()>),
-    Stop(Rpc<(), VmTime>),
+    Stop(Rpc<(), StoppedTime>),
     Reset(Rpc<VmTime, ()>),
     Inspect(inspect::Deferred),
 }
@@ -665,24 +691,31 @@ impl PrimaryKeeper {
                                 .await;
 
                                 let start_time = self.time.start_time().expect("should be running");
-                                let now = start_time
-                                    .vmtime
-                                    .wrapping_add(Instant::now() - start_time.os_time());
+                                let now_os = Instant::now();
+                                let now = StoppedTime {
+                                    vmtime: start_time
+                                        .vmtime
+                                        .wrapping_add(now_os - start_time.os_time()),
+                                    stop_wall_clock: std::time::SystemTime::now().into(),
+                                };
 
                                 // Compute the stop time as the max of all stop
                                 // times so that no keeper goes backwards next
                                 // start.
-                                let stop_time = results
-                                    .into_iter()
-                                    .filter_map(|r| r.ok())
-                                    .fold(now, |a, b| a.max(b));
+                                let stop_time =
+                                    results
+                                        .into_iter()
+                                        .filter_map(|r| r.ok())
+                                        .fold(now, |a, b| {
+                                            if a.vmtime.is_before(b.vmtime) { b } else { a }
+                                        });
 
-                                self.time = TimeState::Stopped(stop_time);
+                                self.time = TimeState::Stopped(stop_time.vmtime);
 
                                 // Update all the keepers with the stop time so that
                                 // it's consistent.
                                 join_all(self.keepers.iter().map(|(_, sender)| {
-                                    sender.call(KeeperRequest::Reset, stop_time)
+                                    sender.call(KeeperRequest::Reset, stop_time.vmtime)
                                 }))
                                 .await;
 
@@ -750,7 +783,11 @@ impl SecondaryKeeper {
                     }),
                     KeeperRequest::Stop(rpc) => rpc.handle_sync(|()| {
                         let mut state = self.state.write();
-                        state.stop(Instant::now())
+                        let now_os = Instant::now();
+                        StoppedTime {
+                            vmtime: state.stop(now_os),
+                            stop_wall_clock: std::time::SystemTime::now().into(),
+                        }
                     }),
                     KeeperRequest::Inspect(deferred) => deferred.inspect(&mut *self),
                 },
@@ -1060,10 +1097,12 @@ mod tests {
         let t2 = acc2.now();
         assert!(!t1.is_before(now));
         assert_eq!(t1, t2);
+        assert!(keeper.save().stop_wall_clock().is_some());
         let zero = VmTime::from_100ns(0);
         // Even on very fast machines, at least _some_ time will have advanced.
         assert_ne!(t1, zero);
         keeper.reset().await;
+        assert!(keeper.save().stop_wall_clock().is_none());
         assert_eq!(acc1.now(), zero);
         assert_eq!(acc2.now(), zero);
     }
