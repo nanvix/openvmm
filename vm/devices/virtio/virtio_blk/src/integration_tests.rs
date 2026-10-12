@@ -95,15 +95,30 @@ impl TestHarness {
         disk: Disk,
         read_only: bool,
     ) -> Self {
-        let mem = GuestMemory::allocate(TOTAL_MEM_SIZE);
-
-        init_avail_ring(&mem, AVAIL_ADDR);
-        init_used_ring(&mem, USED_ADDR);
-
         let driver_source =
             VmTaskDriverSource::new(SingleDriverBackend::new(device_driver.clone()));
         let device = VirtioBlkDevice::new(&driver_source, disk, read_only);
+        Self::with_device(driver, device)
+    }
 
+    fn empty_image_slot(
+        driver: &DefaultDriver,
+    ) -> (Self, mesh::Sender<virtio_resources::blk::ImageSlotRequest>) {
+        let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
+        let (requests, receiver) = mesh::channel();
+        (
+            Self::with_device(
+                driver,
+                VirtioBlkDevice::new_image_slot(&driver_source, true, receiver),
+            ),
+            requests,
+        )
+    }
+
+    fn with_device(driver: &DefaultDriver, device: VirtioBlkDevice) -> Self {
+        let mem = GuestMemory::allocate(TOTAL_MEM_SIZE);
+        init_avail_ring(&mem, AVAIL_ADDR);
+        init_used_ring(&mem, USED_ADDR);
         let queue_event = Event::new();
         let interrupt_event = Event::new();
 
@@ -729,6 +744,17 @@ async fn write_then_read_roundtrip(driver: DefaultDriver) {
     // Verify success status byte (immediately after data).
     let status = harness.read_status(data_gpa + 512);
     assert_eq!(status, VIRTIO_BLK_S_OK);
+}
+
+#[async_test]
+async fn empty_image_slot_read_fails(driver: DefaultDriver) {
+    let (mut harness, _requests) = TestHarness::empty_image_slot(&driver);
+    harness.enable().await;
+
+    let data_gpa = harness.post_read_request(0, 0, 512);
+    let (used_id, used_len) = harness.wait_for_used().await;
+    assert_eq!((used_id, used_len), (0, 1));
+    assert_eq!(harness.read_status(data_gpa + 512), VIRTIO_BLK_S_IOERR);
 }
 
 /// Read from a sector that was never written — should succeed with zeroes.

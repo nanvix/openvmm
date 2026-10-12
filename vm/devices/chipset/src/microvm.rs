@@ -1270,6 +1270,7 @@ mod tests {
 
         let base = RestorePacketBase {
             online_vp_count: 0,
+            image_slot_target: 0,
             memory_target: false,
             ack_required: false,
             generation: 8,
@@ -1378,6 +1379,7 @@ mod tests {
         ] {
             let base = RestorePacketBase {
                 online_vp_count,
+                image_slot_target: 0,
                 memory_target,
                 ack_required: true,
                 generation: 7,
@@ -1514,6 +1516,7 @@ mod tests {
     fn time_abi_portb_serves_restore_packet_v4() {
         let base = RestorePacketBase {
             online_vp_count: 2,
+            image_slot_target: 0,
             memory_target: false,
             ack_required: true,
             generation: 7,
@@ -1586,6 +1589,7 @@ mod tests {
             chipset_resources::microvm::MicrovmRestorePacketSource {
                 base: RestorePacketBase {
                     online_vp_count: 2,
+                    image_slot_target: 0,
                     memory_target: false,
                     ack_required: false,
                     generation: 1,

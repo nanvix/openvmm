@@ -698,27 +698,37 @@ fn random_nonzero_bytes<const N: usize>(description: &'static str) -> anyhow::Re
     }
 }
 
-pub(super) fn microvm_control_broker_config(
+#[derive(Clone)]
+pub(crate) struct MicrovmControlAuthentication {
+    pub(super) capability: [u8; 32],
+    pub(super) expected_peer_identity: serial_core::LocalPeerIdentity,
+    pub(super) auth_timeout_ms: u64,
+}
+
+pub(super) fn microvm_control_authentication(
     opt: &Options,
-    endpoint: &SerialConfigCli,
-) -> anyhow::Result<virtio_resources::console::control::VirtioControlConsoleBrokerConfig> {
-    let capability = if matches!(endpoint, SerialConfigCli::None) {
-        random_nonzero_bytes("disconnected control-console capability")?
-    } else {
-        anyhow::ensure!(
-            opt.microvm.microvm_control_auth_stdin,
-            "live microVM control console requires --microvm-control-auth-stdin"
-        );
-        #[cfg(any(target_os = "linux", windows))]
-        {
-            serial_io::microvm::read_control_capability_from_stdin()
-                .context("failed to read control-console authentication capability from stdin")?
-        }
-        #[cfg(not(any(target_os = "linux", windows)))]
-        {
-            anyhow::bail!("secure live microVM control consoles are unavailable on this platform")
-        }
-    };
+) -> anyhow::Result<MicrovmControlAuthentication> {
+    anyhow::ensure!(
+        opt.microvm.microvm_control_auth_stdin,
+        "live microVM control endpoints require --microvm-control-auth-stdin"
+    );
+    #[cfg(any(target_os = "linux", windows))]
+    let capability = serial_io::microvm::read_control_capability_from_stdin()
+        .context("failed to read microVM control authentication capability from stdin")?;
+    #[cfg(not(any(target_os = "linux", windows)))]
+    anyhow::bail!("secure live microVM control endpoints are unavailable on this platform");
+
+    microvm_control_authentication_from_capability(
+        capability,
+        opt.microvm.microvm_control_auth_timeout_ms,
+    )
+}
+
+pub(crate) fn microvm_control_authentication_from_capability(
+    capability: [u8; 32],
+    auth_timeout_ms: u64,
+) -> anyhow::Result<MicrovmControlAuthentication> {
+    anyhow::ensure!(capability != [0; 32], "control capability must not be zero");
     #[cfg(target_os = "linux")]
     let expected_peer_identity =
         serial_core::LocalPeerIdentity::UnixUid(pal::unix::effective_user_id());
@@ -733,12 +743,38 @@ pub(super) fn microvm_control_broker_config(
     #[cfg(not(any(target_os = "linux", windows)))]
     let expected_peer_identity = serial_core::LocalPeerIdentity::Unsupported;
 
+    Ok(MicrovmControlAuthentication {
+        capability,
+        expected_peer_identity,
+        auth_timeout_ms,
+    })
+}
+
+pub(super) fn microvm_control_broker_config(
+    opt: &Options,
+    endpoint: &SerialConfigCli,
+    authentication: Option<&MicrovmControlAuthentication>,
+) -> anyhow::Result<virtio_resources::console::control::VirtioControlConsoleBrokerConfig> {
+    let capability = if matches!(endpoint, SerialConfigCli::None) {
+        random_nonzero_bytes("disconnected control-console capability")?
+    } else {
+        authentication
+            .context("live microVM control console is missing shared authentication")?
+            .capability
+    };
+    let expected_peer_identity = authentication
+        .map(|authentication| authentication.expected_peer_identity.clone())
+        .unwrap_or(serial_core::LocalPeerIdentity::Unsupported);
+
     Ok(
         virtio_resources::console::control::VirtioControlConsoleBrokerConfig {
             instance_id: random_nonzero_bytes("control-console instance ID")?,
             capability,
             expected_peer_identity,
-            auth_timeout_ms: opt.microvm.microvm_control_auth_timeout_ms,
+            auth_timeout_ms: authentication
+                .map_or(opt.microvm.microvm_control_auth_timeout_ms, |auth| {
+                    auth.auth_timeout_ms
+                }),
         },
     )
 }
@@ -1107,8 +1143,8 @@ mod tests {
             "none",
         ])
         .unwrap();
-        let first = microvm_control_broker_config(&options, &SerialConfigCli::None).unwrap();
-        let second = microvm_control_broker_config(&options, &SerialConfigCli::None).unwrap();
+        let first = microvm_control_broker_config(&options, &SerialConfigCli::None, None).unwrap();
+        let second = microvm_control_broker_config(&options, &SerialConfigCli::None, None).unwrap();
         assert_ne!(first.instance_id, [0; 16]);
         assert_ne!(second.instance_id, [0; 16]);
         assert_ne!(first.instance_id, second.instance_id);

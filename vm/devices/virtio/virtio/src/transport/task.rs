@@ -21,6 +21,7 @@ use chipset_device::io::deferred::DeferredWrite;
 use chipset_device::io::deferred::defer_read;
 use chipset_device::io::deferred::defer_write;
 use futures::StreamExt;
+use futures::future::poll_fn;
 use inspect::Inspect;
 use mesh::rpc::FailableRpc;
 use mesh::rpc::PendingRpc;
@@ -276,6 +277,7 @@ impl DeviceTask {
 pub async fn run_device_task(
     device: Box<dyn DynVirtioDevice>,
     mut recv: mesh::Receiver<DeviceCommand>,
+    config_change_send: mesh::Sender<()>,
 ) {
     let traits = device.traits();
     let mut task = DeviceTask {
@@ -285,7 +287,36 @@ pub async fn run_device_task(
         device,
     };
 
-    while let Some(cmd) = recv.next().await {
+    loop {
+        enum Event {
+            Command(Option<DeviceCommand>),
+            ConfigChange(anyhow::Result<bool>),
+        }
+
+        let event = poll_fn(|cx| {
+            if let Poll::Ready(result) = task.device.poll_config_change(cx) {
+                return Poll::Ready(Event::ConfigChange(result));
+            }
+            recv.poll_next_unpin(cx).map(Event::Command)
+        })
+        .await;
+
+        let cmd = match event {
+            Event::Command(Some(cmd)) => cmd,
+            Event::Command(None) => break,
+            Event::ConfigChange(Ok(true)) => {
+                config_change_send.send(());
+                continue;
+            }
+            Event::ConfigChange(Ok(false)) => continue,
+            Event::ConfigChange(Err(error)) => {
+                tracelimit::error_ratelimited!(
+                    error = error.as_ref() as &dyn std::error::Error,
+                    "virtio host control failed"
+                );
+                continue;
+            }
+        };
         let Some(cmd) = task.restore_before_config(cmd) else {
             continue;
         };

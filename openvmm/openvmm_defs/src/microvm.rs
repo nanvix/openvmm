@@ -21,8 +21,10 @@ use net_backend_resources::mac_address::MacAddress;
 use std::fmt::Write as _;
 use vmotherboard::options::BaseChipsetManifest;
 
-/// The persisted microVM ABI version.
+/// The persisted microVM ABI version, including optional image slots.
 pub const MICROVM_ABI_VERSION_2: u32 = 2;
+/// Fixed image-slot capacity when enabled.
+pub const MICROVM_IMAGE_SLOT_CAPACITY: u8 = 4;
 /// Linux memory-block granularity used for microVM restore-time expansion.
 pub const MICROVM_MEMORY_BLOCK_SIZE_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -47,6 +49,9 @@ pub const MICROVM_VIRTIO_FS_MMIO_BASE: u64 = 0xd000_1000;
 pub const MICROVM_VIRTIO_CONSOLE_MMIO_BASE: u64 = 0xd000_2000;
 /// Fixed microVM control virtio-console MMIO base.
 pub const MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE: u64 = 0xd000_7000;
+/// Fixed microVM image-slot MMIO bases in slot order.
+pub const MICROVM_IMAGE_SLOT_MMIO_BASES: [u64; MICROVM_IMAGE_SLOT_CAPACITY as usize] =
+    [0xd000_8000, 0xd000_9000, 0xd000_a000, 0xd000_b000];
 /// Fixed microVM virtio transport window length.
 pub const MICROVM_VIRTIO_MMIO_LEN: u64 = 0x1000;
 /// Fixed distro virtio-blk interrupt.
@@ -69,6 +74,8 @@ pub const MICROVM_VIRTIO_FS_IRQ: u32 = 6;
 pub const MICROVM_VIRTIO_NET_KVM_IRQ: u32 = 10;
 /// Fixed microVM virtio-net interrupt on WHP.
 pub const MICROVM_VIRTIO_NET_WHP_IRQ: u32 = 5;
+/// Fixed image-slot interrupts in slot order.
+pub const MICROVM_IMAGE_SLOT_IRQS: [u32; MICROVM_IMAGE_SLOT_CAPACITY as usize] = [1, 13, 14, 15];
 /// Exact microVM virtio-net feature mask: MAC and virtio version 1.
 pub const MICROVM_VIRTIO_NET_FEATURES: u64 = (1 << 5) | (1 << 32);
 /// Exact microVM virtio-fs feature mask: indirect descriptors, event index,
@@ -151,6 +158,9 @@ pub const MICROVM_VIRTIO_CUSTOM_BLK_STATUS_OFFSET: u64 = 0x14;
 pub const MICROVM_VIRTIO_SCRATCH_BLK_STATUS_OFFSET: u64 = 0x18;
 /// Shared-status offset for the dedicated control virtio-console.
 pub const MICROVM_VIRTIO_CONTROL_CONSOLE_STATUS_OFFSET: u64 = 0x1c;
+/// Shared-status offsets for image slots in slot order.
+pub const MICROVM_IMAGE_SLOT_STATUS_OFFSETS: [u64; MICROVM_IMAGE_SLOT_CAPACITY as usize] =
+    [0x20, 0x24, 0x28, 0x2c];
 
 /// Returns the shared interrupt-status word for a fixed virtio-mmio slot.
 pub const fn microvm_virtio_status_gpa(mmio_base: u64) -> Option<u64> {
@@ -163,6 +173,10 @@ pub const fn microvm_virtio_status_gpa(mmio_base: u64) -> Option<u64> {
         0xd000_5000 => MICROVM_VIRTIO_CUSTOM_BLK_STATUS_OFFSET,
         0xd000_6000 => MICROVM_VIRTIO_SCRATCH_BLK_STATUS_OFFSET,
         MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE => MICROVM_VIRTIO_CONTROL_CONSOLE_STATUS_OFFSET,
+        0xd000_8000 => MICROVM_IMAGE_SLOT_STATUS_OFFSETS[0],
+        0xd000_9000 => MICROVM_IMAGE_SLOT_STATUS_OFFSETS[1],
+        0xd000_a000 => MICROVM_IMAGE_SLOT_STATUS_OFFSETS[2],
+        0xd000_b000 => MICROVM_IMAGE_SLOT_STATUS_OFFSETS[3],
         _ => return None,
     };
     Some(MICROVM_SHARED_STATUS_PAGE_GPA + offset)
@@ -249,6 +263,44 @@ pub const fn microvm_sandbox_block_features(role: MicrovmSandboxBlockRole) -> u6
         } else {
             0
         }
+}
+
+/// Returns the fixed read-only feature mask of an active image slot.
+pub const fn microvm_image_slot_features() -> u64 {
+    microvm_sandbox_block_features(MicrovmSandboxBlockRole::Distro)
+}
+
+/// Returns the stable image-slot identity.
+pub fn microvm_image_slot_name(index: u8) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        index < MICROVM_IMAGE_SLOT_CAPACITY,
+        "microVM image slot index {index} exceeds capacity {MICROVM_IMAGE_SLOT_CAPACITY}"
+    );
+    Ok(format!("image{index}"))
+}
+
+/// Guest-visible activation contract for optional microVM image slots.
+#[derive(MeshPayload, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MicrovmImageSlotsConfig {
+    /// Number of slots active on the captured cold boot.
+    pub boot_count: u8,
+    /// Number of slots instantiated for this launch.
+    pub active_count: u8,
+}
+
+impl MicrovmImageSlotsConfig {
+    /// Validates the boot and launch activation counts.
+    pub fn validate(self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (1..=MICROVM_IMAGE_SLOT_CAPACITY).contains(&self.boot_count),
+            "microVM image-slot boot count must be between 1 and {MICROVM_IMAGE_SLOT_CAPACITY}"
+        );
+        anyhow::ensure!(
+            (self.boot_count..=MICROVM_IMAGE_SLOT_CAPACITY).contains(&self.active_count),
+            "microVM image-slot active count must be between the boot count and {MICROVM_IMAGE_SLOT_CAPACITY}"
+        );
+        Ok(())
+    }
 }
 
 /// The immutable role and access mode of a microVM sandbox block device.
@@ -1107,8 +1159,30 @@ fn validate_microvm_virtio_reservations() -> anyhow::Result<()> {
             anyhow::ensure!(end <= *next, "microVM virtio MMIO reservations overlap");
         }
     }
+    anyhow::ensure!(
+        MICROVM_IMAGE_SLOT_MMIO_BASES[0] == 0xd000_8000
+            && MICROVM_IMAGE_SLOT_STATUS_OFFSETS[0] == 0x20,
+        "the first microVM image slot must preserve its fixed window and status word"
+    );
+    let fixed_end = bases.iter().max().copied().unwrap_or_default() + MICROVM_VIRTIO_MMIO_LEN;
+    for (index, base) in MICROVM_IMAGE_SLOT_MMIO_BASES.iter().copied().enumerate() {
+        let end = base
+            .checked_add(MICROVM_VIRTIO_MMIO_LEN)
+            .ok_or_else(|| anyhow::anyhow!("microVM image-slot MMIO reservation overflows"))?;
+        anyhow::ensure!(
+            base >= 0xc000_0000 && end <= 0x1_0000_0000,
+            "microVM image-slot MMIO reservation {index} is outside the fixed aperture"
+        );
+        anyhow::ensure!(
+            index == 0 || base >= fixed_end,
+            "microVM image-slot MMIO reservation {index} overlaps a fixed reservation"
+        );
+        if let Some(next) = MICROVM_IMAGE_SLOT_MMIO_BASES.get(index + 1) {
+            anyhow::ensure!(end <= *next, "microVM image-slot MMIO reservations overlap");
+        }
+    }
     let mut previous_status_gpa = None;
-    for base in bases {
+    for base in bases.iter().chain(&MICROVM_IMAGE_SLOT_MMIO_BASES[1..]) {
         let status_gpa = microvm_virtio_status_gpa(*base).ok_or_else(|| {
             anyhow::anyhow!("microVM virtio MMIO slot {base:#x} has no shared-status word")
         })?;
@@ -1187,6 +1261,20 @@ fn validate_microvm_sandbox_blocks(
     Ok(())
 }
 
+fn validate_microvm_sandbox_storage(
+    blocks: &[MicrovmSandboxBlockConfig],
+    ramfs_overlay: bool,
+    image_slots: Option<MicrovmImageSlotsConfig>,
+) -> anyhow::Result<()> {
+    if ramfs_overlay
+        && blocks.is_empty()
+        && let Some(slots) = image_slots
+    {
+        return slots.validate();
+    }
+    validate_microvm_sandbox_blocks(blocks, ramfs_overlay)
+}
+
 /// Returns the number of virtio-fs slots present when the slot is reserved as
 /// `first_slot` and `attached` filesystems occupy it.
 pub fn microvm_filesystem_slot_count(first_slot: bool, attached: usize) -> anyhow::Result<usize> {
@@ -1214,8 +1302,12 @@ pub fn append_microvm_virtio_discovery(
     has_console: bool,
     has_control_console: bool,
     blocks: &[MicrovmSandboxBlockConfig],
+    image_slots: Option<MicrovmImageSlotsConfig>,
 ) -> anyhow::Result<()> {
-    validate_microvm_sandbox_blocks(blocks, ramfs_overlay_requested(cmdline)?)?;
+    validate_microvm_sandbox_storage(blocks, ramfs_overlay_requested(cmdline)?, image_slots)?;
+    if let Some(image_slots) = image_slots {
+        image_slots.validate()?;
+    }
     anyhow::ensure!(
         !cmdline.split_ascii_whitespace().any(|token| {
             if has_control_console {
@@ -1228,6 +1320,10 @@ pub fn append_microvm_virtio_discovery(
     );
     let filesystem_slots = microvm_filesystem_slot_count(filesystem_slot, filesystems.len())?;
     validate_microvm_filesystems(filesystems)?;
+    anyhow::ensure!(
+        image_slots.is_none() || filesystem_slots <= 1,
+        "microVM image slots use the second virtio-fs slot's window and interrupt"
+    );
 
     use std::fmt::Write as _;
     if let Some((_, irq, _)) = network {
@@ -1269,6 +1365,19 @@ pub fn append_microvm_virtio_discovery(
         write!(
             cmdline,
             " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE:#x}:{MICROVM_VIRTIO_CONTROL_CONSOLE_IRQ} {MICROVM_CONTROL_TTY_COMMAND_LINE}"
+        )?;
+    }
+    if image_slots.is_some() {
+        for (index, base) in MICROVM_IMAGE_SLOT_MMIO_BASES.iter().enumerate() {
+            write!(
+                cmdline,
+                " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{base:#x}:{}",
+                MICROVM_IMAGE_SLOT_IRQS[index]
+            )?;
+        }
+        write!(
+            cmdline,
+            " microvm_image_slots={MICROVM_IMAGE_SLOT_CAPACITY}"
         )?;
     }
     if let Some((network, _, gateway_dns)) = network {
@@ -1383,6 +1492,11 @@ fn validate_microvm_command_line(
         .iter()
         .filter(|(_, device)| device.id() == "virtio-blk")
         .count();
+    let image_slot_count = config
+        .virtio_devices
+        .iter()
+        .filter(|(_, device)| device.id() == "virtio-blk-image-slot")
+        .count();
     let has_network = config
         .virtio_devices
         .iter()
@@ -1392,14 +1506,27 @@ fn validate_microvm_command_line(
         has_network == config.microvm.network.is_some(),
         "microVM virtio-net device and static network identity must be configured together"
     );
-    validate_microvm_sandbox_blocks(
+    validate_microvm_sandbox_storage(
         &config.microvm.sandbox_blocks,
         ramfs_overlay_requested(cmdline)?,
+        config.microvm.image_slots,
     )?;
     anyhow::ensure!(
         block_count == config.microvm.sandbox_blocks.len(),
         "microVM sandbox block roles do not match the virtio-blk device inventory"
     );
+    if let Some(image_slots) = config.microvm.image_slots {
+        image_slots.validate()?;
+        anyhow::ensure!(
+            image_slot_count == MICROVM_IMAGE_SLOT_CAPACITY as usize,
+            "microVM requires exactly {MICROVM_IMAGE_SLOT_CAPACITY} configured image-slot transports"
+        );
+    } else {
+        anyhow::ensure!(
+            image_slot_count == 0,
+            "microVM does not permit image-slot transports without image-slot configuration"
+        );
+    }
     anyhow::ensure!(
         !has_control_console || has_console,
         "microVM control console requires the boot console"
@@ -1428,6 +1555,7 @@ fn validate_microvm_command_line(
         "virtfs_tag=",
         "virtfs_mode=",
         "virtfs_aggregate=",
+        "microvm_image_slots=",
     ] {
         let count = if prefix == "virtio_mmio.device=" && has_control_console {
             tokens
@@ -1460,6 +1588,7 @@ fn validate_microvm_command_line(
                 .iter()
                 .filter(|filesystem| filesystem.is_aggregate())
                 .count(),
+            "microvm_image_slots=" => usize::from(config.microvm.image_slots.is_some()),
             _ => 1,
         };
         anyhow::ensure!(
@@ -1495,6 +1624,17 @@ fn validate_microvm_command_line(
             "virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE:#x}:{MICROVM_VIRTIO_CONTROL_CONSOLE_IRQ}"
         ));
         expected_discovery.push(MICROVM_CONTROL_TTY_COMMAND_LINE.to_owned());
+    }
+    if config.microvm.image_slots.is_some() {
+        expected_discovery.extend(
+            MICROVM_IMAGE_SLOT_MMIO_BASES
+                .iter()
+                .zip(MICROVM_IMAGE_SLOT_IRQS)
+                .map(|(base, irq)| {
+                    format!("virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{base:#x}:{irq}")
+                }),
+        );
+        expected_discovery.push(format!("microvm_image_slots={MICROVM_IMAGE_SLOT_CAPACITY}"));
     }
     if let Some(network) = &config.microvm.network {
         expected_discovery.extend(
@@ -1674,7 +1814,8 @@ fn build_microvm_command_line_inner(
                 || (reserve_control_console
                     && (kernel_parameter_name_matches(token, "nvx_control_tty")
                         || kernel_parameter_name_matches(token, "driver_async_probe")
-                        || kernel_parameter_name_matches(token, "virtio_mmio.device")))
+                        || kernel_parameter_name_matches(token, "virtio_mmio.device")
+                        || kernel_parameter_name_matches(token, "microvm_image_slots")))
         }) {
             anyhow::bail!(
                 "microVM kernel command line cannot override profile-owned configuration"
@@ -1719,6 +1860,8 @@ pub struct MicrovmConfig {
     pub filesystems: Vec<MicrovmFilesystemConfig>,
     /// Stable sandbox block-device roles in virtio-blk device order.
     pub sandbox_blocks: Vec<MicrovmSandboxBlockConfig>,
+    /// Optional fixed-capacity image slots within microVM ABI 2.
+    pub image_slots: Option<MicrovmImageSlotsConfig>,
     /// Whether the effective command line bootstraps every attached microVM
     /// filesystem.
     pub filesystem_bootstrap: bool,
@@ -1807,6 +1950,72 @@ fn validate_machine_load_mode(
     }
 }
 
+struct MicrovmVirtioInventory {
+    has_network: bool,
+    has_console: bool,
+    has_control_console: bool,
+    block_count: usize,
+}
+
+/// Classifies the virtio-mmio inventory. The fixed transports and, when
+/// declared, the image-slot transports are the only permitted devices. The
+/// image slots occupy separate fixed windows; virtio-fs devices are counted
+/// against their slots separately.
+fn microvm_virtio_inventory<'a>(
+    devices: impl ExactSizeIterator<Item = (VirtioBus, &'a str)>,
+    image_slots_declared: bool,
+) -> anyhow::Result<MicrovmVirtioInventory> {
+    let image_slot_capacity = if image_slots_declared {
+        usize::from(MICROVM_IMAGE_SLOT_CAPACITY)
+    } else {
+        0
+    };
+    let transport_capacity = MICROVM_VIRTIO_MMIO_BASES.len() + image_slot_capacity;
+    anyhow::ensure!(
+        devices.len() <= transport_capacity,
+        "microVM has too many virtio devices"
+    );
+    let mut inventory = MicrovmVirtioInventory {
+        has_network: false,
+        has_console: false,
+        has_control_console: false,
+        block_count: 0,
+    };
+    let mut image_slot_count = 0;
+    for (bus, id) in devices {
+        anyhow::ensure!(
+            bus == VirtioBus::Mmio,
+            "microVM permits only virtio-mmio devices"
+        );
+        match id {
+            "virtio-net" => anyhow::ensure!(
+                !std::mem::replace(&mut inventory.has_network, true),
+                "microVM permits only one virtio-net device"
+            ),
+            // Counted against the fixed slots by the filesystem validation.
+            "virtiofs" => {}
+            "virtio-console" => anyhow::ensure!(
+                !std::mem::replace(&mut inventory.has_console, true),
+                "microVM permits only one virtio-console device"
+            ),
+            MICROVM_VIRTIO_CONTROL_CONSOLE_ID => {
+                anyhow::ensure!(
+                    !std::mem::replace(&mut inventory.has_control_console, true),
+                    "microVM permits only one control console"
+                );
+            }
+            "virtio-blk" => inventory.block_count += 1,
+            "virtio-blk-image-slot" if image_slots_declared => image_slot_count += 1,
+            id => anyhow::bail!("microVM does not permit virtio device '{id}'"),
+        }
+    }
+    anyhow::ensure!(
+        image_slot_count == image_slot_capacity,
+        "microVM requires exactly {image_slot_capacity} image-slot transports"
+    );
+    Ok(inventory)
+}
+
 /// Validates the microVM machine contract. Standard-machine configurations are unchanged.
 pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> anyhow::Result<()> {
     let MachineProfile::Microvm = config.machine_profile else {
@@ -1822,6 +2031,10 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
         anyhow::ensure!(
             config.microvm.sandbox_blocks.is_empty(),
             "microVM sandbox block roles require the microVM profile"
+        );
+        anyhow::ensure!(
+            config.microvm.image_slots.is_none(),
+            "microVM image slots require the microVM profile"
         );
         anyhow::ensure!(
             config.microvm.memory_capacity.is_none()
@@ -1973,40 +2186,18 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
         "microVM does not support kernel NIC or VPCI resources"
     );
 
-    anyhow::ensure!(
-        config.virtio_devices.len() <= MICROVM_VIRTIO_MMIO_BASES.len(),
-        "microVM has too many virtio devices"
-    );
-    let mut has_network = false;
-    let mut has_console = false;
-    let mut has_control_console = false;
-    let mut block_count = 0;
-    for (bus, device) in &config.virtio_devices {
-        anyhow::ensure!(
-            *bus == VirtioBus::Mmio,
-            "microVM permits only virtio-mmio devices"
-        );
-        match device.id() {
-            "virtio-net" => anyhow::ensure!(
-                !std::mem::replace(&mut has_network, true),
-                "microVM permits only one virtio-net device"
-            ),
-            // Counted against the fixed slots below.
-            "virtiofs" => {}
-            "virtio-console" => anyhow::ensure!(
-                !std::mem::replace(&mut has_console, true),
-                "microVM permits only one virtio-console device"
-            ),
-            MICROVM_VIRTIO_CONTROL_CONSOLE_ID => {
-                anyhow::ensure!(
-                    !std::mem::replace(&mut has_control_console, true),
-                    "microVM permits only one control console"
-                );
-            }
-            "virtio-blk" => block_count += 1,
-            id => anyhow::bail!("microVM does not permit virtio device '{id}'"),
-        }
-    }
+    let MicrovmVirtioInventory {
+        has_network,
+        has_console,
+        has_control_console,
+        block_count,
+    } = microvm_virtio_inventory(
+        config
+            .virtio_devices
+            .iter()
+            .map(|(bus, device)| (*bus, device.id())),
+        config.microvm.image_slots.is_some(),
+    )?;
     anyhow::ensure!(
         !has_control_console || has_console,
         "microVM control console requires the boot console"
@@ -2156,7 +2347,8 @@ mod tests {
         validate_microvm_control_console_command_line(&tokens, false).unwrap();
 
         let mut cmdline = cmdline;
-        append_microvm_virtio_discovery(&mut cmdline, None, false, &[], true, false, &[]).unwrap();
+        append_microvm_virtio_discovery(&mut cmdline, None, false, &[], true, false, &[], None)
+            .unwrap();
 
         assert!(build_microvm_control_command_line(&user_args, true).is_err());
     }
@@ -2177,7 +2369,7 @@ mod tests {
         let mut cmdline = MICROVM_CONSOLE_COMMAND_LINE.to_owned();
         cmdline.push_str(" virtio-mmio.device=0x1000@0xc0000000:1");
         assert!(
-            append_microvm_virtio_discovery(&mut cmdline, None, false, &[], true, true, &[])
+            append_microvm_virtio_discovery(&mut cmdline, None, false, &[], true, true, &[], None)
                 .is_err()
         );
     }
@@ -2344,8 +2536,17 @@ mod tests {
         validate_microvm_sandbox_blocks(&blocks, false).unwrap();
 
         let mut cmdline = MICROVM_BASE_COMMAND_LINE.to_owned();
-        append_microvm_virtio_discovery(&mut cmdline, None, false, &[], false, false, &blocks)
-            .unwrap();
+        append_microvm_virtio_discovery(
+            &mut cmdline,
+            None,
+            false,
+            &[],
+            false,
+            false,
+            &blocks,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             cmdline,
             format!(
@@ -2361,7 +2562,8 @@ mod tests {
     #[test]
     fn microvm_control_console_slot_is_stable() {
         let mut cmdline = MICROVM_CONSOLE_COMMAND_LINE.to_owned();
-        append_microvm_virtio_discovery(&mut cmdline, None, false, &[], true, true, &[]).unwrap();
+        append_microvm_virtio_discovery(&mut cmdline, None, false, &[], true, true, &[], None)
+            .unwrap();
         assert_eq!(
             cmdline,
             format!(
@@ -2377,6 +2579,7 @@ mod tests {
     fn microvm_block_irqs_avoid_rtc_and_are_edge_triggered() {
         assert_eq!(MICROVM_VIRTIO_CONTROL_CONSOLE_IRQ, 3);
         assert_eq!(MICROVM_VIRTIO_RUNTIME_BLK_IRQ, 12);
+        assert_eq!(MICROVM_IMAGE_SLOT_IRQS, [1, 13, 14, 15]);
         assert!(MICROVM_LEVEL_TRIGGERED_IRQS.is_empty());
     }
 
@@ -2391,6 +2594,10 @@ mod tests {
             (MICROVM_VIRTIO_SANDBOX_BLOCK_MMIO_BASES[2], 0x3_0014),
             (MICROVM_VIRTIO_SANDBOX_BLOCK_MMIO_BASES[3], 0x3_0018),
             (MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE, 0x3_001c),
+            (MICROVM_IMAGE_SLOT_MMIO_BASES[0], 0x3_0020),
+            (MICROVM_IMAGE_SLOT_MMIO_BASES[1], 0x3_0024),
+            (MICROVM_IMAGE_SLOT_MMIO_BASES[2], 0x3_0028),
+            (MICROVM_IMAGE_SLOT_MMIO_BASES[3], 0x3_002c),
         ];
         for (mmio_base, expected_gpa) in slots {
             assert_eq!(microvm_virtio_status_gpa(mmio_base), Some(expected_gpa));
@@ -2399,9 +2606,7 @@ mod tests {
                 expected_gpa < MICROVM_SHARED_STATUS_PAGE_GPA + MICROVM_SHARED_STATUS_PAGE_SIZE
             );
         }
-        // The window of the retired second virtio-fs slot is free.
-        assert_eq!(microvm_virtio_status_gpa(0xd000_8000), None);
-        assert_eq!(microvm_virtio_status_gpa(0xd000_9000), None);
+        assert_eq!(microvm_virtio_status_gpa(0xd000_c000), None);
     }
 
     #[test]
@@ -2872,6 +3077,7 @@ mod tests {
             true,
             true,
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2903,6 +3109,7 @@ mod tests {
             false,
             false,
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2923,7 +3130,8 @@ mod tests {
                     &filesystems,
                     false,
                     false,
-                    &[]
+                    &[],
+                    None,
                 )
                 .is_err()
             );
@@ -3040,8 +3248,17 @@ mod tests {
         assert!(validate_microvm_sandbox_blocks(&[distro, scratch], true).is_err());
 
         let mut cmdline = format!("{MICROVM_BASE_COMMAND_LINE} nvx_overlay_upper=ramfs");
-        append_microvm_virtio_discovery(&mut cmdline, None, false, &[], false, false, &[distro])
-            .unwrap();
+        append_microvm_virtio_discovery(
+            &mut cmdline,
+            None,
+            false,
+            &[],
+            false,
+            false,
+            &[distro],
+            None,
+        )
+        .unwrap();
         assert!(cmdline.contains("virtio_mmio.device=0x1000@0xd0003000:4"));
         assert!(!cmdline.contains("virtio_mmio.device=0x1000@0xd0006000:11"));
 
@@ -3054,7 +3271,107 @@ mod tests {
                 &[],
                 false,
                 false,
-                &[distro, scratch]
+                &[distro, scratch],
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn microvm_virtio_inventory_admits_declared_image_slots() {
+        const FIXED: [&str; 8] = [
+            "virtio-net",
+            "virtiofs",
+            "virtio-console",
+            MICROVM_VIRTIO_CONTROL_CONSOLE_ID,
+            "virtio-blk",
+            "virtio-blk",
+            "virtio-blk",
+            "virtio-blk",
+        ];
+        const SLOT: &str = "virtio-blk-image-slot";
+        let inventory = |ids: &[&'static str], declared: bool| {
+            microvm_virtio_inventory(ids.iter().map(|id| (VirtioBus::Mmio, *id)), declared)
+        };
+
+        let full = [&FIXED[..], &[SLOT; 4]].concat();
+        let classified = inventory(&full, true).unwrap();
+        assert!(classified.has_network);
+        assert!(classified.has_console && classified.has_control_console);
+        assert_eq!(classified.block_count, 4);
+        assert!(inventory(&["virtio-console", SLOT, SLOT, SLOT, SLOT], true).is_ok());
+        assert!(inventory(&FIXED, false).is_ok());
+        assert!(inventory(&[&FIXED[..], &["virtiofs"]].concat(), false).is_err());
+
+        assert!(inventory(&["virtio-console", SLOT, SLOT, SLOT, SLOT], false).is_err());
+        assert!(inventory(&["virtio-console", SLOT, SLOT, SLOT], true).is_err());
+        assert!(inventory(&["virtio-console"], true).is_err());
+        assert!(inventory(&[&FIXED[..], &[SLOT; 5]].concat(), true).is_err());
+        assert!(inventory(&[&full[..], &["virtiofs"]].concat(), true).is_err());
+        assert!(inventory(&[&FIXED[..], &["virtio-blk", "virtio-blk"]].concat(), false).is_err());
+        assert!(inventory(&["virtio-console", "virtio-rng"], false).is_err());
+        assert!(
+            microvm_virtio_inventory([(VirtioBus::Pci, "virtio-console")].into_iter(), false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn microvm_image_slots_preserve_fixed_identity_and_the_single_filesystem_slot() {
+        assert_eq!(MICROVM_IMAGE_SLOT_MMIO_BASES[0], 0xd000_8000);
+        assert_eq!(MICROVM_IMAGE_SLOT_IRQS, [1, 13, 14, 15]);
+        assert_eq!(MICROVM_FILESYSTEM_SLOTS.len(), 1);
+        assert_eq!(
+            microvm_virtio_status_gpa(MICROVM_IMAGE_SLOT_MMIO_BASES[0]),
+            Some(MICROVM_SHARED_STATUS_PAGE_GPA + 0x20)
+        );
+        validate_microvm_virtio_reservations().unwrap();
+
+        let image_slots = Some(MicrovmImageSlotsConfig {
+            boot_count: 1,
+            active_count: 1,
+        });
+        let filesystems = [
+            filesystem("/workspace", MicrovmFilesystemAccess::ReadWrite),
+            filesystem("/opt/hostedtoolcache", MicrovmFilesystemAccess::ReadOnly),
+        ];
+        let mut cmdline = MICROVM_BASE_COMMAND_LINE.to_owned();
+        append_microvm_virtio_discovery(
+            &mut cmdline,
+            None,
+            true,
+            &filesystems[..1],
+            false,
+            false,
+            &[],
+            image_slots,
+        )
+        .unwrap();
+        assert_eq!(
+            cmdline,
+            format!(
+                "{MICROVM_BASE_COMMAND_LINE} virtio_mmio.device=0x1000@0xd0001000:6 \
+                 virtio_mmio.device=0x1000@0xd0008000:1 \
+                 virtio_mmio.device=0x1000@0xd0009000:13 \
+                 virtio_mmio.device=0x1000@0xd000a000:14 \
+                 virtio_mmio.device=0x1000@0xd000b000:15 \
+                 microvm_image_slots=4 \
+                 virtfs_dir=/workspace virtfs_tag=microvm virtfs_mode=rw"
+            )
+        );
+
+        let mut cmdline = MICROVM_BASE_COMMAND_LINE.to_owned();
+        assert!(
+            append_microvm_virtio_discovery(
+                &mut cmdline,
+                None,
+                true,
+                &filesystems,
+                false,
+                false,
+                &[],
+                image_slots,
             )
             .is_err()
         );

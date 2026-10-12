@@ -195,10 +195,17 @@ impl VmController {
             VncWorker(WorkerEvent),
             Halt(HaltReason),
             SnapshotRequest(chipset_resources::microvm::MicrovmSnapshotScratchPolicy),
+            HostControl(anyhow::Result<()>),
         }
 
         let mut quit = false;
         let mut rpc_closed = false;
+        // The host-control service persists across iterations: rebuilding it
+        // whenever another event wins would cancel a session mid-request.
+        let mut host_control = Box::pin(
+            futures::stream::iter(self.microvm.resources.host_control.clone())
+                .then(|server| async move { server.lock().await.run().await }),
+        );
         loop {
             let event = {
                 let rpc = pin!(async {
@@ -220,8 +227,16 @@ impl VmController {
                     futures::stream::iter(self.microvm.snapshot_requests.as_mut())
                         .flatten()
                         .map(Event::SnapshotRequest);
+                let host_control = (&mut host_control).map(Event::HostControl);
 
-                (rpc.into_stream(), vm, vnc, halt, snapshot_request)
+                (
+                    rpc.into_stream(),
+                    vm,
+                    vnc,
+                    halt,
+                    snapshot_request,
+                    host_control,
+                )
                     .merge()
                     .next()
                     .await
@@ -357,6 +372,20 @@ impl VmController {
                         event_send.send(VmControllerEvent::ExitRequested { code: exit_code });
                         break;
                     }
+                }
+                Event::HostControl(result) => {
+                    let error = result
+                        .err()
+                        .unwrap_or_else(|| anyhow::anyhow!("host-control service stopped"));
+                    tracing::error!(
+                        error = error.as_ref() as &dyn std::error::Error,
+                        "microVM host-control service failed"
+                    );
+                    self.vm_worker.stop();
+                    quit = true;
+                    event_send.send(VmControllerEvent::ExitFailed {
+                        error: format!("microVM host-control service failed: {error:#}"),
+                    });
                 }
             }
         }

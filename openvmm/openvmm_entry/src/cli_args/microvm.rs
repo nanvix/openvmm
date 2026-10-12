@@ -111,6 +111,26 @@ pub struct MicrovmLoopbackForwardCli {
     pub(crate) guest_port: u16,
 }
 
+/// Host-only microVM control endpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MicrovmHostControlCli {
+    pub(crate) path: PathBuf,
+}
+
+impl FromStr for MicrovmHostControlCli {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let path = value
+            .strip_prefix("listen=")
+            .filter(|path| !path.is_empty())
+            .context("expected listen=<path>")?;
+        Ok(Self {
+            path: PathBuf::from(path),
+        })
+    }
+}
+
 impl FromStr for MicrovmLoopbackForwardCli {
     type Err = anyhow::Error;
 
@@ -273,6 +293,18 @@ impl From<MachineProfileCli> for MachineProfile {
 /// Options of the microVM machine profile.
 #[derive(clap::Args)]
 pub struct MicrovmCli {
+    /// Declare four optional bind-once read-only image slots in microVM ABI 2.
+    #[clap(long)]
+    pub microvm_image_slots: bool,
+
+    /// Number of image slots active at cold boot.
+    #[clap(long, value_name = "COUNT", requires = "microvm_image_slots")]
+    pub microvm_image_slot_boot_count: Option<u8>,
+
+    /// Number of image slots active for this restore launch.
+    #[clap(long, value_name = "COUNT", requires = "restore_snapshot")]
+    pub restore_image_slots: Option<u8>,
+
     /// Accepted for compatibility: every microVM restore exposes restore packet
     /// version 4, which carries fresh entropy, through the private portb restore
     /// channel.
@@ -538,10 +570,13 @@ pub struct MicrovmCli {
     #[clap(
         long,
         hide = true,
-        requires("microvm_control_console"),
         conflicts_with_all = ["rpc", "ttrpc", "grpc", "relay_console_path", "write_saved_state_proto", "cpu_fingerprint", "paused"]
     )]
     pub microvm_control_auth_stdin: bool,
+
+    /// authenticated host-only control endpoint
+    #[clap(long, value_name = "listen=PATH")]
+    pub microvm_host_control: Option<MicrovmHostControlCli>,
 
     /// maximum time for a control-console client to authenticate
     #[clap(
@@ -751,14 +786,18 @@ impl Options {
                     && self.microvm.microvm_lifecycle.is_none()
                     && self.microvm.microvm_report.is_none()
                     && self.microvm.restore_processors.is_none()
+                    && !self.microvm.microvm_image_slots
+                    && self.microvm.microvm_image_slot_boot_count.is_none()
+                    && self.microvm.restore_image_slots.is_none()
                     && self.microvm.restore_memory.is_none()
                     && self.microvm.memory_capacity.is_none()
                     && self.microvm.snapshot_block_identity.is_none()
                     && self.microvm.snapshot_generation_id.is_none()
                     && self.microvm.snapshot_scratch_restore_mode.is_none()
                     && self.microvm.microvm_control_console.is_none()
+                    && self.microvm.microvm_host_control.is_none()
                     && !self.microvm.microvm_control_auth_stdin,
-                "--network-profile, --net-tap, --mount, --mount-aggregate, --microvm-sandbox-block, --microvm-workload-identity, --microvm-lifecycle, --microvm-control-console, --microvm-control-auth-stdin, --restore-processors, --restore-memory, --memory-capacity, snapshot block policy, and microVM network policy require a microVM machine"
+                "--network-profile, --net-tap, --mount, --mount-aggregate, --microvm-sandbox-block, --microvm-image-slots, --microvm-image-slot-boot-count, --microvm-workload-identity, --microvm-lifecycle, --microvm-control-console, --microvm-host-control, --microvm-control-auth-stdin, --restore-processors, --restore-image-slots, --restore-memory, --memory-capacity, snapshot block policy, and microVM network policy require a microVM machine"
             );
             return Ok(());
         }
@@ -771,14 +810,46 @@ impl Options {
             openvmm_defs::microvm::ramfs_overlay_requested(&self.cmdline.join(" "))?;
         if ramfs_overlay {
             anyhow::ensure!(
-                self.microvm.snapshot_destination.is_none() && self.restore_snapshot.is_none(),
-                "microVM RAM-backed overlay does not support snapshot or restore"
+                (self.microvm.snapshot_destination.is_none() && self.restore_snapshot.is_none())
+                    || (self.microvm.snapshot_destination.is_some()
+                        && self.microvm.microvm_image_slots
+                        && self.microvm.microvm_sandbox_block.is_empty()
+                        && self.microvm.snapshot_tier == Some(SnapshotTierCli::Platform)),
+                "microVM RAM-backed snapshot capture requires empty image slots and the platform tier"
             );
         }
         anyhow::ensure!(
             openvmm_defs::microvm::microvm_processor_count_supported(self.processors),
             "microVM does not support {} vCPUs",
             self.processors
+        );
+        if self.microvm.microvm_image_slots {
+            openvmm_defs::microvm::MicrovmImageSlotsConfig {
+                boot_count: self.microvm.microvm_image_slot_boot_count.unwrap_or(1),
+                active_count: self.microvm.microvm_image_slot_boot_count.unwrap_or(1),
+            }
+            .validate()?;
+            anyhow::ensure!(
+                self.microvm.microvm_host_control.is_some(),
+                "microVM image slots require --microvm-host-control"
+            );
+        }
+        if let Some(count) = self.microvm.restore_image_slots {
+            anyhow::ensure!(
+                (1..=openvmm_defs::microvm::MICROVM_IMAGE_SLOT_CAPACITY).contains(&count),
+                "restore image-slot count must be between 1 and {}",
+                openvmm_defs::microvm::MICROVM_IMAGE_SLOT_CAPACITY
+            );
+        }
+        anyhow::ensure!(
+            !self.microvm.microvm_control_auth_stdin
+                || self.microvm.microvm_control_console.is_some()
+                || self.microvm.microvm_host_control.is_some(),
+            "--microvm-control-auth-stdin requires a control console or host-control endpoint"
+        );
+        anyhow::ensure!(
+            self.microvm.microvm_host_control.is_none() || self.microvm.microvm_control_auth_stdin,
+            "live microVM host control requires --microvm-control-auth-stdin"
         );
         anyhow::ensure!(
             self.numa.is_none() && self.numa_distance.is_none(),
@@ -805,9 +876,14 @@ impl Options {
                 "microVM snapshot quiesce timeout must be nonzero"
             );
             anyhow::ensure!(
-                self.microvm.snapshot_tier.is_some()
-                    != self.microvm.microvm_sandbox_block.is_empty(),
-                "--snapshot-tier is required exactly for microVM snapshot capture with sandbox blocks"
+                if self.microvm.microvm_sandbox_block.is_empty() {
+                    self.microvm.snapshot_tier.is_none()
+                        || (self.microvm.microvm_image_slots
+                            && self.microvm.snapshot_tier == Some(SnapshotTierCli::Platform))
+                } else {
+                    self.microvm.snapshot_tier.is_some()
+                },
+                "--snapshot-tier requires sandbox blocks or an empty-slot platform capture"
             );
             let identity = self
                 .microvm
@@ -991,7 +1067,8 @@ impl Options {
             );
             if matches!(control_console, SerialConfigCli::None) {
                 anyhow::ensure!(
-                    !self.microvm.microvm_control_auth_stdin,
+                    !self.microvm.microvm_control_auth_stdin
+                        || self.microvm.microvm_host_control.is_some(),
                     "--microvm-control-auth-stdin is not used with a disconnected control console"
                 );
             } else {
@@ -1006,8 +1083,9 @@ impl Options {
             }
         } else {
             anyhow::ensure!(
-                !self.microvm.microvm_control_auth_stdin,
-                "--microvm-control-auth-stdin requires --microvm-control-console"
+                !self.microvm.microvm_control_auth_stdin
+                    || self.microvm.microvm_host_control.is_some(),
+                "--microvm-control-auth-stdin requires --microvm-control-console or --microvm-host-control"
             );
         }
         if self.microvm.microvm_lifecycle == Some(MicrovmLifecycleCli::Managed) {
@@ -1392,6 +1470,67 @@ mod tests {
     }
 
     #[test]
+    fn parses_microvm_image_slot_options() {
+        let options = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--microvm-image-slots",
+            "--microvm-image-slot-boot-count",
+            "4",
+            "--microvm-host-control",
+            "listen=slot-control",
+            "--microvm-control-auth-stdin",
+        ])
+        .unwrap();
+        assert!(options.microvm.microvm_image_slots);
+        assert_eq!(options.microvm.microvm_image_slot_boot_count, Some(4));
+        assert_eq!(
+            options.microvm.microvm_host_control.as_ref().unwrap().path,
+            PathBuf::from("slot-control")
+        );
+        options.validate_microvm_options().unwrap();
+
+        let invalid = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--microvm-image-slots",
+            "--microvm-image-slot-boot-count",
+            "0",
+            "--microvm-host-control",
+            "listen=slot-control",
+            "--microvm-control-auth-stdin",
+        ])
+        .unwrap();
+        assert!(invalid.validate_microvm_options().is_err());
+
+        let slots_with_mounts = |mounts: &[&'static str]| {
+            let mut args = vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--microvm-image-slots",
+                "--microvm-host-control",
+                "listen=slot-control",
+                "--microvm-control-auth-stdin",
+            ];
+            for mount in mounts {
+                args.extend(["--mount", mount]);
+            }
+            Options::try_parse_from(args)
+        };
+        slots_with_mounts(&["/workspace,work,rw"])
+            .unwrap()
+            .validate_microvm_options()
+            .unwrap();
+        let err = slots_with_mounts(&["/workspace,work,rw", "/opt/hostedtoolcache,tools"])
+            .err()
+            .expect("the microVM must reject a second filesystem slot");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
     fn test_microvm_processor_validation() {
         for processors in [1, 2, 4, 8] {
             let options = Options::try_parse_from([
@@ -1668,6 +1807,38 @@ mod tests {
             options.validate_microvm_options().unwrap();
         }
 
+        #[test]
+        fn empty_image_slot_platform_capture_accepts_ram_overlay_without_scratch() {
+            let mut options = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--processors",
+                "8",
+                "--memory",
+                "256M",
+                "--cmdline",
+                "no_timer_check mitigations=off quiet loglevel=0 nvx_overlay_upper=ramfs maxcpus=1",
+                "--microvm-image-slots",
+                "--microvm-host-control",
+                "listen=host.sock",
+                "--microvm-control-auth-stdin",
+                "--snapshot-destination",
+                "snapshot",
+                "--snapshot-tier",
+                "platform",
+                "--memory-capacity",
+                "8192M",
+            ])
+            .unwrap();
+            options.validate_microvm_options().unwrap();
+            options.microvm.snapshot_tier = Some(SnapshotTierCli::WorkloadStart);
+            assert!(options.validate_microvm_options().is_err());
+            options.microvm.snapshot_tier = Some(SnapshotTierCli::Platform);
+            options.microvm.microvm_image_slots = false;
+            assert!(options.validate_microvm_options().is_err());
+        }
+
         let missing = Options::try_parse_from([
             "openvmm",
             "--machine",
@@ -1832,8 +2003,17 @@ mod tests {
                 read_only: false,
             },
         ];
-        append_microvm_virtio_discovery(&mut with_devices, None, false, &[], true, false, &blocks)
-            .unwrap();
+        append_microvm_virtio_discovery(
+            &mut with_devices,
+            None,
+            false,
+            &[],
+            true,
+            false,
+            &blocks,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             with_devices,
             format!(
@@ -1849,6 +2029,7 @@ mod tests {
             true,
             true,
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1876,6 +2057,7 @@ mod tests {
             false,
             false,
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1899,6 +2081,7 @@ mod tests {
                 false,
                 false,
                 &[],
+                None,
             )
             .unwrap();
             assert!(
@@ -1923,6 +2106,7 @@ mod tests {
             false,
             false,
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2224,7 +2408,9 @@ mod tests {
         ] {
             assert!(Options::try_parse_from(args.into_iter().chain(extra)).is_err());
         }
-        assert!(Options::try_parse_from(["openvmm", "--microvm-control-auth-stdin"]).is_err());
+        let auth_only =
+            Options::try_parse_from(["openvmm", "--microvm-control-auth-stdin"]).unwrap();
+        assert!(auth_only.validate_microvm_options().is_err());
         assert!(
             Options::try_parse_from([
                 "openvmm",
