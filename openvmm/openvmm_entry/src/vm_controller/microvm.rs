@@ -62,6 +62,53 @@ pub(crate) struct MicrovmController {
     pub(crate) _private_scratch_dir: Option<tempfile::TempDir>,
 }
 
+impl MicrovmController {
+    fn validate_snapshot_tier(
+        &self,
+        scratch_policy: chipset_resources::microvm::MicrovmSnapshotScratchPolicy,
+    ) -> anyhow::Result<()> {
+        if self.resources.sandbox_block_sources.is_empty() {
+            if let Some(tier) = self.snapshot_tier {
+                anyhow::ensure!(
+                    tier == crate::cli_args::microvm::SnapshotTierCli::Platform,
+                    "blockless microVM snapshot capture supports only the platform tier"
+                );
+                self.image_slots
+                    .context("blockless platform capture requires declared image slots")?
+                    .validate()?;
+                let command_line = self
+                    .effective_command_line
+                    .as_deref()
+                    .context("blockless platform capture requires an effective command line")?;
+                anyhow::ensure!(
+                    openvmm_defs::microvm::ramfs_overlay_requested(command_line)?,
+                    "blockless platform capture requires a RAM-backed overlay"
+                );
+            }
+        } else {
+            anyhow::ensure!(
+                self.snapshot_tier.is_some(),
+                "microVM sandbox snapshot capture requires a tier"
+            );
+        }
+        if let Some(tier) = self.snapshot_tier {
+            let paired_scratch =
+                scratch_policy == chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Paired;
+            anyhow::ensure!(
+                paired_scratch == tier.requires_paired_scratch(),
+                "snapshot tier '{}' requires {} scratch capture",
+                tier.manifest_name(),
+                if tier.requires_paired_scratch() {
+                    "paired"
+                } else {
+                    "fresh"
+                }
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MicrovmTeardownStatus {
     pub(crate) vm_worker_stopped: bool,
@@ -216,29 +263,7 @@ impl VmController {
                             })),
                 "microVM snapshot requires either no blocks or at least one lower layer and scratch"
             );
-            if self.microvm.resources.sandbox_block_sources.is_empty() {
-                anyhow::ensure!(
-                    self.microvm.snapshot_tier.is_none(),
-                    "blockless microVM snapshot capture does not use a tier"
-                );
-            } else {
-                let tier = self
-                    .microvm
-                    .snapshot_tier
-                    .context("microVM sandbox snapshot capture requires a tier")?;
-                let paired_scratch = scratch_policy
-                    == chipset_resources::microvm::MicrovmSnapshotScratchPolicy::Paired;
-                anyhow::ensure!(
-                    paired_scratch == tier.requires_paired_scratch(),
-                    "snapshot tier '{}' requires {} scratch capture",
-                    tier.manifest_name(),
-                    if tier.requires_paired_scratch() {
-                        "paired"
-                    } else {
-                        "fresh"
-                    }
-                );
-            }
+            self.microvm.validate_snapshot_tier(scratch_policy)?;
             anyhow::ensure!(
                 fs_err::symlink_metadata(&destination)
                     .is_err_and(|error| { error.kind() == std::io::ErrorKind::NotFound }),
@@ -638,6 +663,54 @@ mod tests {
     use crate::microvm::output::MicrovmOutputDrain;
     use futures::executor::block_on;
     use test_with_tracing::test;
+
+    #[test]
+    fn blockless_platform_capture_requires_slots_ram_overlay_and_fresh_policy() {
+        use crate::cli_args::microvm::SnapshotTierCli;
+        use chipset_resources::microvm::MicrovmSnapshotScratchPolicy as ScratchPolicy;
+
+        let mut controller = MicrovmController {
+            snapshot_tier: Some(SnapshotTierCli::Platform),
+            image_slots: Some(openvmm_defs::microvm::MicrovmImageSlotsConfig {
+                boot_count: 1,
+                active_count: 1,
+            }),
+            effective_command_line: Some("nvx_overlay_upper=ramfs".to_owned()),
+            ..Default::default()
+        };
+        controller
+            .validate_snapshot_tier(ScratchPolicy::Fresh)
+            .unwrap();
+        assert!(
+            controller
+                .validate_snapshot_tier(ScratchPolicy::Paired)
+                .is_err()
+        );
+        controller.snapshot_tier = Some(SnapshotTierCli::WorkloadStart);
+        assert!(
+            controller
+                .validate_snapshot_tier(ScratchPolicy::Fresh)
+                .is_err()
+        );
+        controller.snapshot_tier = Some(SnapshotTierCli::Platform);
+        controller.effective_command_line = Some("quiet".to_owned());
+        assert!(
+            controller
+                .validate_snapshot_tier(ScratchPolicy::Fresh)
+                .is_err()
+        );
+        controller.effective_command_line = Some("nvx_overlay_upper=ramfs".to_owned());
+        controller.image_slots = None;
+        assert!(
+            controller
+                .validate_snapshot_tier(ScratchPolicy::Fresh)
+                .is_err()
+        );
+        controller.snapshot_tier = None;
+        controller
+            .validate_snapshot_tier(ScratchPolicy::Paired)
+            .unwrap();
+    }
 
     #[test]
     fn successful_drain_preserves_guest_exit_status() {
