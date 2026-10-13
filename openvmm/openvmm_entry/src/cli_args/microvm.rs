@@ -1200,11 +1200,12 @@ impl Options {
         }
         if ramfs_overlay {
             anyhow::ensure!(
-                self.microvm.microvm_sandbox_block.len() == 1
-                    && self.microvm.microvm_sandbox_block[0].role
-                        == MicrovmSandboxBlockRole::Distro
-                    && self.microvm.microvm_sandbox_block[0].disk.read_only,
-                "microVM RAM-backed overlay requires exactly one read-only distro block"
+                (self.microvm.microvm_sandbox_block.is_empty() && self.microvm.microvm_image_slots)
+                    || (self.microvm.microvm_sandbox_block.len() == 1
+                        && self.microvm.microvm_sandbox_block[0].role
+                            == MicrovmSandboxBlockRole::Distro
+                        && self.microvm.microvm_sandbox_block[0].disk.read_only),
+                "microVM RAM-backed overlay requires one read-only distro block or declared image slots"
             );
         } else if !self.microvm.microvm_sandbox_block.is_empty() && self.restore_snapshot.is_none()
         {
@@ -1675,6 +1676,13 @@ mod tests {
                 "openvmm",
                 "--machine",
                 "microvm",
+                "--cmdline",
+                "nvx_overlay_upper=ramfs",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
                 "--microvm-sandbox-block",
                 "distro:mem:1M",
                 "--microvm-sandbox-block",
@@ -1703,6 +1711,38 @@ mod tests {
             let options = Options::try_parse_from(args).unwrap();
             assert!(options.validate_microvm_options().is_err());
         }
+    }
+
+    #[test]
+    fn empty_image_slot_platform_capture_accepts_ram_overlay_without_scratch() {
+        let mut options = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--processors",
+            "8",
+            "--memory",
+            "256M",
+            "--cmdline",
+            "no_timer_check mitigations=off quiet loglevel=0 nvx_overlay_upper=ramfs maxcpus=1",
+            "--microvm-image-slots",
+            "--microvm-host-control",
+            "listen=host.sock",
+            "--microvm-control-auth-stdin",
+            "--snapshot-destination",
+            "snapshot",
+            "--snapshot-tier",
+            "platform",
+            "--memory-capacity",
+            "8192M",
+        ])
+        .unwrap();
+        options.validate_microvm_options().unwrap();
+        options.microvm.snapshot_tier = Some(SnapshotTierCli::WorkloadStart);
+        assert!(options.validate_microvm_options().is_err());
+        options.microvm.snapshot_tier = Some(SnapshotTierCli::Platform);
+        options.microvm.microvm_image_slots = false;
+        assert!(options.validate_microvm_options().is_err());
     }
 
     #[test]
@@ -1805,38 +1845,6 @@ mod tests {
             .unwrap();
             assert_eq!(options.microvm.restore_gate_timeout_ms, 60_000);
             options.validate_microvm_options().unwrap();
-        }
-
-        #[test]
-        fn empty_image_slot_platform_capture_accepts_ram_overlay_without_scratch() {
-            let mut options = Options::try_parse_from([
-                "openvmm",
-                "--machine",
-                "microvm",
-                "--processors",
-                "8",
-                "--memory",
-                "256M",
-                "--cmdline",
-                "no_timer_check mitigations=off quiet loglevel=0 nvx_overlay_upper=ramfs maxcpus=1",
-                "--microvm-image-slots",
-                "--microvm-host-control",
-                "listen=host.sock",
-                "--microvm-control-auth-stdin",
-                "--snapshot-destination",
-                "snapshot",
-                "--snapshot-tier",
-                "platform",
-                "--memory-capacity",
-                "8192M",
-            ])
-            .unwrap();
-            options.validate_microvm_options().unwrap();
-            options.microvm.snapshot_tier = Some(SnapshotTierCli::WorkloadStart);
-            assert!(options.validate_microvm_options().is_err());
-            options.microvm.snapshot_tier = Some(SnapshotTierCli::Platform);
-            options.microvm.microvm_image_slots = false;
-            assert!(options.validate_microvm_options().is_err());
         }
 
         let missing = Options::try_parse_from([
