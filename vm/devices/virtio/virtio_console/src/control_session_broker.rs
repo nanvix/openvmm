@@ -739,14 +739,15 @@ impl ControlSessionBroker {
         }
     }
 
-    /// Restores only physical guest alignment state, then starts a fresh
-    /// instance at epoch one and queues RESET.
+    /// Restores physical guest alignment with a fresh instance at epoch one.
+    /// A guest already attached receives RESET; an unattached guest still bootstraps normally.
     pub fn restore(
         snapshot: BrokerSnapshot,
         new_instance_id: [u8; 16],
         new_capability: [u8; 32],
     ) -> Result<Self, BrokerError> {
         Self::validate_restore(&snapshot, new_instance_id)?;
+        let awaiting_guest_attach = snapshot.state == BrokerState::AwaitGuestAttach as u8;
         let guest_parser = Parser::restore(snapshot.guest_parser)?;
         let mut saved_guest_output = OutputLeg::restore(snapshot.guest_output)?;
         let _saved_host_output = OutputLeg::restore(snapshot.host_output)?;
@@ -762,12 +763,14 @@ impl ControlSessionBroker {
         }
 
         let mut broker = Self::new(new_instance_id, new_capability);
-        broker.state = BrokerState::ResetPending;
         broker.guest_parser = guest_parser;
         broker.guest_output = saved_guest_output;
-        broker.drain_foreign_instance_records = true;
         broker.counters = snapshot.counters;
-        broker.enqueue_guest_control(RecordType::Reset)?;
+        if !awaiting_guest_attach {
+            broker.state = BrokerState::ResetPending;
+            broker.drain_foreign_instance_records = true;
+            broker.enqueue_guest_control(RecordType::Reset)?;
+        }
         Ok(broker)
     }
 
@@ -1966,6 +1969,35 @@ mod tests {
         assert_eq!(broker.output_record_count(OutputLegId::Guest), 0);
         assert_eq!(broker.output_record_count(OutputLegId::Host), 0);
         assert!(!broker.begin_output(OutputLegId::Guest));
+        Ok(())
+    }
+
+    #[test]
+    fn restore_before_guest_attach_does_not_emit_control_bytes_early() -> Result<(), BrokerError> {
+        let snapshot = ControlSessionBroker::new(INSTANCE, CAPABILITY).snapshot();
+        let fresh_instance = [0x77; 16];
+        let fresh_capability = [0x88; 32];
+        let mut restored =
+            ControlSessionBroker::restore(snapshot, fresh_instance, fresh_capability)?;
+        assert!(!restored.begin_output(OutputLegId::Guest));
+        feed_guest(
+            &mut restored,
+            &Record::bootstrap(RecordType::GuestAttach, Vec::new()),
+        )?;
+        let reset = drain_record(&mut restored, OutputLegId::Guest)?;
+        assert_eq!(reset.instance_id, fresh_instance);
+        let guest_ack = ack(&restored);
+        feed_guest(&mut restored, &guest_ack)?;
+        restored.begin_host_attachment()?;
+        feed_host(
+            &mut restored,
+            &Record::bootstrap(RecordType::HostAttach, fresh_capability.to_vec()),
+        )?;
+        assert_eq!(
+            drain_record(&mut restored, OutputLegId::Host)?.record_type,
+            RecordType::Ready
+        );
+        assert_eq!(restored.state(), BrokerState::Active);
         Ok(())
     }
 
