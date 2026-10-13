@@ -72,6 +72,21 @@ pub(super) fn create_private_directory(path: &Path) -> std::io::Result<()> {
     return builder.create(path);
 }
 
+pub(super) fn supports_owned_memory_link(file: &std::fs::File) -> anyhow::Result<bool> {
+    #[cfg(windows)]
+    {
+        let filesystem = pal::windows::fs::query_filesystem_name(file)
+            .context("failed to identify snapshot RAM filesystem")?;
+        // ReFS cannot rename a staging directory while its linked guest RAM remains mapped.
+        Ok(!filesystem.eq_ignore_ascii_case("ReFS"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        Ok(true)
+    }
+}
+
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub(super) fn rename_no_replace(source: &Path, destination: &Path) -> anyhow::Result<()> {
     let source_parent = snapshot_parent(source);

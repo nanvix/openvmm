@@ -27,6 +27,7 @@ use super::fs::open_regular_file;
 use super::fs::path_exists;
 use super::fs::rename_no_replace;
 use super::fs::snapshot_parent;
+use super::fs::supports_owned_memory_link;
 use super::fs::sync_directory;
 use super::fs::validate_directory;
 use super::fs::verify_hard_link_identity;
@@ -149,7 +150,8 @@ pub fn write_snapshot_from_memory_and_scratch_files(
 /// [`SnapshotWriteError::BeforeCommit`] proves that staging was removed and the
 /// source may resume. [`SnapshotWriteError::CleanupUncertain`] requires source
 /// termination because a private staging alias may remain. Unsupported hard
-/// links fall back to an independent sparse-aware copy.
+/// links, and filesystems that cannot atomically publish a mapped hard link,
+/// fall back to an independent copy.
 pub fn write_snapshot_from_owned_memory_and_scratch_files(
     dir: &Path,
     manifest: &SnapshotManifest,
@@ -505,6 +507,18 @@ fn publish_owned_memory_file(
         .context("failed to flush automatic snapshot RAM handle")?;
 
     let memory_path = staging.path().join(MEMORY_FILE_NAME);
+    if !supports_owned_memory_link(source)? {
+        tracing::info!(
+            "snapshot RAM filesystem requires an independent copy for atomic mapped-memory publication"
+        );
+        return copy_exact(
+            source,
+            &memory_path,
+            expected_length,
+            "automatic snapshot RAM handle",
+            "snapshot memory",
+        );
+    }
     let directory = OpenedSnapshotDirectory::open_for_publication(staging.path())?;
     // From this point, any failure is treated as though the link may have been
     // installed until the complete staging directory is proven absent.
@@ -734,7 +748,44 @@ mod tests {
         .unwrap();
 
         let published = std::fs::File::open(snap_dir.join(MEMORY_FILE_NAME)).unwrap();
-        verify_hard_link_identity(&memory_file, &published, 1024).unwrap();
+        if supports_owned_memory_link(&memory_file).unwrap() {
+            verify_hard_link_identity(&memory_file, &published, 1024).unwrap();
+        }
+        assert_eq!(
+            std::fs::read(snap_dir.join(MEMORY_FILE_NAME)).unwrap(),
+            vec![0x5a_u8; 1024]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owned_memory_snapshot_publishes_while_guest_section_is_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        let memory_file = memory.reopen().unwrap();
+        initialize_snapshot_memory_backing_file(&memory_file, 65536).unwrap();
+        let section =
+            crate::shared_memory::file_to_shared_memory_fd(memory_file.try_clone().unwrap())
+                .unwrap();
+        let mapping = sparse_mmap::SparseMapping::new(65536).unwrap();
+        mapping.map_file(0, 65536, &section, 0, true).unwrap();
+        let mut manifest = test_manifest();
+        manifest.memory_size_bytes = 65536;
+        let destination = dir.path().join("snapshot");
+        write_snapshot_from_owned_memory_and_scratch_files(
+            &destination,
+            &manifest,
+            b"state",
+            &memory_file,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(destination.join(MEMORY_FILE_NAME))
+                .unwrap()
+                .len(),
+            65536
+        );
     }
 
     #[cfg(any(target_os = "linux", windows))]
@@ -763,7 +814,9 @@ mod tests {
         .unwrap();
 
         let published = std::fs::File::open(snap_dir.join(MEMORY_FILE_NAME)).unwrap();
-        verify_hard_link_identity(&memory_file, &published, 1024).unwrap();
+        if supports_owned_memory_link(&memory_file).unwrap() {
+            verify_hard_link_identity(&memory_file, &published, 1024).unwrap();
+        }
         assert_eq!(
             std::fs::read(snap_dir.join(MEMORY_FILE_NAME)).unwrap(),
             vec![0x5a_u8; 1024]
@@ -791,7 +844,10 @@ mod tests {
             MemoryPublication::OwnedExactFile,
         )
         .unwrap();
-        assert!(staging.source_memory_alias);
+        assert_eq!(
+            staging.source_memory_alias,
+            supports_owned_memory_link(&memory_file).unwrap()
+        );
         let staging_path = staging.path().to_owned();
 
         let error = staging.rollback(anyhow::anyhow!("injected failure after memory link"));

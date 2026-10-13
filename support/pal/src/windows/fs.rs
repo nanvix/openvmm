@@ -22,6 +22,7 @@ use windows_sys::Win32::Foundation::OBJ_CASE_INSENSITIVE;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 use windows_sys::Win32::Storage::FileSystem::FindClose;
 use windows_sys::Win32::Storage::FileSystem::FindFirstFileW;
+use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationByHandleW;
 use windows_sys::Win32::Storage::FileSystem::WIN32_FIND_DATAW;
 
 pub fn query_stat_lx_by_name(path: &Path) -> io::Result<ntioapi::FILE_STAT_LX_INFORMATION> {
@@ -66,6 +67,35 @@ pub fn query_stat_lx(file: &fs::File) -> io::Result<ntioapi::FILE_STAT_LX_INFORM
         ))?;
         Ok(info)
     }
+}
+
+/// Returns the filesystem name of the volume containing an opened file.
+pub fn query_filesystem_name(file: &fs::File) -> io::Result<String> {
+    let mut name = [0u16; 32];
+    // SAFETY: the file handle is live and the filesystem-name buffer has the supplied length.
+    let result = unsafe {
+        GetVolumeInformationByHandleW(
+            file.as_raw_handle().cast(),
+            null_mut(),
+            0,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            name.as_mut_ptr(),
+            name.len() as u32,
+        )
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let length = name.iter().position(|value| *value == 0).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "filesystem name is not terminated",
+        )
+    })?;
+    String::from_utf16(&name[..length])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 /// Wrapper for Win32 FindFirstFileW which only returns the data.
