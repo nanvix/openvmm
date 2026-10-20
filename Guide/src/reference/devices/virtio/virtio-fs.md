@@ -22,10 +22,16 @@ rules. It does not support snapshot and restore.
 
 ## microVM
 
-The microVM profile defines one fixed virtio-fs slot. A cold boot always
+The microVM profile defines one fixed virtio-fs slot. By default, a cold boot
 exposes it; without `--mount` or `--mount-aggregate`, it is guest-discoverable
-but dormant and has no HostFs backend or filesystem policy. Configure an
-active attachment with:
+but dormant and has no HostFs backend or filesystem policy.
+`--microvm-filesystem-topology no-device-v1` opts a zero-export direct-image
+cold launch out of the device entirely: no tag, transport, IRQ, or discovery
+token is exposed. It requires a read-only distro block and rejects exports,
+mount policies, snapshot capture, and restore. Reusable template captures
+must retain the default dormant slot; existing snapshot matching is
+unchanged. See the [CLI reference](../../openvmm/management/cli.md).
+Configure an active attachment with:
 
 ```bash
 openvmm --machine microvm \

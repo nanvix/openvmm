@@ -123,8 +123,8 @@ impl MicrovmFilesystemSlot {
     }
 }
 
-/// The fixed microVM virtio-fs slots: the microVM has one. A cold boot always
-/// exposes it, dormant when no filesystem is attached. Several host
+/// The fixed microVM virtio-fs slots: the microVM has one. By default, a cold
+/// boot exposes it, dormant when no filesystem is attached. Several host
 /// directories share it as the children of one aggregate filesystem.
 pub const MICROVM_FILESYSTEM_SLOTS: [MicrovmFilesystemSlot; 1] = [MicrovmFilesystemSlot {
     stable_id: "fs:microvm0",

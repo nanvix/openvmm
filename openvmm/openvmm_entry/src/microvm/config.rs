@@ -87,10 +87,14 @@ impl<'a> MicrovmConfigBuilder<'a> {
     pub(crate) fn new(opt: &'a Options, restore: &'a MicrovmRestore) -> anyhow::Result<Self> {
         let active = opt.machine == MachineProfileCli::Microvm;
         let restore_machine_contract = restore.machine_contract.as_ref();
+        opt.validate_microvm_options()?;
+        anyhow::ensure!(
+            opt.microvm.microvm_filesystem_topology.is_none() || restore_machine_contract.is_none(),
+            "--microvm-filesystem-topology no-device-v1 does not support snapshot restore"
+        );
         if let Some(contract) = restore_machine_contract {
             openvmm_helpers::snapshot::microvm::validate_supported_microvm_contract(contract)?;
         }
-        opt.validate_microvm_options()?;
         let network = if active {
             effective_microvm_network(opt, restore_machine_contract)?
         } else {
@@ -100,7 +104,7 @@ impl<'a> MicrovmConfigBuilder<'a> {
             restore_machine_contract
                 .map(microvm_filesystem_slot_from_snapshot)
                 .transpose()?
-                .unwrap_or(true)
+                .unwrap_or(opt.microvm.microvm_filesystem_topology.is_none())
         } else {
             false
         };
@@ -931,7 +935,155 @@ fn build_effective_microvm_command_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+    use pal_async::DefaultPool;
     use test_with_tracing::test;
+
+    #[test]
+    fn filesystem_topology_configuration_inventory() {
+        DefaultPool::run_with(async |driver| {
+            let directory = tempfile::tempdir().unwrap();
+            let kernel = directory.path().join("kernel");
+            std::fs::File::create(&kernel).unwrap();
+            let initrd = directory.path().join("initrd");
+            std::fs::File::create(&initrd).unwrap();
+            let distro = directory.path().join("distro.raw");
+            let scratch = directory.path().join("scratch.raw");
+            for path in [&distro, &scratch] {
+                std::fs::File::create(path)
+                    .unwrap()
+                    .set_len(1024 * 1024)
+                    .unwrap();
+            }
+            let share = directory.path().join("share");
+            std::fs::create_dir(&share).unwrap();
+            let snapshot = directory.path().join("snapshot");
+            let mesh = crate::meshworker::VmmMesh::new(&driver, true).unwrap();
+
+            for (name, extra, has_slot, has_export) in [
+                ("default", Vec::new(), true, false),
+                (
+                    "no-device-v1",
+                    vec![
+                        "--microvm-filesystem-topology".to_owned(),
+                        "no-device-v1".to_owned(),
+                    ],
+                    false,
+                    false,
+                ),
+                (
+                    "mapped",
+                    vec![
+                        "--mount-aggregate".to_owned(),
+                        "/shares".to_owned(),
+                        "--mount-child".to_owned(),
+                        format!("one,{},ro", share.display()),
+                    ],
+                    true,
+                    true,
+                ),
+                (
+                    "platform-capture",
+                    vec![
+                        "--snapshot-destination".to_owned(),
+                        snapshot.display().to_string(),
+                        "--snapshot-tier".to_owned(),
+                        "platform".to_owned(),
+                    ],
+                    true,
+                    false,
+                ),
+            ] {
+                let args = [
+                    "openvmm".to_owned(),
+                    "--machine".to_owned(),
+                    "microvm".to_owned(),
+                    "--kernel".to_owned(),
+                    kernel.display().to_string(),
+                    "--initrd".to_owned(),
+                    initrd.display().to_string(),
+                    "--microvm-sandbox-block".to_owned(),
+                    format!("distro:file:{},ro", distro.display()),
+                    "--microvm-sandbox-block".to_owned(),
+                    format!("scratch:file:{}", scratch.display()),
+                    "--single-process".to_owned(),
+                ];
+                let opt = Options::try_parse_from(args.into_iter().chain(extra)).unwrap();
+                let (config, resources) = crate::vm_config_from_command_line(
+                    driver.clone(),
+                    &mesh,
+                    &opt,
+                    &MicrovmRestore::default(),
+                )
+                .await
+                .unwrap();
+                let ids = config
+                    .virtio_devices
+                    .iter()
+                    .map(|(bus, device)| {
+                        assert!(matches!(bus, openvmm_defs::config::VirtioBus::Mmio));
+                        device.id()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    ids,
+                    if has_slot {
+                        vec!["virtiofs", "virtio-blk", "virtio-blk"]
+                    } else {
+                        vec!["virtio-blk", "virtio-blk"]
+                    },
+                    "{name}"
+                );
+                assert_eq!(config.microvm.filesystems.len(), usize::from(has_export));
+                assert_eq!(resources.microvm.filesystem.is_some(), has_export);
+                if has_export {
+                    assert!(config.microvm.filesystems[0].is_aggregate());
+                    assert_eq!(config.microvm.filesystems[0].children.len(), 1);
+                    assert_eq!(
+                        resources
+                            .microvm
+                            .filesystem
+                            .as_ref()
+                            .unwrap()
+                            .children
+                            .len(),
+                        1
+                    );
+                }
+                assert!(config.microvm.network.is_none());
+                let LoadMode::Linux { cmdline, .. } = &config.load_mode else {
+                    panic!("expected direct boot");
+                };
+                let discovery = cmdline
+                    .split_ascii_whitespace()
+                    .filter(|token| token.starts_with("virtio_mmio.device="))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    discovery,
+                    if has_slot {
+                        vec![
+                            "virtio_mmio.device=0x1000@0xd0001000:6",
+                            "virtio_mmio.device=0x1000@0xd0003000:4",
+                            "virtio_mmio.device=0x1000@0xd0006000:11",
+                        ]
+                    } else {
+                        vec![
+                            "virtio_mmio.device=0x1000@0xd0003000:4",
+                            "virtio_mmio.device=0x1000@0xd0006000:11",
+                        ]
+                    },
+                    "{name}"
+                );
+                assert_eq!(cmdline.contains("virtfs_tag=microvm"), has_export);
+                assert_eq!(cmdline.contains("virtfs_aggregate=1"), has_export);
+                assert_eq!(
+                    cmdline.contains("nvx_snapshot_tier=platform"),
+                    name == "platform-capture"
+                );
+            }
+            mesh.shutdown().await;
+        });
+    }
 
     #[test]
     fn boot_only_command_line_preserves_control_free_arguments() {

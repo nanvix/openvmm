@@ -27,6 +27,13 @@ pub enum MachineProfileCli {
     Microvm,
 }
 
+/// Opt-in filesystem topology for a direct-image microVM cold launch.
+#[derive(Debug, Copy, Clone, ValueEnum, PartialEq, Eq)]
+pub enum MicrovmFilesystemTopologyCli {
+    /// Omit the filesystem device; exports, capture, and restore are unavailable.
+    NoDeviceV1,
+}
+
 /// Required host-network implementation contract for a microVM NIC.
 #[derive(Debug, Copy, Clone, ValueEnum, PartialEq, Eq)]
 pub enum MicrovmNetworkProfileCli {
@@ -437,6 +444,15 @@ pub struct MicrovmCli {
     #[clap(long, value_name = "IPv4:TCP-PORT", conflicts_with_all = ["allow_host", "block_host"])]
     pub allow_endpoint: Vec<net_backend_resources::egress::TcpEndpoint>,
 
+    /// Omit the fixed virtio-fs device for a zero-export direct-image cold boot.
+    ///
+    /// `no-device-v1` requires a read-only distro block and Linux direct boot.
+    /// It rejects all filesystem exports, snapshot capture, and restore.
+    /// Without this option, the fixed slot remains present, dormant when no
+    /// filesystem is attached. Mappings cannot be added after boot.
+    #[clap(long, value_enum, value_name = "TOPOLOGY")]
+    pub microvm_filesystem_topology: Option<MicrovmFilesystemTopologyCli>,
+
     /// attach a host directory to the fixed microVM virtio-fs slot
     ///
     /// The directory uses the `microvm` tag. GUEST_TARGET ends at the first
@@ -726,6 +742,70 @@ pub(super) fn parse_endpoint(network: &str) -> Result<EndpointConfigCli, String>
 }
 
 impl Options {
+    /// Rejects the cold-only topology before an ignored launch mode or a
+    /// snapshot operation can open host resources.
+    pub(crate) fn validate_microvm_filesystem_topology(&self) -> anyhow::Result<()> {
+        let Some(MicrovmFilesystemTopologyCli::NoDeviceV1) =
+            self.microvm.microvm_filesystem_topology
+        else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            self.machine == MachineProfileCli::Microvm,
+            "--microvm-filesystem-topology requires --machine microvm"
+        );
+        anyhow::ensure!(
+            self.microvm.snapshot_destination.is_none() && self.restore_snapshot.is_none(),
+            "--microvm-filesystem-topology no-device-v1 does not support snapshot capture or restore"
+        );
+        anyhow::ensure!(
+            self.microvm.microvm_mount.is_none()
+                && self.microvm.microvm_mount_aggregate.is_none()
+                && self.microvm.microvm_mount_child.is_empty()
+                && self.microvm.microvm_mount_deny.is_empty()
+                && self.microvm.microvm_mount_allow.is_empty()
+                && self.microvm.microvm_mount_write.is_empty()
+                && self.microvm.microvm_mount_owner.is_none()
+                && self.virtio_9p.is_empty()
+                && self.virtio_fs.is_empty()
+                && self.virtio_fs_shmem.is_empty()
+                && self.virtio_pmem.is_none(),
+            "--microvm-filesystem-topology no-device-v1 requires zero filesystem exports and no mount policy"
+        );
+        anyhow::ensure!(
+            self.rpc.is_none()
+                && self.ttrpc.is_none()
+                && self.grpc.is_none()
+                && self.relay_console_path.is_none()
+                && self.write_saved_state_proto.is_none()
+                && self.cpu_fingerprint.is_none(),
+            "--microvm-filesystem-topology no-device-v1 requires a direct VM launch"
+        );
+        anyhow::ensure!(
+            self.kernel.0.is_some()
+                && self
+                    .microvm
+                    .microvm_sandbox_block
+                    .first()
+                    .is_some_and(|block| block.role == MicrovmSandboxBlockRole::Distro
+                        && block.disk.read_only),
+            "--microvm-filesystem-topology no-device-v1 requires --kernel and a read-only distro block"
+        );
+        for token in self
+            .cmdline
+            .iter()
+            .flat_map(|arg| arg.split_ascii_whitespace())
+        {
+            let name = token.split_once('=').map_or(token, |(name, _)| name);
+            let name = name.replace('-', "_");
+            anyhow::ensure!(
+                name != "virtio_mmio.device" && !name.starts_with("virtfs_"),
+                "--microvm-filesystem-topology no-device-v1 cannot override filesystem or transport discovery"
+            );
+        }
+        Ok(())
+    }
+
     /// Rejects unsupported microVM combinations before opening host resources.
     pub(crate) fn validate_microvm_host_loopback(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -738,6 +818,7 @@ impl Options {
     }
 
     pub(crate) fn validate_microvm_options(&self) -> anyhow::Result<()> {
+        self.validate_microvm_filesystem_topology()?;
         self.validate_microvm_host_loopback()?;
         if self.machine != MachineProfileCli::Microvm {
             anyhow::ensure!(
@@ -1430,6 +1511,196 @@ mod tests {
         assert!(Options::try_parse_from(["openvmm", "--machine", "microvm-v3"]).is_err());
         assert!(Options::try_parse_from(["openvmm", "--machine", "nvx"]).is_err());
         assert!(Options::try_parse_from(["openvmm", "--machine", "unknown"]).is_err());
+    }
+
+    #[test]
+    fn test_microvm_filesystem_topology_is_versioned_and_opt_in() {
+        let defaults = Options::try_parse_from(["openvmm", "--machine", "microvm"]).unwrap();
+        assert_eq!(defaults.microvm.microvm_filesystem_topology, None);
+        for upper in ["scratch", "ramfs"] {
+            let mut args = vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--kernel",
+                "kernel",
+                "--microvm-filesystem-topology",
+                "no-device-v1",
+                "--microvm-sandbox-block",
+                "distro:mem:1M,ro",
+            ];
+            if upper == "scratch" {
+                args.extend(["--microvm-sandbox-block", "scratch:mem:1M"]);
+            } else {
+                args.extend(["--cmdline", "nvx_overlay_upper=ramfs"]);
+            }
+            let opt = Options::try_parse_from(args).unwrap();
+            assert_eq!(
+                opt.microvm.microvm_filesystem_topology,
+                Some(MicrovmFilesystemTopologyCli::NoDeviceV1)
+            );
+            opt.validate_microvm_options().unwrap();
+        }
+        for topology in ["none", "no-device", "no-device-v2", "default"] {
+            assert!(
+                Options::try_parse_from(["openvmm", "--microvm-filesystem-topology", topology,])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn test_microvm_filesystem_topology_rejects_exports_and_snapshots() {
+        let base = [
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--kernel",
+            "kernel",
+            "--microvm-filesystem-topology",
+            "no-device-v1",
+            "--microvm-sandbox-block",
+            "distro:mem:1M,ro",
+            "--microvm-sandbox-block",
+            "scratch:mem:1M",
+        ];
+        for extra in [
+            vec!["--mount", "/share,host,ro"],
+            vec![
+                "--mount-aggregate",
+                "/shares",
+                "--mount-child",
+                "one,host,ro",
+            ],
+            vec!["--mount-deny", "host"],
+            vec!["--mount-allow", "host"],
+            vec!["--mount-write", "host"],
+            vec!["--mount-owner", "vmm"],
+            vec!["--virtio-fs", "share,host"],
+            vec!["--virtio-fs-shmem", "share,host"],
+            vec!["--virtio-9p", "share,host"],
+            vec![
+                "--snapshot-destination",
+                "snapshot",
+                "--snapshot-tier",
+                "platform",
+            ],
+            vec![
+                "--snapshot-destination",
+                "snapshot",
+                "--snapshot-tier",
+                "workload-start",
+            ],
+            vec![
+                "--snapshot-destination",
+                "snapshot",
+                "--snapshot-tier",
+                "instance-checkpoint",
+            ],
+            vec!["--rpc", "path=rpc.sock,transport=ttrpc"],
+            vec!["--ttrpc", "rpc.sock"],
+            vec!["--grpc", "rpc.sock"],
+            vec!["--write-saved-state-proto", "state.proto"],
+            vec!["--cpu-fingerprint", "cpu.json"],
+        ] {
+            let args = base.iter().copied().chain(extra.iter().copied());
+            let opt = Options::try_parse_from(args).unwrap();
+            let error = opt.validate_microvm_options().unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("--microvm-filesystem-topology"),
+                "{extra:?}: {error:#}"
+            );
+        }
+        let restore = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--microvm-filesystem-topology",
+            "no-device-v1",
+            "--restore-snapshot",
+            "snapshot",
+        ])
+        .unwrap();
+        assert!(
+            restore
+                .validate_microvm_options()
+                .unwrap_err()
+                .to_string()
+                .contains("snapshot capture or restore")
+        );
+    }
+
+    #[test]
+    fn test_microvm_filesystem_topology_requires_a_direct_image() {
+        for extra in [
+            vec![],
+            vec!["--machine", "microvm"],
+            vec!["--machine", "microvm", "--kernel", "kernel"],
+            vec![
+                "--machine",
+                "microvm",
+                "--kernel",
+                "kernel",
+                "--microvm-sandbox-block",
+                "scratch:mem:1M",
+            ],
+            vec![
+                "--machine",
+                "microvm",
+                "--kernel",
+                "",
+                "--microvm-sandbox-block",
+                "distro:mem:1M,ro",
+                "--microvm-sandbox-block",
+                "scratch:mem:1M",
+            ],
+        ] {
+            let opt = Options::try_parse_from(
+                ["openvmm", "--microvm-filesystem-topology", "no-device-v1"]
+                    .into_iter()
+                    .chain(extra),
+            )
+            .unwrap();
+            assert!(opt.validate_microvm_options().is_err());
+        }
+    }
+
+    #[test]
+    fn test_microvm_no_device_topology_rejects_discovery_overrides() {
+        for token in [
+            "virtio_mmio.device=0x1000@0xd0001000:6",
+            "virtio-mmio.device=0x1000@0xd0001000:6",
+            "virtio-mmio.device",
+            "virtfs_tag=microvm",
+            "virtfs-tag=microvm",
+            "virtfs_dir=/share",
+            "virtfs-mode=ro",
+            "virtfs_aggregate=1",
+        ] {
+            let opt = Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--kernel",
+                "kernel",
+                "--microvm-filesystem-topology",
+                "no-device-v1",
+                "--microvm-sandbox-block",
+                "distro:mem:1M,ro",
+                "--microvm-sandbox-block",
+                "scratch:mem:1M",
+                "--cmdline",
+                token,
+            ])
+            .unwrap();
+            let error = opt.validate_microvm_options().unwrap_err();
+            assert!(
+                error.to_string().contains("discovery"),
+                "{token}: {error:#}"
+            );
+        }
     }
 
     #[test]

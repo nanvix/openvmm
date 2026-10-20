@@ -47,9 +47,9 @@ describes the source definitions.
   devices described below. User arguments cannot override `earlycon=`,
   `console=`, `virtio_mmio.device=`, `virtnet_*=`, or `virtfs_*=`.
 
-  One virtio-fs slot is exposed at MMIO `0xd0001000`, IRQ 6 and remains
-  dormant when neither `--mount` nor `--mount-aggregate` is given; either one
-  binds HostFs to it;
+  By default, one virtio-fs slot is exposed at MMIO `0xd0001000`, IRQ 6 and
+  remains dormant when neither `--mount` nor `--mount-aggregate` is given;
+  either one binds HostFs to it;
   one optional `--virtio-console <BACKEND>` is exposed at MMIO `0xd0002000`,
   IRQ 7 as the boot/log console (`hvc1`); and `--microvm-sandbox-block`
   exposes fixed distro, runtime, custom, and scratch slots starting at MMIO
@@ -64,6 +64,24 @@ describes the source definitions.
   MP 1.4 tables at `0x0` and `0x400`; `boot_params` is at `0x2000`, the command
   line starts at `0x20000`, and no ACPI or SMBIOS data is exposed. Host-driven
   save/restore, pulse-save/restore, and worker restart remain unavailable.
+
+  `--microvm-filesystem-topology no-device-v1` explicitly selects a
+  zero-export, direct-image cold topology without any virtio-fs device, tag,
+  MMIO transport, IRQ, or discovery token. It requires `--kernel` and a
+  read-only `distro` sandbox block, using the existing scratch or RAM-backed
+  overlay rules. Omitting the option preserves the dormant fixed slot.
+  Every filesystem export and mount-policy option, snapshot capture, and
+  restore are incompatible. RPC-server and other non-launch modes reject
+  the option rather than ignoring it.
+
+  A host launch planner may select `no-device-v1` only after validating that
+  its complete export and guest-mapping inventories are empty and that this
+  is a cold launch, not a reusable template capture or restore. A mapped
+  cold launch keeps its aggregate; a reusable template capture keeps the
+  dormant slot. This topology does not change snapshot ABI or existing
+  restore matching. Adding mappings later requires a new compatible launch;
+  there is no filesystem hotplug. Networking remains independent: without
+  `--net`, no NIC is created.
 
   `microvm` may also expose a dedicated control virtio-console at MMIO
   `0xd0007000`, IRQ 3. It requires the boot virtio-console, preserves

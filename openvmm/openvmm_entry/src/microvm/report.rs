@@ -265,7 +265,10 @@ fn validate_destination(path: &Path) -> anyhow::Result<()> {
 /// Rejects microVM options that must fail before any host resource is opened,
 /// writing the bounded outcome report for the failure.
 pub(crate) fn validate_early_options(opt: &Options) -> anyhow::Result<()> {
-    if let Err(error) = opt.validate_microvm_host_loopback() {
+    if let Err(error) = opt
+        .validate_microvm_host_loopback()
+        .and_then(|()| opt.validate_microvm_filesystem_topology())
+    {
         let result = Err(error);
         if let Some(report) = MicrovmReportPlan::from_options(opt)? {
             report.write(&result)?;
@@ -311,6 +314,7 @@ mod tests {
     use super::*;
     use crate::vm_controller::MicrovmTeardownError;
     use crate::vm_controller::MicrovmTeardownStatus;
+    use clap::Parser;
     use serde_json::Value;
     use test_with_tracing::test;
 
@@ -425,5 +429,32 @@ mod tests {
         fs_err::write(&path, b"existing").unwrap();
         let error = validate_destination(&path).unwrap_err();
         assert!(error.to_string().contains("destination already exists"));
+    }
+
+    #[test]
+    fn filesystem_topology_is_rejected_before_restore_or_rpc_io() {
+        for extra in [
+            ["--restore-snapshot", "missing-snapshot"],
+            ["--ttrpc", "existing-rpc.sock"],
+        ] {
+            let opt = Options::try_parse_from(
+                [
+                    "openvmm",
+                    "--machine",
+                    "microvm",
+                    "--microvm-filesystem-topology",
+                    "no-device-v1",
+                ]
+                .into_iter()
+                .chain(extra),
+            )
+            .unwrap();
+            let error = validate_early_options(&opt).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("--microvm-filesystem-topology")
+            );
+        }
     }
 }
