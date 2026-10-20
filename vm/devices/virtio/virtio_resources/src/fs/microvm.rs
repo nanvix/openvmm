@@ -10,6 +10,42 @@
 
 use mesh::MeshPayload;
 
+/// Read-only, little-endian microVM filesystem layout appended to the
+/// standard virtio-fs config. Child indices refer to attachment/receipt order;
+/// child names and host identities come from the authenticated activation,
+/// not from guest-supplied paths or a boot command-line token.
+pub mod layout {
+    /// Byte offset in device config, after the tag and request queue count.
+    pub const CONFIG_OFFSET: u16 = 40;
+    /// `MVFS` in little-endian byte order.
+    pub const MAGIC: u32 = u32::from_le_bytes(*b"MVFS");
+    /// Layout schema version, independent of the platform-template envelope.
+    pub const VERSION: u32 = 1;
+    /// Eight u32 fields: magic, version, header size, state, access, owner,
+    /// child count, and child record size.
+    pub const HEADER_SIZE: u32 = 32;
+    /// Each child is a u16 index followed by u8 kind and u8 access.
+    pub const CHILD_SIZE: u32 = 4;
+    /// No backend; no access mode or children.
+    pub const DORMANT: u32 = 0;
+    /// One directory backend; no child records.
+    pub const SINGLE: u32 = 1;
+    /// Synthetic root with the following ordered child records.
+    pub const AGGREGATE: u32 = 2;
+    /// Directory child.
+    pub const DIRECTORY: u8 = 1;
+    /// Regular-file child.
+    pub const FILE: u8 = 2;
+    /// Host-enforced read-only access.
+    pub const READ_ONLY: u8 = 1;
+    /// Host-enforced read-write access, subject to subtree policy.
+    pub const READ_WRITE: u8 = 2;
+    /// Host operations run as the VMM.
+    pub const OWNER_VMM: u32 = 0;
+    /// Host operations run as the guest caller with root squashed.
+    pub const OWNER_CALLER: u32 = 1;
+}
+
 #[derive(MeshPayload)]
 pub enum VirtioFsProfile {
     Standard,

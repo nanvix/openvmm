@@ -932,6 +932,7 @@ pub(crate) fn microvm_filesystem_from_snapshot(
 pub(crate) fn microvm_filesystem_slot_from_snapshot(
     contract: &openvmm_helpers::snapshot::microvm::SnapshotMachineContract,
 ) -> anyhow::Result<bool> {
+    openvmm_helpers::snapshot::microvm::validate_microvm_platform_template(contract)?;
     let has_device = contract
         .devices
         .iter()
@@ -954,6 +955,7 @@ pub(crate) fn microvm_filesystem_slot_from_snapshot(
 /// Returns the effective filesystem that `request` attaches. A restore must
 /// supply exactly the snapshot's filesystem, unless the snapshot's slot is
 /// dormant, in which case one `--mount` may bind a new filesystem to it.
+/// Only a versioned platform template also accepts an aggregate.
 pub(super) fn effective_microvm_filesystem(
     request: Option<MicrovmFilesystemRequest<'_>>,
     policy: MicrovmFilesystemPolicyPaths<'_>,
@@ -987,10 +989,16 @@ pub(super) fn effective_microvm_filesystem(
                 == openvmm_helpers::snapshot::microvm::MICROVM_FILESYSTEM_SLOT_VERSION,
             "snapshot does not support restore-time microVM filesystem attachment"
         );
-        // Only the dormant slot exists in the snapshot's machine.
         anyhow::ensure!(
-            matches!(request, MicrovmFilesystemRequest::Single(_)),
-            "a dormant-slot snapshot can attach only a --mount on restore"
+            matches!(request, MicrovmFilesystemRequest::Single(_))
+                || restore.platform_template_abi_version
+                    == openvmm_defs::microvm::MICROVM_PLATFORM_TEMPLATE_ABI_VERSION,
+            "an older or workload dormant-slot snapshot can attach only a --mount on restore; an aggregate requires the versioned platform-template ABI"
+        );
+        anyhow::ensure!(
+            restore.platform_template_abi_version == 0
+                || owner == openvmm_defs::microvm::MicrovmFilesystemOwner::Vmm,
+            "platform-template filesystem ownership must remain vmm"
         );
         return microvm_filesystem_from_request(request, policy, owner).map(Some);
     };
@@ -1117,6 +1125,16 @@ mod tests {
     fn dormant_filesystem_contract() -> openvmm_helpers::snapshot::microvm::SnapshotMachineContract
     {
         share_contract(None)
+    }
+
+    fn platform_filesystem_contract() -> openvmm_helpers::snapshot::microvm::SnapshotMachineContract
+    {
+        let mut contract = dormant_filesystem_contract();
+        contract.set_effective_command_line(format!(
+            "{} nvx_snapshot_tier=platform",
+            contract.effective_command_line
+        ));
+        contract.with_platform_template().unwrap()
     }
 
     /// Builds the contract of a cold-booted machine with `share` attached to
@@ -2024,6 +2042,165 @@ mod tests {
             error.to_string().contains("requires the --mount"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn platform_template_attaches_different_aggregate_children_without_boot_tokens() {
+        use openvmm_defs::microvm::MicrovmFilesystemAccess;
+        use openvmm_defs::microvm::MicrovmFilesystemChildKind;
+
+        let contract = platform_filesystem_contract();
+        let saved = contract.clone();
+        assert!(!contract.effective_command_line.contains("virtfs_"));
+        let workspace = policy_share();
+        let tools = tempfile::tempdir().unwrap();
+        let settings = tempfile::NamedTempFile::new().unwrap();
+        let deny = workspace.path().join("logs").display().to_string();
+        let allow = workspace
+            .path()
+            .join("logs")
+            .join("payloads")
+            .display()
+            .to_string();
+        let write = workspace.path().join("out").display().to_string();
+        let first = options_filesystem(
+            &aggregate_options(
+                &[
+                    format!("work,{},rw", workspace.path().display()),
+                    format!("tools,{},ro", tools.path().display()),
+                    format!("settings,{},ro,file", settings.path().display()),
+                ],
+                &[
+                    "--restore-snapshot",
+                    "snapshot",
+                    "--mount-deny",
+                    &deny,
+                    "--mount-allow",
+                    &allow,
+                    "--mount-write",
+                    &write,
+                ],
+            ),
+            Some(&contract),
+        )
+        .unwrap();
+        assert_eq!(first.config.owner, VMM);
+        assert_eq!(first.config.children[0].denied_paths, ["logs"]);
+        assert_eq!(first.config.children[0].allowed_paths, ["logs/payloads"]);
+        assert_eq!(first.config.children[0].writable_paths, ["out"]);
+        assert_eq!(
+            first.config.children[1].access,
+            MicrovmFilesystemAccess::ReadOnly
+        );
+        assert_eq!(
+            first.config.children[2].kind,
+            MicrovmFilesystemChildKind::File
+        );
+
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let second = options_filesystem(
+            &aggregate_options(
+                &[format!("output,{},rw,file", output.path().display())],
+                &["--restore-snapshot", "snapshot"],
+            ),
+            Some(&contract),
+        )
+        .unwrap();
+        assert_eq!(second.config.children.len(), 1);
+        assert_eq!(
+            second.config.children[0].kind,
+            MicrovmFilesystemChildKind::File
+        );
+        assert_eq!(
+            second.config.children[0].access,
+            MicrovmFilesystemAccess::ReadWrite
+        );
+        assert_ne!(first.attachment, second.attachment);
+        assert_eq!(first.attachment.stable_id, MICROVM_FILESYSTEM_STABLE_ID);
+        assert_eq!(second.attachment.stable_id, MICROVM_FILESYSTEM_STABLE_ID);
+        assert_eq!(contract, saved);
+        assert!(
+            single_filesystem(None, &[], VMM, Some(&contract))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn platform_template_rejects_changed_slot_geometry_and_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let options = aggregate_options(
+            &[format!("work,{},ro", root.path().display())],
+            &["--restore-snapshot", "snapshot"],
+        );
+        let contract = platform_filesystem_contract();
+        let error = effective_microvm_filesystem(
+            MicrovmFilesystemRequest::from_options(&options),
+            MicrovmFilesystemPolicyPaths::default(),
+            openvmm_defs::microvm::MicrovmFilesystemOwner::Caller,
+            Some(&contract),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("ownership must remain vmm"),
+            "{error:#}"
+        );
+
+        for field in [
+            "mmio", "length", "irq", "features", "queues", "identity", "version",
+        ] {
+            let mut changed = contract.clone();
+            let device = changed
+                .devices
+                .iter_mut()
+                .find(|device| device.stable_id == MICROVM_FILESYSTEM_STABLE_ID)
+                .unwrap();
+            match field {
+                "mmio" => device.ranges[0].start += 0x1000,
+                "length" => device.ranges[0].length *= 2,
+                "irq" => device.irq = Some(5),
+                "features" => device.feature_banks[0] ^= 1,
+                "queues" => device.queue_max_sizes[0] *= 2,
+                "identity" => device.stable_id = "fs:microvm1".to_owned(),
+                "version" => changed.platform_template_abi_version += 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                options_filesystem(&options, Some(&changed)).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn platform_template_aggregate_reuses_host_path_and_policy_validation() {
+        let root = policy_share();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let contract = platform_filesystem_contract();
+        let outside = tempfile::tempdir().unwrap();
+        let write = root.path().join("out");
+        for (child, policy) in [
+            (format!("file,{},ro", file.path().display()), vec![]),
+            (
+                format!("directory,{},ro,file", root.path().display()),
+                vec![],
+            ),
+            (
+                format!("work,{},rw", root.path().display()),
+                vec!["--mount-deny", outside.path().to_str().unwrap()],
+            ),
+            (
+                format!("work,{},ro", root.path().display()),
+                vec!["--mount-write", write.to_str().unwrap()],
+            ),
+        ] {
+            let mut arguments = vec!["--restore-snapshot", "snapshot"];
+            arguments.extend(policy);
+            assert!(
+                options_filesystem(&aggregate_options(&[child], &arguments), Some(&contract))
+                    .is_err()
+            );
+        }
     }
 
     #[test]

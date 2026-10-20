@@ -334,6 +334,13 @@ impl VmController {
                 response.time.time,
                 response.time.cpu_profile,
             )?;
+            let machine_contract = if self.microvm.snapshot_tier
+                == Some(crate::cli_args::microvm::SnapshotTierCli::Platform)
+            {
+                machine_contract.with_platform_template()?
+            } else {
+                machine_contract
+            };
             let manifest = openvmm_helpers::snapshot::SnapshotManifest {
                 version: openvmm_helpers::snapshot::MANIFEST_VERSION,
                 created_at: std::time::SystemTime::now().into(),

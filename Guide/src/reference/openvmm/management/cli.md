@@ -342,7 +342,9 @@ describes the source definitions.
   same guest target and the same `--mount-child` options, in the same order,
   with the same canonical host paths, kinds, modes, and policy paths.
   A snapshot captured without a filesystem may remain dormant or bind one new
-  `--mount` to the slot. The resumed
+  `--mount` to the slot. A newly versioned platform template also accepts an
+  aggregate in that same slot, with validated children and VMM ownership.
+  Older and workload contracts do not gain that permission. The resumed
   guest must then explicitly run `mount -t virtiofs microvm <GUEST_TARGET>`
   because its cold-boot mount hook has already completed.
   See [virtio-fs](../../devices/virtio/virtio-fs.md).
@@ -437,7 +439,10 @@ describes the source definitions.
   host paths, guest target, and `ro`/`rw` modes while also supplying live
   roots with the same saved identities. A snapshot advertising the dormant
   slot may instead accept one new `--mount`; snapshots without that
-  capability reject additive attachment.
+  capability reject additive attachment. A version-1 platform template can
+  also attach an aggregate. Zero mappings leave the slot dormant; the saved
+  command line is unchanged, and guests discover the layout through
+  [read-only device config](../../devices/virtio/microvm-fs-layout.md).
 
   When the snapshot contains virtio-net, restore also requires
   `--network-profile portable`; the snapshot's profile and canonical egress
@@ -525,6 +530,9 @@ describes the source definitions.
 * `--snapshot-tier <TIER>`: Required for snapshot capture with sandbox blocks. Choose
   `platform`, `workload-start`, or `instance-checkpoint`. The first two are
   reusable clone policies; instance checkpoints use single-use resume policy.
+  New platform captures require the dormant filesystem slot and record
+  platform-template ABI version 1, permitting a validated aggregate on restore
+  without changing device geometry or the saved command line.
 * `--snapshot-block-identity <MODE>`: Select `sha256` (the default) or
   `generation`. SHA-256 computes and verifies every bound block. Generation
   mode requires `--snapshot-generation-id <32-HEX-DIGITS>` and records that

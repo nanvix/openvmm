@@ -23,6 +23,9 @@ use vmotherboard::options::BaseChipsetManifest;
 
 /// The persisted microVM ABI version.
 pub const MICROVM_ABI_VERSION_2: u32 = 2;
+/// Platform-template contract envelope. Device inventory and geometry remain
+/// part of the immutable compatibility key, not interchangeable capabilities.
+pub const MICROVM_PLATFORM_TEMPLATE_ABI_VERSION: u32 = 1;
 /// Linux memory-block granularity used for microVM restore-time expansion.
 pub const MICROVM_MEMORY_BLOCK_SIZE_BYTES: u64 = 128 * 1024 * 1024;
 

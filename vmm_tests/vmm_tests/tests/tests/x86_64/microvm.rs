@@ -190,3 +190,108 @@ async fn phase_1_lifecycle(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyho
 
     vm.teardown().await
 }
+
+#[openvmm_test_no_agent(linux_direct_x64)]
+async fn microvm_dormant_filesystem_layout(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+) -> anyhow::Result<()> {
+    use openvmm_defs::config::LoadMode;
+    use openvmm_defs::config::VirtioBus;
+    use virtio_resources::fs::VirtioFsBackend;
+    use virtio_resources::fs::VirtioFsHandle;
+    use virtio_resources::fs::microvm::VirtioFsProfile;
+    use virtio_resources::fs::microvm::layout;
+    use vm_resource::IntoResource as _;
+
+    const MARKER: &[u8] = b"MICROVM-DORMANT-FILESYSTEM-LAYOUT-READY\n";
+    let slot = &openvmm_defs::microvm::MICROVM_FILESYSTEM_SLOTS[0];
+    let base = slot.mmio_base + 0x100 + u64::from(layout::CONFIG_OFFSET);
+    let mut checks = String::new();
+    use std::fmt::Write as _;
+    for (offset, value) in [
+        (0, layout::MAGIC),
+        (4, layout::VERSION),
+        (8, layout::HEADER_SIZE),
+        (12, layout::DORMANT),
+        (16, 0),
+        (20, layout::OWNER_VMM),
+        (24, 0),
+        (28, layout::CHILD_SIZE),
+    ] {
+        writeln!(&mut checks, "check_word {:#x} {value}", base + offset)?;
+    }
+    let script = format!(
+        "#!/bin/busybox sh\n\
+         set -eu\n\
+         mount -t devtmpfs devtmpfs /dev\n\
+         mount -t proc proc /proc\n\
+         fail() {{\n\
+             {}\
+             printf '\\x01' | dd of=/dev/port bs=1 seek=1540 count=1 conv=notrunc 2>/dev/null\n\
+             while :; do sleep 1; done\n\
+         }}\n\
+         check_word() {{\n\
+             actual=$(busybox devmem \"$1\" 32) || fail\n\
+             [ \"$((actual))\" -eq \"$2\" ] || fail\n\
+         }}\n\
+         if grep -q 'virtfs_aggregate=' /proc/cmdline; then fail; fi\n\
+         {checks}\
+         {}\
+         printf '\\x00' | dd of=/dev/port bs=1 seek=1540 count=1 conv=notrunc 2>/dev/null\n\
+         while :; do sleep 1; done\n",
+        portb_output(b"MICROVM-FILESYSTEM-LAYOUT-FAILED\n")?,
+        portb_output(MARKER)?,
+    );
+    let config = config.with_microvm_machine(1);
+    let initrd =
+        config.prepare_initrd_with_file("microvm-layout-test", script.as_bytes(), 0o100755)?;
+    let mut vm = config
+        .with_prebuilt_initrd(initrd)
+        .modify_backend(|config| {
+            config.with_custom_config(|config| {
+                config.virtio_devices.push((
+                    VirtioBus::Mmio,
+                    VirtioFsHandle {
+                        tag: slot.tag.to_owned(),
+                        fs: VirtioFsBackend::Dormant,
+                        profile: VirtioFsProfile::MicrovmDormant {
+                            stable_id: slot.stable_id.to_owned(),
+                        },
+                    }
+                    .into_resource(),
+                ));
+                let LoadMode::Linux { cmdline, .. } = &mut config.load_mode else {
+                    unreachable!("the test requires Linux direct boot");
+                };
+                openvmm_defs::microvm::append_microvm_virtio_discovery(
+                    cmdline,
+                    None,
+                    true,
+                    &[],
+                    false,
+                    false,
+                    &[],
+                )
+                .unwrap();
+            })
+        })
+        .run_without_agent()
+        .await?;
+    CancelContext::new()
+        .with_timeout(Duration::from_secs(30))
+        .until_cancelled(vm.backend().wait_for_microvm_portb_bytes(MARKER))
+        .await
+        .context("guest did not discover the dormant filesystem layout without a boot token")??;
+    let halt = CancelContext::new()
+        .with_timeout(Duration::from_secs(30))
+        .until_cancelled(vm.wait_for_halt())
+        .await
+        .context("layout guest did not shut down")??;
+    assert_eq!(halt.reason, PetriHaltReason::PowerOff);
+    assert!(
+        halt.detail.contains("code: 0"),
+        "unexpected guest shutdown: {}",
+        halt.detail
+    );
+    vm.teardown().await
+}

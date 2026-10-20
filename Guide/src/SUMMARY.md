@@ -113,6 +113,7 @@
   - [PCI IDs](./reference/devices/pci_ids.md)
   - [Virtio]()
       - [virtio-fs](./reference/devices/virtio/virtio-fs.md)
+      - [microVM filesystem layout](./reference/devices/virtio/microvm-fs-layout.md)
       - [virtio-9p]()
       - [virtio-net]()
       - [virtio-pmem]()

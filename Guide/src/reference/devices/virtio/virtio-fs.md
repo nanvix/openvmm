@@ -353,10 +353,18 @@ access, such as a handle open for writing on a file that a guest caller owns.
 OpenVMM releases that predate `--mount-owner` reject the device state of a
 `caller` attachment rather than restore it as `vmm`.
 
-A snapshot captured without `--mount` records the slot as dormant. It may
+A snapshot captured without a filesystem records the slot as dormant. It may
 restore without an attachment, or bind one new `--mount` attachment to the
-slot, but not an aggregate. Because execution resumes after the cold-boot
-mount hook, the guest must mount the newly attached backend explicitly:
+slot. Newly captured platform templates also version the platform-template
+ABI and may populate that same slot with a validated aggregate. Older and
+workload snapshots do not acquire that permission. The tag, device placement,
+queues, features, and saved command line remain unchanged; no device is
+hotplugged. Zero mappings leave the slot dormant.
+
+The [microVM filesystem layout](microvm-fs-layout.md) exposes the attachment
+through read-only device config, including on a restore whose saved command
+line has no `virtfs_aggregate=1`. Because execution resumes after the cold-boot
+mount hook, an activated guest must mount the newly attached backend explicitly:
 
 ```bash
 mkdir -p /mnt/share

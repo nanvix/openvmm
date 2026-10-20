@@ -72,6 +72,8 @@ pub struct VirtioFsDevice {
     #[inspect(skip)]
     pub(crate) config: VirtioFsDeviceConfig,
     #[inspect(skip)]
+    pub(crate) microvm_layout: Vec<u8>,
+    #[inspect(skip)]
     pub(crate) fs: Arc<fuse::Session>,
     #[inspect(skip)]
     pub(crate) workers: Vec<TaskControl<VirtioFsWorker, VirtioFsQueue>>,
@@ -224,6 +226,7 @@ impl VirtioFsDevice {
             task_name: format!("virtiofs-{}", tag).into(),
             driver: driver_source.simple(),
             config,
+            microvm_layout: Vec::new(),
             fs: Arc::new(fuse::Session::new(fs)),
             workers: Vec::new(),
             shmem_size,
@@ -246,7 +249,8 @@ impl VirtioDevice for VirtioFsDevice {
             device_id: virtio::spec::VirtioDeviceType::FS,
             device_features: crate::microvm::device::device_features(self),
             max_queues: 1 + self.num_request_queues as u16,
-            device_register_length: self.config.as_bytes().len() as u32,
+            device_register_length: (self.config.as_bytes().len() + self.microvm_layout.len())
+                as u32,
             shared_memory: DeviceTraitsSharedMemory {
                 id: 0,
                 size: self.shmem_size,
@@ -261,8 +265,13 @@ impl VirtioDevice for VirtioFsDevice {
     async fn read_registers_u32(&mut self, offset: u16) -> u32 {
         let offset = offset as usize;
         let config = self.config.as_bytes();
-        config
-            .get(offset..offset.saturating_add(4))
+        let bytes = if offset < config.len() {
+            config.get(offset..offset + 4)
+        } else {
+            let offset = offset - config.len();
+            self.microvm_layout.get(offset..offset + 4)
+        };
+        bytes
             .and_then(|bytes| bytes.try_into().ok())
             .map(u32::from_le_bytes)
             .unwrap_or(0)

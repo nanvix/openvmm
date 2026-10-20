@@ -690,6 +690,11 @@ pub struct SnapshotMachineContract {
     pub cpu_profile: Option<openvmm_defs::time_abi::SnapshotCpuProfile>,
     // Field 33 held the policies of a second virtio-fs slot, which the
     // microVM no longer has. It is retired, and its number is never reused.
+    /// Opt-in platform-template ABI, or zero for exact-match older and
+    /// workload contracts. Version 1 permits an aggregate in the saved
+    /// dormant filesystem slot, with device-observable layout version 1.
+    #[mesh(34)]
+    pub platform_template_abi_version: u32,
 }
 
 impl SnapshotMachineContract {
@@ -698,6 +703,62 @@ impl SnapshotMachineContract {
         self.effective_command_line_sha256 = sha2::Sha256::digest(command_line.as_bytes()).to_vec();
         self.effective_command_line = command_line;
     }
+
+    /// Versions a newly captured platform template without changing its
+    /// saved command line or device inventory.
+    pub fn with_platform_template(mut self) -> anyhow::Result<Self> {
+        self.platform_template_abi_version =
+            openvmm_defs::microvm::MICROVM_PLATFORM_TEMPLATE_ABI_VERSION;
+        validate_microvm_platform_template(&self)?;
+        Ok(self)
+    }
+}
+
+/// Validates the dormant filesystem primitive of the shared platform-template
+/// ABI. Other devices retain their exact saved identities and geometry.
+pub fn validate_microvm_platform_template(
+    contract: &SnapshotMachineContract,
+) -> anyhow::Result<()> {
+    match contract.platform_template_abi_version {
+        0 => return Ok(()),
+        openvmm_defs::microvm::MICROVM_PLATFORM_TEMPLATE_ABI_VERSION => {}
+        version => anyhow::bail!("snapshot platform-template ABI version {version} is unsupported"),
+    }
+    let slot = &openvmm_defs::microvm::MICROVM_FILESYSTEM_SLOTS[0];
+    anyhow::ensure!(
+        contract.microvm_filesystem_slot_version == MICROVM_FILESYSTEM_SLOT_VERSION
+            && contract.microvm_filesystem.is_none()
+            && !contract
+                .attachments
+                .iter()
+                .any(|attachment| attachment.stable_id == slot.stable_id),
+        "platform template requires the existing dormant microVM filesystem slot"
+    );
+    let mut devices = contract
+        .devices
+        .iter()
+        .filter(|device| device.stable_id == slot.stable_id);
+    let device = devices
+        .next()
+        .context("platform template is missing its fixed microVM filesystem device")?;
+    anyhow::ensure!(
+        devices.next().is_none()
+            && *device == microvm_filesystem_device(slot, device.order as usize),
+        "platform template microVM filesystem identity or geometry is incompatible"
+    );
+    anyhow::ensure!(
+        contract
+            .effective_command_line
+            .split_ascii_whitespace()
+            .filter(|token| token.starts_with("nvx_snapshot_tier="))
+            .eq(["nvx_snapshot_tier=platform"])
+            && !contract
+                .effective_command_line
+                .split_ascii_whitespace()
+                .any(|token| token.starts_with("virtfs_")),
+        "platform template requires an invariant saved command line without filesystem attachment tokens"
+    );
+    Ok(())
 }
 
 /// The live host side of the microVM filesystem that a snapshot contract
@@ -1496,6 +1557,7 @@ pub fn microvm_machine_contract(
         memory_expansion_ranges,
         time: Some(time),
         cpu_profile: Some(cpu_profile),
+        platform_template_abi_version: 0,
     };
     contract.set_effective_command_line(effective_command_line);
     validate_machine_contract_shape(&contract, memory_size, processor_count)?;
@@ -1539,6 +1601,7 @@ pub fn validate_supported_microvm_contract(
         contract.boot_layout_version,
         MICROVM_BOOT_LAYOUT_VERSION,
     );
+    validate_microvm_platform_template(contract)?;
     Ok(())
 }
 
@@ -1571,6 +1634,10 @@ pub fn validate_microvm_machine_contract(
     anyhow::ensure!(
         contract.microvm_filesystem_slot_version == expected.microvm_filesystem_slot_version,
         "snapshot microVM filesystem slot capability doesn't match the requested machine"
+    );
+    anyhow::ensure!(
+        contract.platform_template_abi_version == expected.platform_template_abi_version,
+        "snapshot platform-template ABI doesn't match the requested machine"
     );
     anyhow::ensure!(
         contract.source_hypervisor == expected.source_hypervisor,
@@ -2215,6 +2282,11 @@ pub(super) fn validate_snapshot_tier(manifest: &SnapshotManifest) -> anyhow::Res
         );
         return Ok(());
     };
+    anyhow::ensure!(
+        contract.platform_template_abi_version == 0
+            || manifest.snapshot_tier == SNAPSHOT_TIER_PLATFORM,
+        "platform-template ABI requires the platform snapshot tier"
+    );
     if contract.microvm_sandbox_blocks.is_empty() {
         anyhow::ensure!(
             manifest.snapshot_tier.is_empty()
@@ -2476,6 +2548,7 @@ pub(super) fn test_machine_contract() -> SnapshotMachineContract {
         memory_expansion_ranges: Vec::new(),
         time: Some(super::time::tests::test_time_contract()),
         cpu_profile: Some(super::time::tests::test_cpu_profile()),
+        platform_template_abi_version: 0,
     };
     contract.set_effective_command_line("console=hvc0".to_owned());
     contract
@@ -4150,6 +4223,91 @@ mod tests {
         let processor_count = u32::try_from(contract.topology.apic_ids.len()).unwrap();
         contract
             .set_effective_command_line(canonical_worker_platform_command_line(processor_count));
+    }
+
+    fn platform_template_manifest() -> SnapshotManifest {
+        let mut manifest = paired_scratch_manifest(&[0x5a; 512]);
+        make_platform_snapshot(&mut manifest);
+        let mut contract = manifest.machine_contract.take().unwrap();
+        contract
+            .microvm_sandbox_blocks
+            .last_mut()
+            .unwrap()
+            .restore_mode
+            .clear();
+        let slot = &openvmm_defs::microvm::MICROVM_FILESYSTEM_SLOTS[0];
+        let device = microvm_filesystem_device(slot, contract.devices.len());
+        contract
+            .state_unit_names
+            .push(device.state_unit_name.clone());
+        contract.devices.push(device);
+        contract.microvm_filesystem_slot_version = MICROVM_FILESYSTEM_SLOT_VERSION;
+        contract.set_effective_command_line(format!(
+            "{} {}",
+            contract.effective_command_line,
+            slot.discovery_token()
+        ));
+        manifest.machine_contract = Some(contract.with_platform_template().unwrap());
+        manifest
+    }
+
+    #[test]
+    fn platform_template_abi_is_platform_only_and_exactly_compared() {
+        let manifest = platform_template_manifest();
+        validate_manifest_contents(&manifest).unwrap();
+        let contract = manifest.machine_contract.as_ref().unwrap();
+        assert!(
+            !contract
+                .effective_command_line
+                .contains("virtfs_aggregate=")
+        );
+        validate_microvm_machine_contract(&manifest, contract).unwrap();
+
+        let mut old = contract.clone();
+        old.platform_template_abi_version = 0;
+        let error = validate_microvm_machine_contract(&manifest, &old).unwrap_err();
+        assert!(
+            error.to_string().contains("platform-template ABI"),
+            "{error:#}"
+        );
+        for tier in [
+            "",
+            SNAPSHOT_TIER_WORKLOAD_START,
+            SNAPSHOT_TIER_INSTANCE_CHECKPOINT,
+        ] {
+            let mut changed = manifest.clone();
+            changed.snapshot_tier = tier.to_owned();
+            let error = validate_snapshot_tier(&changed).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires the platform snapshot tier"),
+                "{error:#}"
+            );
+        }
+
+        let mut missing = contract.clone();
+        missing.microvm_filesystem_slot_version = 0;
+        assert!(validate_microvm_platform_template(&missing).is_err());
+        let mut unsupported = contract.clone();
+        unsupported.platform_template_abi_version += 1;
+        assert!(validate_supported_microvm_contract(&unsupported).is_err());
+        let mut boot_tokens = contract.clone();
+        boot_tokens.set_effective_command_line(format!(
+            "{} virtfs_aggregate=1",
+            contract.effective_command_line
+        ));
+        assert!(validate_microvm_platform_template(&boot_tokens).is_err());
+        assert!(
+            generated_filesystem_contract("whp")
+                .with_platform_template()
+                .is_err()
+        );
+        assert!(
+            generated_dormant_filesystem_contract()
+                .with_platform_template()
+                .is_err()
+        );
     }
 
     #[test]

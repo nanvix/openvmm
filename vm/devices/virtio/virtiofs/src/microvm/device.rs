@@ -20,6 +20,7 @@ use task_control::TaskControl;
 use virtio::device::saved_state::DeviceQueueState;
 use virtio::device::saved_state::DeviceStateValidator;
 use virtio::spec::VirtioDeviceFeatures;
+use virtio_resources::fs::microvm::layout;
 use vmcore::save_restore::RestoreError;
 use vmcore::save_restore::SaveError;
 use vmcore::save_restore::SavedStateBlob;
@@ -54,6 +55,7 @@ impl VirtioFsDevice {
             notify_corruption,
             MICROVM_REQUEST_QUEUES,
         );
+        device.microvm_layout = Self::layout_config(Some(&profile));
         device.microvm_attachment_id = Some(attachment_id);
         device.microvm_profile = Some(profile);
         device.caller_identity = fs.caller_identity();
@@ -79,8 +81,60 @@ impl VirtioFsDevice {
             notify_corruption,
             MICROVM_REQUEST_QUEUES,
         );
+        device.microvm_layout = Self::layout_config(None);
         device.microvm_attachment_id = Some(stable_id);
         Ok(device)
+    }
+
+    fn layout_config(profile: Option<&MicroVmVirtioFsProfile>) -> Vec<u8> {
+        let access = |read_only| {
+            if read_only {
+                layout::READ_ONLY
+            } else {
+                layout::READ_WRITE
+            }
+        };
+        let (state, mode, owner, children) = match profile {
+            None => (layout::DORMANT, 0, layout::OWNER_VMM, &[][..]),
+            Some(profile) => (
+                if profile.is_aggregate() {
+                    layout::AGGREGATE
+                } else {
+                    layout::SINGLE
+                },
+                u32::from(access(profile.is_readonly())),
+                match profile.owner_mode() {
+                    MicroVmOwnerMode::Vmm => layout::OWNER_VMM,
+                    MicroVmOwnerMode::Caller => layout::OWNER_CALLER,
+                },
+                profile.children(),
+            ),
+        };
+        let mut bytes = Vec::with_capacity(
+            layout::HEADER_SIZE as usize + children.len() * layout::CHILD_SIZE as usize,
+        );
+        for field in [
+            layout::MAGIC,
+            layout::VERSION,
+            layout::HEADER_SIZE,
+            state,
+            mode,
+            owner,
+            children.len() as u32,
+            layout::CHILD_SIZE,
+        ] {
+            bytes.extend_from_slice(&field.to_le_bytes());
+        }
+        for (index, child) in (0_u16..).zip(children) {
+            bytes.extend_from_slice(&index.to_le_bytes());
+            bytes.push(if child.is_file() {
+                layout::FILE
+            } else {
+                layout::DIRECTORY
+            });
+            bytes.push(access(child.is_readonly()));
+        }
+        bytes
     }
 
     /// Creates the fixed no-DAX microVM HostFs device directly from the
@@ -294,6 +348,7 @@ pub(crate) fn device_state_validator(device: &VirtioFsDevice) -> DeviceStateVali
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::MICROVM_AGGREGATE_MAX_CHILDREN;
     use crate::profile::MICROVM_ATTACHMENT_ID;
     use crate::profile::microvm_root_identity;
     use chipset_device::io::IoResult;
@@ -390,6 +445,252 @@ mod tests {
                 VirtioFsDevice::new_microvm_dormant(&driver_source, stable_id.to_owned(), None)
                     .is_err()
             );
+        }
+    }
+
+    #[async_test]
+    async fn microvm_layout_config_is_bounded_and_read_only(driver: DefaultDriver) {
+        let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+        let root = tempfile::tempdir().unwrap();
+        let children = (0..MICROVM_AGGREGATE_MAX_CHILDREN)
+            .map(|index| {
+                MicroVmAggregateChild::new(
+                    index.to_string(),
+                    vec![1],
+                    index % 2 == 0,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let profile =
+            MicroVmVirtioFsProfile::from_aggregate(MICROVM_ATTACHMENT_ID.to_owned(), children)
+                .unwrap();
+        let bytes = VirtioFsDevice::layout_config(Some(&profile));
+        assert_eq!(
+            bytes.len(),
+            layout::HEADER_SIZE as usize
+                + MICROVM_AGGREGATE_MAX_CHILDREN * layout::CHILD_SIZE as usize
+        );
+        assert!(usize::from(layout::CONFIG_OFFSET) + bytes.len() <= 0x1000 - 0x100);
+        assert_eq!(
+            &bytes[bytes.len() - 4..],
+            &[255, 0, layout::DIRECTORY, layout::READ_WRITE]
+        );
+
+        let mut device = VirtioFsDevice::new_microvm_hostfs(
+            &driver_source,
+            MICROVM_ATTACHMENT_ID.to_owned(),
+            microvm_root_identity(root.path()).unwrap(),
+            true,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            MicroVmOwnerMode::Vmm,
+            root.path(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            device.read_registers_u32(layout::CONFIG_OFFSET).await,
+            layout::MAGIC
+        );
+        assert_eq!(
+            device.read_registers_u32(layout::CONFIG_OFFSET + 4).await,
+            layout::VERSION
+        );
+        assert_eq!(
+            device.read_registers_u32(layout::CONFIG_OFFSET + 12).await,
+            layout::SINGLE
+        );
+        assert_eq!(
+            device.read_registers_u32(layout::CONFIG_OFFSET + 16).await,
+            u32::from(layout::READ_ONLY)
+        );
+        device
+            .write_registers_u32(layout::CONFIG_OFFSET + 12, layout::AGGREGATE)
+            .await;
+        assert_eq!(
+            device.read_registers_u32(layout::CONFIG_OFFSET + 12).await,
+            layout::SINGLE
+        );
+        assert_eq!(device.read_registers_u32(u16::MAX).await, 0);
+
+        let mut standard =
+            VirtioFsDevice::new(&driver_source, "standard", DormantMicrovmFs, 0, None);
+        assert_eq!(
+            standard.traits().device_register_length,
+            u32::from(layout::CONFIG_OFFSET)
+        );
+        assert_eq!(standard.read_registers_u32(layout::CONFIG_OFFSET).await, 0);
+    }
+
+    async fn read_transport_config(device: &mut VirtioMmioDevice, offset: u16) -> u32 {
+        let mut bytes = [0; 4];
+        match device.mmio_read(0x100 + u64::from(offset), &mut bytes) {
+            IoResult::Defer(token) => token.read_future(&mut bytes).await.unwrap(),
+            other => panic!("expected deferred config read, got {other:?}"),
+        }
+        u32::from_le_bytes(bytes)
+    }
+
+    #[async_test]
+    async fn microvm_dormant_transport_restores_aggregate_or_zero_child_layout(
+        driver: DefaultDriver,
+    ) {
+        let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
+        let source_device = VirtioFsDevice::new_microvm_dormant(
+            &driver_source,
+            MICROVM_ATTACHMENT_ID.to_owned(),
+            None,
+        )
+        .unwrap();
+        let mut source = VirtioMmioDevice::new(
+            Box::new(source_device),
+            &driver,
+            GuestMemory::empty(),
+            LineInterrupt::detached(),
+            None,
+            0,
+            0x1000,
+        )
+        .unwrap();
+        source.quiesce_input().await.unwrap();
+        source.stop().await;
+        let saved = mesh::payload::encode(source.save().unwrap());
+
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("settings");
+        std::fs::write(&file, b"settings").unwrap();
+        let directory = root.path().join("work");
+        std::fs::create_dir(&directory).unwrap();
+        let aggregate = || {
+            VirtioFsDevice::new_microvm_aggregate(
+                &driver_source,
+                MICROVM_ATTACHMENT_ID.to_owned(),
+                vec![
+                    MicroVmAggregateChild::new(
+                        "work".to_owned(),
+                        microvm_root_identity(&directory).unwrap(),
+                        false,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                    MicroVmAggregateChild::new_file(
+                        "settings".to_owned(),
+                        crate::profile::microvm_file_identity(&file).unwrap(),
+                        true,
+                    )
+                    .unwrap(),
+                ],
+                MicroVmOwnerMode::Vmm,
+                &[&directory, &file],
+                None,
+            )
+            .unwrap()
+        };
+        for attach in [false, true] {
+            let destination_device = if attach {
+                aggregate()
+            } else {
+                VirtioFsDevice::new_microvm_dormant(
+                    &driver_source,
+                    MICROVM_ATTACHMENT_ID.to_owned(),
+                    None,
+                )
+                .unwrap()
+            };
+            let mut destination = VirtioMmioDevice::new(
+                Box::new(destination_device),
+                &driver,
+                GuestMemory::empty(),
+                LineInterrupt::detached(),
+                None,
+                0,
+                0x1000,
+            )
+            .unwrap();
+            destination
+                .restore(mesh::payload::decode(&saved).unwrap())
+                .unwrap();
+            destination.start_fallible().await.unwrap();
+            assert_eq!(
+                read_transport_config(&mut destination, 0).await,
+                u32::from_le_bytes(*b"micr")
+            );
+            assert_eq!(
+                read_transport_config(&mut destination, layout::CONFIG_OFFSET).await,
+                layout::MAGIC
+            );
+            assert_eq!(
+                read_transport_config(&mut destination, layout::CONFIG_OFFSET + 4).await,
+                layout::VERSION
+            );
+            assert_eq!(
+                read_transport_config(&mut destination, layout::CONFIG_OFFSET + 12).await,
+                if attach {
+                    layout::AGGREGATE
+                } else {
+                    layout::DORMANT
+                }
+            );
+            assert_eq!(
+                read_transport_config(&mut destination, layout::CONFIG_OFFSET + 24).await,
+                if attach { 2 } else { 0 }
+            );
+            if attach {
+                assert_eq!(
+                    read_transport_config(
+                        &mut destination,
+                        layout::CONFIG_OFFSET + layout::HEADER_SIZE as u16
+                    )
+                    .await,
+                    u32::from_le_bytes([0, 0, layout::DIRECTORY, layout::READ_WRITE])
+                );
+                assert_eq!(
+                    read_transport_config(
+                        &mut destination,
+                        layout::CONFIG_OFFSET + layout::HEADER_SIZE as u16 + 4
+                    )
+                    .await,
+                    u32::from_le_bytes([1, 0, layout::FILE, layout::READ_ONLY])
+                );
+            }
+            destination.quiesce_input().await.unwrap();
+            destination.stop().await;
+            if attach {
+                let state = destination.save().unwrap();
+                let mut captured = VirtioMmioDevice::new(
+                    Box::new(aggregate()),
+                    &driver,
+                    GuestMemory::empty(),
+                    LineInterrupt::detached(),
+                    None,
+                    0,
+                    0x1000,
+                )
+                .unwrap();
+                captured.restore(state).unwrap();
+                captured.start_fallible().await.unwrap();
+                assert_eq!(
+                    read_transport_config(&mut captured, layout::CONFIG_OFFSET + 12).await,
+                    layout::AGGREGATE
+                );
+                assert_eq!(
+                    read_transport_config(
+                        &mut captured,
+                        layout::CONFIG_OFFSET + layout::HEADER_SIZE as u16 + 4
+                    )
+                    .await,
+                    u32::from_le_bytes([1, 0, layout::FILE, layout::READ_ONLY])
+                );
+                captured.quiesce_input().await.unwrap();
+                captured.stop().await;
+            }
         }
     }
 

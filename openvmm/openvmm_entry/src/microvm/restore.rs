@@ -504,6 +504,7 @@ pub(crate) fn validate_restore_contract(
         contract,
         cpu_profile,
     )?;
+    expected_contract.platform_template_abi_version = saved_contract.platform_template_abi_version;
     align_legacy_network_policy_contract(saved_contract, &mut expected_contract);
     align_restore_console_listener_contract(saved_contract, &mut expected_contract);
     openvmm_helpers::snapshot::microvm::validate_microvm_machine_contract(
