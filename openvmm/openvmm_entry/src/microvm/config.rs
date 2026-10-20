@@ -545,7 +545,15 @@ impl<'a> MicrovmConfigBuilder<'a> {
                     max_queues: Some(1),
                     mac_address: config.guest_mac,
                     endpoint,
-                    egress_policy: Some(network.policy.clone()),
+                    egress_policy: Some(if network.restore_policy_barrier {
+                        virtio_resources::net::VirtioNetEgressPolicy::Restore(
+                            network.policy.clone(),
+                        )
+                    } else {
+                        virtio_resources::net::VirtioNetEgressPolicy::Enforce(
+                            network.policy.clone(),
+                        )
+                    }),
                     save_restore: true,
                     static_ipv4: Some(StaticIpv4Config {
                         guest_ipv4: config.guest_ipv4,
@@ -825,6 +833,11 @@ impl<'a> MicrovmConfigBuilder<'a> {
                 }
                 cmdline.push_str("nvx_snapshot_tier=");
                 cmdline.push_str(snapshot_tier.manifest_name());
+            }
+            if opt.microvm.platform_template {
+                cmdline.push(' ');
+                cmdline
+                    .push_str(openvmm_defs::microvm::MICROVM_PLATFORM_TEMPLATE_COMMAND_LINE_TOKEN);
             }
             openvmm_defs::microvm::append_microvm_virtio_discovery(
                 cmdline,

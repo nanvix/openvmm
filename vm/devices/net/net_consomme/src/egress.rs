@@ -25,6 +25,9 @@ use net_backend_resources::ingress::IngressTransport;
 impl ConsommeEndpoint {
     /// Implements `set_egress_policy`.
     pub(crate) fn install_egress_policy(&mut self, policy: EgressPolicy) -> anyhow::Result<()> {
+        policy
+            .validate()
+            .context("invalid Consomme egress policy")?;
         self.endpoint_state
             .lock()
             .as_mut()
@@ -55,6 +58,13 @@ impl ConsommeQueue {
         ) else {
             return false;
         };
+        if endpoint
+            .egress_policy
+            .as_ref()
+            .is_some_and(|policy| policy.listener_announcement(frame, frame.len()).is_none())
+        {
+            return false;
+        }
         publisher.apply(
             &frame[payload],
             &mut endpoint.consomme.access(&mut ClientNoPool {

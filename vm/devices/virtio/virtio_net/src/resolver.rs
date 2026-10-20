@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use net_backend::resolve::ResolveEndpointParams;
 use virtio::resolve::ResolvedVirtioDevice;
 use virtio::resolve::VirtioResolveInput;
+use virtio_resources::net::VirtioNetEgressPolicy;
 use virtio_resources::net::VirtioNetHandle;
 use vm_resource::AsyncResolveResource;
 use vm_resource::ResourceResolver;
@@ -39,7 +40,10 @@ impl AsyncResolveResource<VirtioDeviceHandle, VirtioNetHandle> for VirtioNetReso
         }
         builder = builder.save_restore_resource(&resource)?;
         if let Some(egress_policy) = resource.egress_policy {
-            builder = builder.egress_policy(egress_policy);
+            builder = match egress_policy {
+                VirtioNetEgressPolicy::Enforce(policy) => builder.egress_policy(policy),
+                VirtioNetEgressPolicy::Restore(policy) => builder.restore_egress_policy(policy),
+            };
         }
 
         let endpoint = resolver

@@ -13,6 +13,7 @@ use net_backend_resources::egress::EgressPolicyMode;
 use net_backend_resources::mac_address::MacAddress;
 use pal_async::DefaultDriver;
 use std::future::poll_fn;
+use test_with_tracing::test;
 
 const GUEST_IPV4: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const GATEWAY_IPV4: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
@@ -143,6 +144,77 @@ async fn endpoint_policy_proxy_arps_only_bound_on_link_targets(driver: DefaultDr
     endpoint.stop().await;
 }
 
+#[pal_async::async_test]
+async fn restored_listener_preparation_rolls_back_real_bind_failure(driver: DefaultDriver) {
+    let first =
+        create_bound_socket(&IpProtocol::Tcp, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)), 0).unwrap();
+    let second =
+        create_bound_socket(&IpProtocol::Tcp, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)), 0).unwrap();
+    let ports = [
+        socket_addr(&first).unwrap().port(),
+        socket_addr(&second).unwrap().port(),
+    ];
+    let mut params = ConsommeParams::new().unwrap();
+    params
+        .set_static_ipv4(GUEST_IPV4, 24, GATEWAY_IPV4, GATEWAY_MAC)
+        .unwrap();
+    params.client_mac.0 = GUEST_MAC;
+    let mut endpoint = ConsommeEndpoint::new_with_ports(
+        params,
+        [first, second]
+            .into_iter()
+            .map(|socket| PortForwardConfig {
+                protocol: IpProtocol::Tcp,
+                socket,
+                guest_port: 8080,
+            })
+            .collect(),
+    );
+    let closed = EgressPolicy::bind(
+        GUEST_IPV4,
+        24,
+        MacAddress::new(GUEST_MAC),
+        GATEWAY_IPV4,
+        EgressPolicyMode::DenyAll,
+    )
+    .unwrap()
+    .deny_all()
+    .unwrap();
+    endpoint.set_egress_policy(closed.clone()).unwrap();
+    let mut queues = Vec::new();
+    let error = endpoint
+        .get_queues(
+            vec![QueueConfig {
+                driver: Box::new(driver),
+            }],
+            None,
+            &mut queues,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<consomme::BindError>(),
+            Some(consomme::BindError::PortAlreadyBound(8080))
+        ),
+        "{error:#}"
+    );
+    assert!(queues.is_empty());
+    assert_eq!(
+        endpoint
+            .endpoint_state
+            .lock()
+            .as_ref()
+            .unwrap()
+            .egress_policy,
+        Some(closed)
+    );
+    endpoint.stop().await;
+    for port in ports {
+        std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    }
+}
+
 fn set_ipv4_checksum(frame: &mut [u8]) {
     frame[24..26].fill(0);
     let mut sum = frame[14..34].chunks_exact(2).fold(0u32, |sum, word| {
@@ -262,6 +334,11 @@ impl IngressHarness {
             ))
             .unwrap();
 
+        let harness = Self::attach(driver, &mut endpoint).await;
+        (endpoint, harness)
+    }
+
+    async fn attach(driver: DefaultDriver, endpoint: &mut ConsommeEndpoint) -> Self {
         let layout = net_backend::tests::test_layout();
         let memory = GuestMemory::allocate(layout.end_of_ram() as usize);
         let pool = net_backend::tests::Bufs::new(memory.clone());
@@ -276,19 +353,124 @@ impl IngressHarness {
             )
             .await
             .unwrap();
-        (
-            endpoint,
-            Self {
-                driver,
-                memory,
-                pool,
-                queues,
-                next_tx: 1,
-                next_rx: 1,
-            },
-        )
+        Self {
+            driver,
+            memory,
+            pool,
+            queues,
+            next_tx: 1,
+            next_rx: 1,
+        }
     }
+}
 
+#[pal_async::async_test]
+async fn restored_endpoint_denies_packets_and_announcements_until_policy_install(
+    driver: DefaultDriver,
+) {
+    use net_backend_resources::egress::EgressAction;
+
+    for authorized in [Some(0), Some(1), None] {
+        let listeners = [
+            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+        ];
+        for listener in &listeners {
+            listener.set_nonblocking(true).unwrap();
+        }
+        let ports = listeners
+            .each_ref()
+            .map(|listener| listener.local_addr().unwrap().port());
+        let (mut endpoint, mut held) = IngressHarness::with(
+            driver.clone(),
+            ingress::ListenerPublisher::host_loopback(false),
+            |policy| policy.deny_all().unwrap(),
+        )
+        .await;
+        for (index, port) in ports.iter().enumerate() {
+            assert!(
+                held.transmit(&tcp_segment(
+                    40000 + index as u16,
+                    SocketAddrV4::new(GATEWAY_IPV4, *port),
+                    1000,
+                    0,
+                    0x02,
+                ))
+                .await
+                .is_empty()
+            );
+            assert_eq!(
+                listeners[index].accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+        let announcement_port = {
+            let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        held.transmit(&announcement(&[announcement_port])).await;
+        drop(held);
+        assert!(
+            endpoint
+                .endpoint_state
+                .lock()
+                .as_ref()
+                .unwrap()
+                .publisher
+                .as_ref()
+                .unwrap()
+                .published()
+                .is_empty()
+        );
+        let mut policy = EgressPolicy::bind(
+            GUEST_IPV4,
+            24,
+            MacAddress::new(GUEST_MAC),
+            GATEWAY_IPV4,
+            EgressPolicyMode::DenyAll,
+        )
+        .unwrap()
+        .deny_all()
+        .unwrap();
+        if let Some(index) = authorized {
+            policy = policy
+                .with_host_loopback(
+                    EgressAction::Deny,
+                    Some(format!("{GATEWAY_IPV4}:{}", ports[index]).parse().unwrap()),
+                )
+                .unwrap();
+        }
+        endpoint.set_egress_policy(policy).unwrap();
+        let mut restored = IngressHarness::attach(driver.clone(), &mut endpoint).await;
+        for (index, port) in ports.iter().enumerate() {
+            let guest_port = 41000 + index as u16;
+            restored
+                .transmit(&tcp_segment(
+                    guest_port,
+                    SocketAddrV4::new(GATEWAY_IPV4, *port),
+                    1000,
+                    0,
+                    0x02,
+                ))
+                .await;
+            if authorized == Some(index) {
+                restored
+                    .receive_tcp(guest_port, |frame| frame[47] & 0x12 == 0x12)
+                    .await;
+                listeners[index].accept().unwrap();
+            } else {
+                assert_eq!(
+                    listeners[index].accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            }
+        }
+        drop(restored);
+        endpoint.stop().await;
+    }
+}
+
+impl IngressHarness {
     /// Transmits `frame`, with its TCP checksum offloaded, and returns the
     /// frames that the guest received meanwhile.
     async fn transmit(&mut self, frame: &[u8]) -> Vec<Vec<u8>> {

@@ -481,7 +481,23 @@ pub(crate) fn validate_restore_contract(
     ) else {
         unreachable!("the time ABI preflight requires both records");
     };
-    let network = network.map(|(config, policy, attachment)| (config, policy, attachment.clone()));
+    // Templates bind only the fixed link and the closed capture posture.
+    // The run policy is installed separately under the worker's VP barrier.
+    let template_policy = if saved_contract.platform_template_version != 0 {
+        network
+            .as_ref()
+            .map(|(config, _, _)| config.deny_all_policy())
+            .transpose()?
+    } else {
+        None
+    };
+    let network = network.map(|(config, policy, attachment)| {
+        (
+            config,
+            template_policy.as_ref().unwrap_or(policy),
+            attachment.clone(),
+        )
+    });
     let filesystem_slot = microvm_filesystem_slot_from_snapshot(saved_contract)?;
     // A dormant-slot snapshot captured no filesystem, so a filesystem that the
     // restore attaches to the slot is not part of the snapshot's contract.

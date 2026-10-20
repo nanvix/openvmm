@@ -142,12 +142,22 @@ pub mod net {
     use vm_resource::kind::NetEndpointHandleKind;
     use vm_resource::kind::VirtioDeviceHandle;
 
+    /// When the device may install its run-scoped network policy.
+    #[derive(MeshPayload)]
+    pub enum VirtioNetEgressPolicy {
+        /// Enforce the policy from device construction.
+        Enforce(net_backend_resources::egress::EgressPolicy),
+        /// Start deny-all; prepare host listeners and install the policy
+        /// during fallible restore startup, before the VPs are released.
+        Restore(net_backend_resources::egress::EgressPolicy),
+    }
+
     #[derive(MeshPayload)]
     pub struct VirtioNetHandle {
         pub max_queues: Option<u16>,
         pub mac_address: MacAddress,
         pub endpoint: Resource<NetEndpointHandleKind>,
-        pub egress_policy: Option<net_backend_resources::egress::EgressPolicy>,
+        pub egress_policy: Option<VirtioNetEgressPolicy>,
         pub save_restore: bool,
         pub static_ipv4: Option<net_backend_resources::consomme::static_ipv4::StaticIpv4Config>,
         pub effective_features: Option<u64>,

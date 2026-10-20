@@ -690,6 +690,10 @@ pub struct SnapshotMachineContract {
     pub cpu_profile: Option<openvmm_defs::time_abi::SnapshotCpuProfile>,
     // Field 33 held the policies of a second virtio-fs slot, which the
     // microVM no longer has. It is retired, and its number is never reused.
+    /// Integrated platform-template revision, or zero for exact-match
+    /// workload and older snapshots.
+    #[mesh(34)]
+    pub platform_template_version: u32,
 }
 
 impl SnapshotMachineContract {
@@ -1077,6 +1081,8 @@ pub fn microvm_machine_contract(
     time: openvmm_defs::time_abi::SnapshotTimeContract,
     cpu_profile: openvmm_defs::time_abi::SnapshotCpuProfile,
 ) -> anyhow::Result<SnapshotMachineContract> {
+    let platform_template_version =
+        openvmm_defs::microvm::microvm_platform_template_version(&effective_command_line)?;
     anyhow::ensure!(
         matches!(source_hypervisor, "kvm" | "mshv" | "whp"),
         "microVM snapshots require the KVM, MSHV, or WHP hypervisor"
@@ -1221,10 +1227,11 @@ pub fn microvm_machine_contract(
             .collect::<HashSet<_>>();
         anyhow::ensure!(
             tokens.contains(discovery.as_str())
-                && network
-                    .command_line_fragment()
-                    .split_ascii_whitespace()
-                    .all(|token| tokens.contains(token)),
+                && (platform_template_version != 0
+                    || network
+                        .command_line_fragment()
+                        .split_ascii_whitespace()
+                        .all(|token| tokens.contains(token))),
             "microVM network command line does not match its saved identity"
         );
         devices.push(SnapshotDevice {
@@ -1496,6 +1503,7 @@ pub fn microvm_machine_contract(
         memory_expansion_ranges,
         time: Some(time),
         cpu_profile: Some(cpu_profile),
+        platform_template_version,
     };
     contract.set_effective_command_line(effective_command_line);
     validate_machine_contract_shape(&contract, memory_size, processor_count)?;
@@ -1527,6 +1535,21 @@ pub(super) fn paired_scratch_block(
 pub fn validate_supported_microvm_contract(
     contract: &SnapshotMachineContract,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        matches!(
+            contract.platform_template_version,
+            0 | openvmm_defs::microvm::MICROVM_PLATFORM_TEMPLATE_VERSION
+        ),
+        "snapshot platform-template revision {} is unsupported",
+        contract.platform_template_version
+    );
+    anyhow::ensure!(
+        contract.platform_template_version
+            == openvmm_defs::microvm::microvm_platform_template_version(
+                &contract.effective_command_line
+            )?,
+        "snapshot platform-template revision does not match its command line"
+    );
     anyhow::ensure!(
         contract.microvm_abi_version == openvmm_defs::microvm::MICROVM_ABI_VERSION_2,
         "snapshot microVM ABI version {} is unsupported; this OpenVMM supports version {}",
@@ -1581,6 +1604,10 @@ pub fn validate_microvm_machine_contract(
     anyhow::ensure!(
         contract.boot_layout_version == expected.boot_layout_version,
         "snapshot boot layout version doesn't match the requested machine"
+    );
+    anyhow::ensure!(
+        contract.platform_template_version == expected.platform_template_version,
+        "snapshot platform-template revision doesn't match the requested machine"
     );
     anyhow::ensure!(
         contract.virtio_interrupt_mode == expected.virtio_interrupt_mode
@@ -1813,6 +1840,27 @@ pub(super) fn validate_machine_contract_shape(
             network.egress_policy_encoding_version
         );
         validate_sha256(&network.egress_policy_sha256, "egress policy")?;
+    }
+    if contract.platform_template_version != 0 {
+        let saved = contract
+            .microvm_network
+            .as_ref()
+            .context("a platform template requires a fixed NIC")?;
+        let network = microvm_network_config_from_snapshot(saved)?;
+        let closed = network.deny_all_policy()?;
+        anyhow::ensure!(
+            saved.egress_policy_encoding_version == closed.encoding_version(),
+            "platform-template snapshot egress policy encoding version is not canonical"
+        );
+        validate_microvm_network_policy(saved, &closed)
+            .context("a platform template must capture deny-all without tenant network policy")?;
+        anyhow::ensure!(
+            contract
+                .effective_command_line
+                .split_ascii_whitespace()
+                .all(|token| { !token.starts_with("virtnet_") }),
+            "a platform template must leave its fixed guest NIC unconfigured"
+        );
     }
     let slot = &openvmm_defs::microvm::MICROVM_FILESYSTEM_SLOTS[0];
     // A snapshot of an earlier OpenVMM can record a second virtio-fs slot.
@@ -2215,7 +2263,7 @@ pub(super) fn validate_snapshot_tier(manifest: &SnapshotManifest) -> anyhow::Res
         );
         return Ok(());
     };
-    if contract.microvm_sandbox_blocks.is_empty() {
+    if contract.microvm_sandbox_blocks.is_empty() && contract.platform_template_version == 0 {
         anyhow::ensure!(
             manifest.snapshot_tier.is_empty()
                 && manifest.restore_policy.is_empty()
@@ -2224,6 +2272,10 @@ pub(super) fn validate_snapshot_tier(manifest: &SnapshotManifest) -> anyhow::Res
         );
         return Ok(());
     }
+    anyhow::ensure!(
+        contract.platform_template_version == 0 || manifest.snapshot_tier == SNAPSHOT_TIER_PLATFORM,
+        "a platform-template contract requires the platform snapshot tier"
+    );
 
     let paired_scratch = paired_scratch_block(manifest).is_some();
     let expected_consumed_sections = match manifest.snapshot_tier.as_str() {
@@ -2339,6 +2391,7 @@ fn platform_command_line_token_is_invariant(token: &str) -> bool {
             | "nvx_sandbox=1"
             | "nvx_config=0xd0010000,65536"
             | "nvx_snapshot_tier=platform"
+            | openvmm_defs::microvm::MICROVM_PLATFORM_TEMPLATE_COMMAND_LINE_TOKEN
     ) || token.starts_with("nr_cpus=")
         || token == openvmm_defs::microvm::MICROVM_CONTROL_TTY_COMMAND_LINE
         || [
@@ -2476,6 +2529,7 @@ pub(super) fn test_machine_contract() -> SnapshotMachineContract {
         memory_expansion_ranges: Vec::new(),
         time: Some(super::time::tests::test_time_contract()),
         cpu_profile: Some(super::time::tests::test_cpu_profile()),
+        platform_template_version: 0,
     };
     contract.set_effective_command_line("console=hvc0".to_owned());
     contract
@@ -2486,6 +2540,7 @@ mod tests {
     use super::super::format::validate_manifest_contents;
     use super::super::tests::test_manifest;
     use super::*;
+    use test_with_tracing::test;
 
     const TEST_SCRATCH_IDENTITY_BYTE: u8 = 0x22;
 
@@ -2624,11 +2679,31 @@ mod tests {
         network: &openvmm_defs::microvm::MicrovmNetworkConfig,
         mode: net_backend_resources::egress::EgressPolicyMode,
     ) -> SnapshotMachineContract {
-        let egress_policy = network.bind_egress_policy(mode).unwrap();
+        generated_network_contract_with_topology(source_hypervisor, network, mode, false)
+    }
+
+    fn generated_network_contract_with_topology(
+        source_hypervisor: &str,
+        network: &openvmm_defs::microvm::MicrovmNetworkConfig,
+        mode: net_backend_resources::egress::EgressPolicyMode,
+        template: bool,
+    ) -> SnapshotMachineContract {
+        let egress_policy = if template {
+            network.deny_all_policy().unwrap()
+        } else {
+            network.bind_egress_policy(mode).unwrap()
+        };
         let irq = openvmm_defs::microvm::microvm_virtio_net_irq(Some(source_hypervisor)).unwrap();
-        let command_line = format!(
-            "earlycon=xe9 console=hvc0 reboot=t panic=-1 virtio_mmio.device=0x1000@0xd0000000:{irq} {}",
+        let bootstrap = if template {
+            format!(
+                "nvx_snapshot_tier=platform {}",
+                openvmm_defs::microvm::MICROVM_PLATFORM_TEMPLATE_COMMAND_LINE_TOKEN,
+            )
+        } else {
             network.command_line_fragment_with_dns(egress_policy.gateway_dns_server())
+        };
+        let command_line = format!(
+            "earlycon=xe9 console=hvc0 reboot=t panic=-1 virtio_mmio.device=0x1000@0xd0000000:{irq} {bootstrap}",
         );
         microvm_machine_contract(
             source_hypervisor,
@@ -3494,6 +3569,97 @@ mod tests {
         assert!(network.egress_policy_required);
         assert!(!contract.effective_command_line.contains("virtnet_dns="));
         validate_supported_microvm_contract(&contract).unwrap();
+    }
+
+    #[test]
+    fn platform_template_contract_round_trips_and_binds_nic_geometry() {
+        for hypervisor in ["kvm", "mshv", "whp"] {
+            let config = "10.0.0.2/24".parse().unwrap();
+            let contract = generated_network_contract_with_topology(
+                hypervisor,
+                &config,
+                net_backend_resources::egress::EgressPolicyMode::DenyAll,
+                true,
+            );
+            assert_eq!(contract.platform_template_version, 1);
+            let decoded: SnapshotMachineContract =
+                mesh::payload::decode(&mesh::payload::encode(contract.clone())).unwrap();
+            assert_eq!(decoded, contract);
+            let mut manifest = test_manifest();
+            manifest.memory_size_bytes = 1024;
+            manifest.vp_count = 1;
+            manifest.machine_contract = Some(contract.clone());
+            manifest.snapshot_tier = SNAPSHOT_TIER_PLATFORM.to_owned();
+            manifest.restore_policy = SNAPSHOT_RESTORE_POLICY_CLONE.to_owned();
+            manifest.consumed_config_sections = SNAPSHOT_CONFIG_INVARIANTS;
+            validate_snapshot_tier(&manifest).unwrap();
+            validate_microvm_machine_contract(&manifest, &contract).unwrap();
+            let mutations: [fn(&mut SnapshotMachineContract); 8] = [
+                |contract| contract.platform_template_version += 1,
+                |contract| contract.microvm_network.as_mut().unwrap().prefix_length = 25,
+                |contract| contract.microvm_network.as_mut().unwrap().guest_mac[5] ^= 1,
+                |contract| {
+                    contract
+                        .microvm_network
+                        .as_mut()
+                        .unwrap()
+                        .guest_ipv6
+                        .clear()
+                },
+                |contract| contract.devices.last_mut().unwrap().irq = Some(99),
+                |contract| contract.devices.last_mut().unwrap().ranges[0].start += 4096,
+                |contract| contract.devices.last_mut().unwrap().queue_max_sizes[0] /= 2,
+                |contract| contract.devices.last_mut().unwrap().feature_banks[0] ^= 1,
+            ];
+            for mutate in mutations {
+                let mut changed = contract.clone();
+                mutate(&mut changed);
+                assert!(validate_microvm_machine_contract(&manifest, &changed).is_err());
+            }
+            manifest.snapshot_tier = SNAPSHOT_TIER_WORKLOAD_START.to_owned();
+            assert!(validate_snapshot_tier(&manifest).is_err());
+        }
+    }
+
+    #[test]
+    fn platform_template_rejects_tenant_policy_and_bootstrap_tokens() {
+        let config: openvmm_defs::microvm::MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
+        let contract = generated_network_contract_with_topology(
+            "whp",
+            &config,
+            net_backend_resources::egress::EgressPolicyMode::DenyAll,
+            true,
+        );
+        for policy in [
+            config
+                .bind_egress_policy(net_backend_resources::egress::EgressPolicyMode::AllowAll)
+                .unwrap(),
+            config
+                .deny_all_policy()
+                .unwrap()
+                .with_host_loopback(
+                    net_backend_resources::egress::EgressAction::Deny,
+                    Some("10.0.0.1:8443".parse().unwrap()),
+                )
+                .unwrap(),
+        ] {
+            let mut changed = contract.clone();
+            changed.microvm_network = Some(SnapshotMicrovmNetwork::new(&config, &policy));
+            assert!(validate_machine_contract_shape(&changed, 1024, 1).is_err());
+        }
+        for token in [
+            "virtnet_ip=10.0.0.2",
+            "virtnet_ingress=allow",
+            "virtnet_dns=10.0.0.1",
+        ] {
+            let mut changed = contract.clone();
+            changed
+                .set_effective_command_line(format!("{} {token}", changed.effective_command_line));
+            assert!(validate_machine_contract_shape(&changed, 1024, 1).is_err());
+        }
+        let mut missing_nic = contract;
+        missing_nic.microvm_network = None;
+        assert!(validate_machine_contract_shape(&missing_nic, 1024, 1).is_err());
     }
 
     #[test]

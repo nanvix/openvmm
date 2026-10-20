@@ -350,6 +350,24 @@ and restore requires the saved and current inventories to match exactly. A
 microVM manifest additionally records and validates the exact device inventory
 and order.
 
+An explicit `--platform-template` capture records integrated template-contract
+revision 1 in machine-contract field 34. Revision zero (including older
+snapshots) retains exact workload policy matching. Revision 1 reserves a fixed,
+unconfigured NIC, captures only its deny-all posture, and permits a separately
+authorized run policy on restore. Its saved address identity and device
+geometry still match exactly; neither NIC hotplug nor address replacement is
+supported. This revision does not define guest activation RPCs, a configuration
+region, or a different block/filesystem layout.
+
+Template restore constructs the endpoint deny-all. Its fallible device start
+prepares explicit listeners and atomically installs the egress, host-loopback,
+and proxy policy before the worker releases its restored-vCPU stop guard.
+Preparation also runs for a saved NIC without active queues. Bind, policy,
+version, or install errors abort startup, without a readiness event or a cold
+boot fallback. Without network options, the fixed guest NIC remains
+unconfigured and deny-all. Requested ingress prepares only its host publisher;
+any optional guest listener announcer starts afterward, not at template boot.
+
 For a phase-3 virtio console, the manifest also records its stable attachment
 ID, canonical endpoint identity, reconnect policy, requiredness, and timeout.
 Native socket, pipe, terminal, and file handles are never serialized. Restore

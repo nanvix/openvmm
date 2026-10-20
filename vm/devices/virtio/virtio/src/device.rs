@@ -151,6 +151,13 @@ pub trait VirtioDevice: InspectMut + Send {
         saved_state::default_restore_device(self.supports_save_restore(), state)
     }
 
+    /// Prepares host resources during fallible restore startup, including
+    /// when the saved device has no active queues. The caller must hold the
+    /// restored VPs stopped until this succeeds for every device.
+    fn prepare_restore(&mut self) -> impl Future<Output = anyhow::Result<()>> + Send {
+        async { Ok(()) }
+    }
+
     /// Return an immutable validator that the transport can retain after the
     /// device moves into its async task.
     fn device_state_validator(&self) -> DeviceStateValidator {
@@ -223,6 +230,9 @@ pub trait DynVirtioDevice: InspectMut + Send {
 
     /// Restore device-private state before any queues are restarted.
     fn restore_device(&mut self, state: Option<SavedStateBlob>) -> Result<(), RestoreError>;
+
+    /// Prepares host resources before releasing the restored VPs.
+    fn prepare_restore(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>>;
 
     /// Return immutable validation for device-private saved state.
     fn device_state_validator(&self) -> DeviceStateValidator;
@@ -308,6 +318,10 @@ impl<T: VirtioDevice> DynVirtioDevice for T {
 
     fn restore_device(&mut self, state: Option<SavedStateBlob>) -> Result<(), RestoreError> {
         VirtioDevice::restore_device(self, state)
+    }
+
+    fn prepare_restore(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(VirtioDevice::prepare_restore(self))
     }
 
     fn device_state_validator(&self) -> DeviceStateValidator {

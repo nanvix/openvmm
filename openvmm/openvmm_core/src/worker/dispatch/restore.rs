@@ -128,6 +128,9 @@ pub(super) struct SnapshotRestore {
     vp_prefix: Option<u32>,
     /// Whether the VM was loaded from saved state.
     restored_from_snapshot: bool,
+    /// A failed initial restore start is terminal, even if a management
+    /// caller retries after the transport consumed its staged state.
+    start_failed: bool,
     /// Holds the VPs stopped after a restore until the VM first starts.
     start_guard: Option<StopGuard>,
     /// Single-use sink for the restore readiness event.
@@ -312,6 +315,13 @@ impl LoadedVm {
     /// post-restore input gate, the restore readiness event, and the release
     /// of the restored VPs around the start.
     pub(super) async fn start_state_units(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.snapshot_restore.start_failed,
+            "snapshot restore startup already failed; discard this VM"
+        );
+        // Keep this latched across every failure below. Only a successful
+        // restore start may clear it and release the VP guard.
+        self.snapshot_restore.start_failed = self.snapshot_restore.start_guard.is_some();
         if let Some(timeout) = self.snapshot_restore.gate_timeout {
             self.state_units
                 .quiesce_input_for_save(timeout)
@@ -359,6 +369,7 @@ impl LoadedVm {
         if self.snapshot_restore.packet_selected.is_some() {
             self.snapshot_restore.resume_profile = Some(ProfileSpan::start());
         }
+        self.snapshot_restore.start_failed = false;
         self.snapshot_restore.start_guard.take();
         Ok(())
     }

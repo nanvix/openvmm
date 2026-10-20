@@ -66,6 +66,20 @@ pub(crate) struct MicrovmReportPlan {
 }
 
 impl MicrovmReportPlan {
+    pub(crate) fn set_effective_network_policy(
+        &mut self,
+        policy: Option<&net_backend_resources::egress::EgressPolicy>,
+    ) {
+        if let Some(policy) = policy {
+            self.policy_requested = true;
+            self.policy_mode = policy.mode_name();
+            self.host_loopback = match policy.host_loopback_action() {
+                net_backend_resources::egress::EgressAction::Allow => "allow",
+                net_backend_resources::egress::EgressAction::Deny => "deny",
+            };
+        }
+    }
+
     pub(crate) fn from_options(opt: &Options) -> anyhow::Result<Option<Self>> {
         let Some(path) = &opt.microvm.microvm_report else {
             return Ok(None);
@@ -278,7 +292,7 @@ pub(crate) fn validate_early_options(opt: &Options) -> anyhow::Result<()> {
 /// Runs the VM control process and, when requested, writes the bounded microVM
 /// outcome report after the run completes.
 pub(crate) async fn run_control(driver: &DefaultDriver, opt: Options) -> anyhow::Result<i32> {
-    let Some(report) = MicrovmReportPlan::from_options(&opt)? else {
+    let Some(mut report) = MicrovmReportPlan::from_options(&opt)? else {
         return crate::run_control(driver, opt).await;
     };
     let mut mesh = match VmmMesh::new(&driver, opt.single_process) {
@@ -289,7 +303,7 @@ pub(crate) async fn run_control(driver: &DefaultDriver, opt: Options) -> anyhow:
             return result;
         }
     };
-    let result = crate::run_control_inner(driver, &mut mesh, opt).await;
+    let result = crate::run_control_inner(driver, &mut mesh, opt, Some(&mut report)).await;
     // If setup failed before the mesh was handed to the controller, shut it
     // down so the child host process exits cleanly without noisy logs.
     if let Some(mesh) = mesh {
@@ -392,6 +406,32 @@ mod tests {
                 "report exposed forbidden field category {forbidden:?}"
             );
         }
+    }
+
+    #[test]
+    fn template_report_uses_the_effective_closed_policy_without_cli_network_options() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("outcome.json");
+        let mut plan = test_plan(path.clone());
+        plan.policy_requested = false;
+        plan.policy_mode = "none";
+        plan.host_loopback = "none";
+        plan.allow_rule_count = 0;
+        plan.deny_rule_count = 0;
+        let network: openvmm_defs::microvm::MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
+        plan.set_effective_network_policy(Some(&network.deny_all_policy().unwrap()));
+        plan.write(&Ok(0)).unwrap();
+        assert_eq!(
+            read_report(&path)["network_policy"],
+            serde_json::json!({
+                "status": "applied",
+                "status_code": 0,
+                "mode": "deny-all",
+                "allow_rule_count": 0,
+                "deny_rule_count": 0,
+                "host_loopback": "deny",
+            }),
+        );
     }
 
     #[test]

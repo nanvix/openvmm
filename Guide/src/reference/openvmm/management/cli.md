@@ -161,8 +161,9 @@ describes the source definitions.
   each announced port, relaying only peers whose addresses are not globally
   reachable. Globally reachable peers are refused, and so is the host itself
   unless `--host-loopback allow` admits it. Replies to admitted peers pass
-  regardless of the egress policy. Snapshot capture and restore reject ingress
-  `allow`, because its listeners are live host attachments.
+  regardless of the egress policy. Snapshot capture and ordinary snapshot
+  restore reject ingress `allow`. Platform-template restore can prepare this
+  publisher before releasing restored vCPUs, without starting a guest announcer.
 
   Egress `allow` may accompany `--block-host`; egress `deny` may accompany
   `--allow-host` or `--allow-endpoint`. Contradictory default and rule
@@ -208,8 +209,8 @@ describes the source definitions.
   loopback at each announced port, never displacing a host listener that
   already holds the port. Replies to the host pass regardless of the egress
   policy. With `--network-ingress allow`, the listeners published to the
-  host's private networks admit the host instead. Snapshot capture and restore
-  reject explicit `allow`, because its listeners are live host attachments.
+  host's private networks admit the host instead. Snapshot capture and ordinary
+  snapshot restore reject explicit `allow`; platform-template restore permits it.
   Omitting the option preserves the existing guest-gateway-to-host-loopback
   mapping, from the IPv4 gateway to host IPv4 loopback and from the IPv6
   gateway to host IPv6 loopback, without publishing guest ports. `deny` blocks
@@ -225,8 +226,11 @@ describes the source definitions.
   `--host-loopback-forward <tcp|udp:HOST-PORT:GUEST-PORT>` binds one localhost
   port and forwards it into the guest, possibly to another guest port. It
   requires explicit `--host-loopback allow`; duplicate bindings and more than
-  64 forwards are rejected before resources are opened. Live forwards are
-  process-local attachments and are rejected for snapshot capture or restore.
+  64 forwards are rejected before resources are opened. A TCP forward cannot
+  bind the proxy's host port. Live forwards are process-local attachments and
+  are rejected for capture and ordinary snapshot restore. Platform-template
+  restore binds them under its pre-vCPU policy barrier; bind or installation
+  failure aborts that restore.
 
   Networked snapshots record the `portable` profile, drain accepted TX and
   endpoint-ready RX at the capture boundary, rewind unused guest RX
@@ -239,6 +243,55 @@ describes the source definitions.
   tables are not serialized. The capture
   protocol does not retain pre-capture endpoint completions; restored guest
   software must establish new host-side flows.
+* `--platform-template`: Opt into integrated platform-template contract revision
+  1, recorded in manifest version 6 without changing microVM ABI 2 or boot layout
+  2. Requires `--machine microvm`, `--snapshot-destination <DIR>`,
+  `--snapshot-tier platform`, `--network-profile portable`, and one
+  `--net <IPv4/PREFIX>`. This is not the default: an ordinary no-network cold
+  boot still has no NIC.
+
+  Capture discovers the fixed NIC but omits every `virtnet_` bootstrap token,
+  including DNS and listener announcements. The guest link remains unconfigured,
+  and the host enforces deny-all with no tenant rules, host-loopback access,
+  proxy, or forward. Supplying tenant network policy on capture is an error.
+  The saved MACs, IPv4/IPv6 addresses, prefixes, gateways, MMIO/IRQ, features,
+  and queue geometry remain exact compatibility inputs.
+
+  On restore, omitting network options retains that unconfigured fixed NIC
+  under deny-all. To authorize networking, supply `--network-profile portable`
+  and the ordinary egress, host-loopback, proxy, or forward options. Unlike an
+  ordinary networked boot, template restore defaults both egress and host
+  loopback to `deny`. Optional `--net` asserts the saved identity; it cannot
+  replace its address, prefix, or address family. A different identity requires
+  a different template. No NIC is hot-plugged.
+
+  OpenVMM first installs deny-all, prepares explicit host listeners, and
+  atomically installs the validated run policy during fallible device startup.
+  Restored vCPUs remain stopped until all of this succeeds, even for an inactive
+  saved NIC. A failed restore cannot be retried on the same VM or fall back to
+  cold boot. Workload and older snapshots retain their exact policy matching.
+
+  `--network-ingress allow` or explicit `--host-loopback allow` prepares the
+  requested announcement publisher only. A guest announcer may start after the
+  VMM policy is ready; no announcer is needed for a no-network launch. This
+  option does not implement guest activation RPCs or a guest configuration
+  region, and restore does not rewrite the saved command line.
+
+  The VMM regression `fixed_nic_template_policy_barrier` requires a kernel
+  built with `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y`, `CONFIG_VIRTIO_NET=y`,
+  and IPv4/IPv6 support, plus a matching BusyBox initrd with `ip` and `nc`.
+  Set `OPENVMM_MICROVM_TEST_KERNEL` and `OPENVMM_MICROVM_TEST_INITRD` to
+  those explicit artifacts before running:
+
+  ```powershell
+  cargo xflowey vmm-tests-run `
+    --filter "test(fixed_nic_template_policy_barrier)"
+  ```
+
+  Without overrides the test is ignored: the packaged test kernel lacks
+  command-line MMIO discovery.
+  The test configures its guest link directly; it is not guest activation RPC
+  coverage.
 * `--mount <GUEST_TARGET,HOST_PATH[,ro|rw]>`: With `--machine microvm`, attach
   one no-DAX HostFs device at MMIO `0xd0001000`, IRQ 6, with tag `microvm`.
   `--mount` may appear once. The default mode is read-only; `rw` must be
@@ -439,9 +492,11 @@ describes the source definitions.
   slot may instead accept one new `--mount`; snapshots without that
   capability reject additive attachment.
 
-  When the snapshot contains virtio-net, restore also requires
+  When an ordinary snapshot contains virtio-net, restore also requires
   `--network-profile portable`; the snapshot's profile and canonical egress
-  policy must match the supplied portable configuration.
+  policy must match the supplied portable configuration. Explicit
+  platform-template snapshots instead keep deny-all unless restore supplies
+  an authorized run policy, as described under `--platform-template`.
 
   For sandbox-block snapshots, restore repeats each read-only
   `--microvm-sandbox-block` argument. Its role, access, geometry, and SHA-256

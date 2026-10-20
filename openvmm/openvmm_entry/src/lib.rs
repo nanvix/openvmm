@@ -2820,7 +2820,7 @@ fn new_hvsock_service_id(port: u32) -> Guid {
 
 async fn run_control(driver: &DefaultDriver, opt: Options) -> anyhow::Result<i32> {
     let mut mesh = Some(VmmMesh::new(&driver, opt.single_process)?);
-    let result = run_control_inner(driver, &mut mesh, opt).await;
+    let result = run_control_inner(driver, &mut mesh, opt, None).await;
     // If setup failed before the mesh was handed to the controller, shut it
     // down so the child host process exits cleanly without noisy logs.
     if let Some(mesh) = mesh {
@@ -2833,12 +2833,16 @@ async fn run_control_inner(
     driver: &DefaultDriver,
     mesh_slot: &mut Option<VmmMesh>,
     mut opt: Options,
+    report: Option<&mut microvm::report::MicrovmReportPlan>,
 ) -> anyhow::Result<i32> {
     let mesh = mesh_slot.as_ref().unwrap();
     let mut restore = snapshot_restore::SnapshotRestore::open(&opt)?;
     let microvm_restore = microvm::prepare_restore(&mut opt, restore.snapshot())?;
     let (mut vm_config, mut resources) =
         vm_config_from_command_line(driver, mesh, &opt, &microvm_restore).await?;
+    if let Some(report) = report {
+        report.set_effective_network_policy(resources.microvm.egress_policy.as_ref());
+    }
     let mut microvm = microvm::MicrovmLaunch::new(
         &opt,
         &vm_config,

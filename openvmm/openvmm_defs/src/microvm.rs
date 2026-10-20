@@ -88,6 +88,11 @@ pub const MICROVM_INGRESS_COMMAND_LINE_TOKEN: &str = "virtnet_ingress=allow";
 /// and UDP listeners for host-loopback ingress alone, which publishes them on
 /// host loopback; see [`net_backend_resources::ingress`].
 pub const MICROVM_HOST_LOOPBACK_INGRESS_COMMAND_LINE_TOKEN: &str = "virtnet_ingress=host-loopback";
+/// Integrated platform-template contract revision. Revision 1 reserves an
+/// unconfigured fixed NIC and binds its identity, not a tenant policy.
+pub const MICROVM_PLATFORM_TEMPLATE_VERSION: u32 = 1;
+/// Host-owned token selecting the platform-template topology.
+pub const MICROVM_PLATFORM_TEMPLATE_COMMAND_LINE_TOKEN: &str = "nvx_platform_template=1";
 /// MicroVM virtio MMIO reservations in stable device order.
 pub const MICROVM_VIRTIO_MMIO_BASES: [u64; 8] = [
     MICROVM_VIRTIO_NET_MMIO_BASE,
@@ -963,6 +968,17 @@ pub enum InvalidMicrovmFilesystemConfig {
 }
 
 impl MicrovmNetworkConfig {
+    /// Returns the template's closed network posture for this fixed identity.
+    pub fn deny_all_policy(
+        &self,
+    ) -> Result<
+        net_backend_resources::egress::EgressPolicy,
+        net_backend_resources::egress::InvalidEgressPolicy,
+    > {
+        self.bind_egress_policy(net_backend_resources::egress::EgressPolicyMode::DenyAll)?
+            .with_host_loopback(net_backend_resources::egress::EgressAction::Deny, None)
+    }
+
     /// Returns the subnet mask derived from `prefix_length`.
     pub fn netmask(&self) -> std::net::Ipv4Addr {
         std::net::Ipv4Addr::from(u32::MAX << (32 - self.prefix_length))
@@ -1255,6 +1271,8 @@ pub fn microvm_filesystem_slot_count(first_slot: bool, attached: usize) -> anyho
 /// one, occupies it. `network` carries the NIC's identity, its interrupt, the
 /// gateway address, if any, that the guest names as its DNS server, and the
 /// ingress, if any, for which the guest announces its listeners.
+/// A platform template discovers the NIC without configuring the guest link
+/// or starting a listener announcer.
 pub fn append_microvm_virtio_discovery(
     cmdline: &mut String,
     network: Option<(
@@ -1269,6 +1287,11 @@ pub fn append_microvm_virtio_discovery(
     has_control_console: bool,
     blocks: &[MicrovmSandboxBlockConfig],
 ) -> anyhow::Result<()> {
+    let platform_template = microvm_platform_template_version(cmdline)? != 0;
+    anyhow::ensure!(
+        !platform_template || network.is_some(),
+        "a platform template requires a fixed NIC"
+    );
     validate_microvm_sandbox_blocks(blocks, ramfs_overlay_requested(cmdline)?)?;
     anyhow::ensure!(
         !cmdline.split_ascii_whitespace().any(|token| {
@@ -1325,7 +1348,9 @@ pub fn append_microvm_virtio_discovery(
             " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE:#x}:{MICROVM_VIRTIO_CONTROL_CONSOLE_IRQ} {MICROVM_CONTROL_TTY_COMMAND_LINE}"
         )?;
     }
-    if let Some((network, _, gateway_dns, ingress)) = network {
+    if let Some((network, _, gateway_dns, ingress)) = network
+        && !platform_template
+    {
         write!(
             cmdline,
             " {}",
@@ -1340,6 +1365,25 @@ pub fn append_microvm_virtio_discovery(
         "microVM kernel command line exceeds the 64-KiB ABI limit after device discovery"
     );
     Ok(())
+}
+
+/// Returns the integrated template revision selected by the host-owned
+/// command-line token, or zero for an ordinary machine.
+pub fn microvm_platform_template_version(cmdline: &str) -> anyhow::Result<u32> {
+    let tokens = cmdline
+        .split_ascii_whitespace()
+        .filter(|token| {
+            kernel_parameter_name_matches(token, "nvx_platform_template")
+                || *token == "nvx_platform_template"
+        })
+        .collect::<Vec<_>>();
+    match tokens.as_slice() {
+        [] => Ok(0),
+        [token] if *token == MICROVM_PLATFORM_TEMPLATE_COMMAND_LINE_TOKEN => {
+            Ok(MICROVM_PLATFORM_TEMPLATE_VERSION)
+        }
+        _ => anyhow::bail!("unsupported or duplicate microVM platform-template revision"),
+    }
 }
 
 /// Validates the virtio-fs device inventory against the attached filesystem
@@ -1456,6 +1500,7 @@ fn validate_microvm_command_line(
     );
 
     let tokens = cmdline.split_ascii_whitespace().collect::<Vec<_>>();
+    let platform_template = microvm_platform_template_version(cmdline)? != 0;
     let has_console = config
         .virtio_devices
         .iter()
@@ -1478,6 +1523,10 @@ fn validate_microvm_command_line(
     anyhow::ensure!(
         has_network == config.microvm.network.is_some(),
         "microVM virtio-net device and static network identity must be configured together"
+    );
+    anyhow::ensure!(
+        !platform_template || has_network,
+        "a platform template requires a fixed NIC"
     );
     validate_microvm_sandbox_blocks(
         &config.microvm.sandbox_blocks,
@@ -1534,13 +1583,16 @@ fn validate_microvm_command_line(
         };
         let expected = match prefix {
             "virtio_mmio.device=" => config.virtio_devices.len(),
-            "virtnet_ip=" | "virtnet_mask=" | "virtnet_gw=" => usize::from(has_network),
+            "virtnet_ip=" | "virtnet_mask=" | "virtnet_gw=" => {
+                usize::from(has_network && !platform_template)
+            }
             "virtnet_ip6=" | "virtnet_gw6=" => usize::from(
-                config
-                    .microvm
-                    .network
-                    .as_ref()
-                    .is_some_and(|network| network.ipv6.is_some()),
+                !platform_template
+                    && config
+                        .microvm
+                        .network
+                        .as_ref()
+                        .is_some_and(|network| network.ipv6.is_some()),
             ),
             "virtfs_dir=" | "virtfs_tag=" | "virtfs_mode=" => bootstrapped.len(),
             "virtfs_aggregate=" => bootstrapped
@@ -1556,6 +1608,10 @@ fn validate_microvm_command_line(
     }
     let dns_server = microvm_command_line_dns_server(config.microvm.network.as_ref(), &tokens)?;
     let ingress = microvm_command_line_ingress(config.microvm.network.as_ref(), &tokens)?;
+    anyhow::ensure!(
+        !platform_template || (dns_server.is_none() && ingress.is_none()),
+        "a platform template cannot bootstrap DNS or a guest listener announcer"
+    );
     let mut expected_discovery = Vec::new();
     if has_network {
         let irq = microvm_virtio_net_irq(hypervisor_id)?;
@@ -1584,7 +1640,9 @@ fn validate_microvm_command_line(
         ));
         expected_discovery.push(MICROVM_CONTROL_TTY_COMMAND_LINE.to_owned());
     }
-    if let Some(network) = &config.microvm.network {
+    if let Some(network) = &config.microvm.network
+        && !platform_template
+    {
         expected_discovery.extend(
             network
                 .command_line_fragment_with(dns_server, ingress)
@@ -1753,6 +1811,7 @@ fn build_microvm_command_line_inner(
                 "virtfs_mode=",
                 "virtfs_aggregate=",
                 "nvx_snapshot_tier=",
+                "nvx_platform_template=",
                 "nr_cpus=",
                 "nvx_workload_uid=",
                 "nvx_workload_gid=",
@@ -1760,6 +1819,8 @@ fn build_microvm_command_line_inner(
             ]
             .iter()
             .any(|reserved| token.starts_with(reserved))
+                || kernel_parameter_name_matches(token, "nvx_platform_template")
+                || token == "nvx_platform_template"
                 || (reserve_control_console
                     && (kernel_parameter_name_matches(token, "nvx_control_tty")
                         || kernel_parameter_name_matches(token, "driver_async_probe")
@@ -2122,6 +2183,7 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
 mod tests {
     use super::*;
     use std::fs::File;
+    use test_with_tracing::test;
 
     fn linux_load_mode(
         boot_mode: LinuxDirectBootMode,
@@ -2292,6 +2354,39 @@ mod tests {
         let network: MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
         assert_eq!(network.profile, MicrovmNetworkProfile::Portable);
         assert_eq!(network.profile.as_str(), "portable");
+    }
+
+    #[test]
+    fn platform_template_discovers_but_does_not_configure_the_fixed_nic() {
+        let network: MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
+        let mut command_line = build_microvm_command_line(&[], false).unwrap();
+        command_line.push(' ');
+        command_line.push_str(MICROVM_PLATFORM_TEMPLATE_COMMAND_LINE_TOKEN);
+        append_microvm_virtio_discovery(
+            &mut command_line,
+            Some((&network, MICROVM_VIRTIO_NET_WHP_IRQ, None, None)),
+            false,
+            &[],
+            false,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(command_line.contains("virtio_mmio.device=0x1000@0xd0000000:5"));
+        assert!(!command_line.contains("virtnet_"));
+        assert_eq!(microvm_platform_template_version(&command_line).unwrap(), 1);
+        for token in [
+            "nvx_platform_template=1",
+            "nvx-platform-template=1",
+            "nvx_platform_template",
+        ] {
+            assert!(build_microvm_command_line(&[token.to_owned()], false).is_err());
+        }
+        assert!(microvm_platform_template_version("nvx_platform_template=2").is_err());
+        assert!(
+            microvm_platform_template_version("nvx_platform_template=1 nvx_platform_template=1")
+                .is_err()
+        );
     }
 
     #[test]

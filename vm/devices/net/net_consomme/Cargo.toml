@@ -28,6 +28,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 guestmem.workspace = true
+test_with_tracing.workspace = true
 
 [lints]
 workspace = true

@@ -20,6 +20,7 @@ pub(super) struct EffectiveMicrovmNetwork {
     pub(super) config: openvmm_defs::microvm::MicrovmNetworkConfig,
     pub(super) policy: net_backend_resources::egress::EgressPolicy,
     pub(super) attachment: openvmm_helpers::snapshot::microvm::SnapshotAttachment,
+    pub(super) restore_policy_barrier: bool,
 }
 
 fn microvm_network_attachment() -> openvmm_helpers::snapshot::microvm::SnapshotAttachment {
@@ -56,17 +57,24 @@ pub(super) fn effective_microvm_network(
     let Some(restore) = restore else {
         return requested
             .map(|config| {
-                let policy = opt.microvm_egress_policy(&config)?;
+                let policy = if opt.microvm.platform_template {
+                    config.deny_all_policy()?
+                } else {
+                    opt.microvm_egress_policy(&config)?
+                };
                 Ok(EffectiveMicrovmNetwork {
                     config,
                     policy,
                     attachment: microvm_network_attachment(),
+                    restore_policy_barrier: false,
                 })
             })
             .transpose();
     };
+    openvmm_helpers::snapshot::microvm::validate_supported_microvm_contract(restore)?;
+    let platform_template = restore.platform_template_version != 0;
     anyhow::ensure!(
-        requested.is_none(),
+        platform_template || requested.is_none(),
         "restore takes microVM network addressing from saved state"
     );
 
@@ -84,7 +92,8 @@ pub(super) fn effective_microvm_network(
     );
     let Some(saved) = restore.microvm_network.as_ref() else {
         anyhow::ensure!(
-            opt.microvm.network_profile.is_none()
+            requested.is_none()
+                && opt.microvm.network_profile.is_none()
                 && opt.microvm.net_tap.is_none()
                 && opt.microvm.network_egress.is_none()
                 && opt.microvm.network_ingress.is_none()
@@ -104,13 +113,43 @@ pub(super) fn effective_microvm_network(
         saved.profile == openvmm_defs::microvm::MicrovmNetworkProfile::Portable.as_str(),
         "snapshot microVM network profile is unsupported"
     );
-    anyhow::ensure!(
-        opt.microvm.network_profile == Some(cli_args::microvm::MicrovmNetworkProfileCli::Portable),
-        "networked microVM snapshot restore requires --network-profile portable"
-    );
     let config = microvm_network_from_snapshot(saved)?;
-    let policy = opt.microvm_egress_policy(&config)?;
-    openvmm_helpers::snapshot::microvm::validate_microvm_network_policy(saved, &policy)?;
+    let policy = if platform_template {
+        let closed = config.deny_all_policy()?;
+        anyhow::ensure!(
+            saved.egress_policy_encoding_version == closed.encoding_version(),
+            "platform-template snapshot egress policy encoding version is not canonical"
+        );
+        openvmm_helpers::snapshot::microvm::validate_microvm_network_policy(saved, &closed)?;
+        anyhow::ensure!(
+            requested
+                .as_ref()
+                .is_none_or(|requested| requested == &config),
+            "requested network address identity or address family does not match the fixed platform-template NIC"
+        );
+        anyhow::ensure!(
+            opt.microvm.network_profile.is_some() || !opt.microvm_network_policy_requested(),
+            "platform-template restore network policy requires --network-profile portable"
+        );
+        opt.microvm_template_egress_policy(&config)?
+    } else {
+        anyhow::ensure!(
+            opt.microvm.network_profile
+                == Some(cli_args::microvm::MicrovmNetworkProfileCli::Portable),
+            "networked microVM snapshot restore requires --network-profile portable"
+        );
+        anyhow::ensure!(
+            opt.microvm.network_ingress != Some(cli_args::microvm::MicrovmNetworkActionCli::Allow)
+                && opt.microvm.host_loopback
+                    != Some(cli_args::microvm::MicrovmNetworkActionCli::Allow)
+                && opt.microvm.host_loopback_forward.is_empty(),
+            "only a platform-template snapshot supports restore-time ingress or host-loopback listeners"
+        );
+        let policy = opt.microvm_egress_policy(&config)?;
+        openvmm_helpers::snapshot::microvm::validate_microvm_network_policy(saved, &policy)?;
+        policy
+    };
+    policy.validate()?;
     let attachment = microvm_network_attachment();
     anyhow::ensure!(
         Some(&attachment) == saved_attachment,
@@ -120,6 +159,7 @@ pub(super) fn effective_microvm_network(
         config,
         policy,
         attachment,
+        restore_policy_barrier: platform_template,
     }))
 }
 
@@ -208,18 +248,34 @@ pub(crate) mod tests {
     fn network_contract_for(
         network: &openvmm_defs::microvm::MicrovmNetworkConfig,
     ) -> openvmm_helpers::snapshot::microvm::SnapshotMachineContract {
-        let policy = network
-            .bind_egress_policy(
-                net_backend_resources::egress::EgressPolicyMode::TcpEndpoints(vec![
-                    "10.0.0.9:8443".parse().unwrap(),
-                    "192.0.2.7:443".parse().unwrap(),
-                    "10.0.0.9:443".parse().unwrap(),
-                ]),
-            )
-            .unwrap();
+        network_contract_with_topology(network, false)
+    }
+
+    fn network_contract_with_topology(
+        network: &openvmm_defs::microvm::MicrovmNetworkConfig,
+        template: bool,
+    ) -> openvmm_helpers::snapshot::microvm::SnapshotMachineContract {
+        let policy = if template {
+            network.deny_all_policy().unwrap()
+        } else {
+            network
+                .bind_egress_policy(
+                    net_backend_resources::egress::EgressPolicyMode::TcpEndpoints(vec![
+                        "10.0.0.9:8443".parse().unwrap(),
+                        "192.0.2.7:443".parse().unwrap(),
+                        "10.0.0.9:443".parse().unwrap(),
+                    ]),
+                )
+                .unwrap()
+        };
         let source_hypervisor = if cfg!(windows) { "whp" } else { "kvm" };
         let irq = openvmm_defs::microvm::microvm_virtio_net_irq(Some(source_hypervisor)).unwrap();
         let mut command_line = build_microvm_command_line(&[], false).unwrap();
+        if template {
+            command_line.push_str(" nvx_snapshot_tier=platform ");
+            command_line
+                .push_str(openvmm_defs::microvm::MICROVM_PLATFORM_TEMPLATE_COMMAND_LINE_TOKEN);
+        }
         openvmm_defs::microvm::append_microvm_virtio_discovery(
             &mut command_line,
             Some((network, irq, policy.gateway_dns_server(), None)),
@@ -261,6 +317,169 @@ pub(crate) mod tests {
             crate::microvm::restore::tests::test_cpu_profile(),
         )
         .unwrap()
+    }
+
+    fn template_options(arguments: &[&str]) -> Options {
+        let options = Options::try_parse_from(
+            [
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--restore-snapshot",
+                "snapshot",
+            ]
+            .into_iter()
+            .chain(arguments.iter().copied()),
+        )
+        .unwrap();
+        options.validate_microvm_options().unwrap();
+        options
+    }
+
+    #[test]
+    fn platform_template_restores_two_policies_or_no_network_on_the_same_nic() {
+        use net_backend_resources::egress::EgressAction;
+
+        let config = "10.0.0.2/24".parse().unwrap();
+        let contract = network_contract_with_topology(&config, true);
+        assert_eq!(contract.platform_template_version, 1);
+        assert!(!contract.effective_command_line.contains("virtnet_"));
+        let arguments: &[&[&str]] = &[
+            &[],
+            &["--network-profile", "portable"],
+            &[
+                "--network-profile",
+                "portable",
+                "--network-egress",
+                "deny",
+                "--network-egress-allow",
+                "192.0.2.0/24:tcp:443",
+                "--network-egress-deny",
+                "192.0.2.9",
+                "--host-loopback",
+                "deny",
+                "--network-proxy",
+                "10.0.0.1:8443",
+            ],
+            &[
+                "--network-profile",
+                "portable",
+                "--network-egress",
+                "deny",
+                "--network-egress-allow",
+                "2001:db8::/64:udp:53",
+                "--host-loopback",
+                "allow",
+                "--host-loopback-forward",
+                "tcp:28443:443",
+                "--network-ingress",
+                "allow",
+            ],
+        ];
+        let networks = arguments
+            .iter()
+            .map(|arguments| {
+                effective_microvm_network(&template_options(arguments), Some(&contract))
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for network in &networks {
+            assert_eq!(network.config, config);
+            assert!(network.restore_policy_barrier);
+            assert_eq!(network.attachment, networks[0].attachment);
+        }
+        assert_eq!(networks[0].policy, config.deny_all_policy().unwrap());
+        assert_eq!(networks[1].policy, networks[0].policy);
+        assert_eq!(microvm_ingress(&networks[0].policy), None);
+        assert_eq!(
+            networks[2].policy.host_loopback_action(),
+            EgressAction::Deny
+        );
+        assert!(networks[2].policy.proxy_endpoint().is_some());
+        assert_eq!(
+            microvm_ingress(&networks[3].policy),
+            Some(openvmm_defs::microvm::MicrovmIngress::PrivateNetworks)
+        );
+        assert_ne!(networks[2].policy, networks[3].policy);
+        assert_eq!(
+            contract.microvm_network.unwrap().egress_policy_mode,
+            "deny-all"
+        );
+    }
+
+    #[test]
+    fn platform_template_rejects_address_family_cidr_and_revision_mismatches() {
+        let config: openvmm_defs::microvm::MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
+        let contract = network_contract_with_topology(&config, true);
+        for address in ["10.0.0.3/24", "10.0.0.2/25", "10.1.0.2/24"] {
+            let options = template_options(&["--network-profile", "portable", "--net", address]);
+            let error = effective_microvm_network(&options, Some(&contract))
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("address identity"), "{error}");
+        }
+        let options = template_options(&["--network-profile", "portable", "--net", "10.0.0.2/24"]);
+        let ipv4_only = network_contract_with_topology(&config.without_ipv6(), true);
+        assert!(effective_microvm_network(&options, Some(&ipv4_only)).is_err());
+        let mut unknown = contract;
+        unknown
+            .microvm_network
+            .as_mut()
+            .unwrap()
+            .egress_policy_encoding_version = 0;
+        assert!(effective_microvm_network(&options, Some(&unknown)).is_err());
+        unknown
+            .microvm_network
+            .as_mut()
+            .unwrap()
+            .egress_policy_encoding_version = 4;
+        unknown.platform_template_version += 1;
+        assert!(effective_microvm_network(&options, Some(&unknown)).is_err());
+    }
+
+    #[test]
+    fn template_policy_never_relaxes_workload_or_no_nic_snapshots() {
+        let options = template_options(&[
+            "--network-profile",
+            "portable",
+            "--network-egress",
+            "allow",
+            "--host-loopback",
+            "allow",
+        ]);
+        assert!(effective_microvm_network(&options, Some(&network_contract())).is_err());
+        let mut no_nic = network_contract();
+        no_nic.microvm_network = None;
+        no_nic
+            .devices
+            .retain(|device| device.stable_id != MICROVM_NETWORK_STABLE_ID);
+        no_nic
+            .attachments
+            .retain(|attachment| attachment.stable_id != MICROVM_NETWORK_STABLE_ID);
+        assert!(effective_microvm_network(&options, Some(&no_nic)).is_err());
+        let no_network = template_options(&[]);
+        assert!(
+            effective_microvm_network(&no_network, Some(&no_nic))
+                .unwrap()
+                .is_none()
+        );
+        let cold = Options::try_parse_from(["openvmm", "--machine", "microvm"]).unwrap();
+        assert!(effective_microvm_network(&cold, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn template_requires_explicit_network_authorization_and_closed_capture() {
+        let config = "10.0.0.2/24".parse().unwrap();
+        let mut contract = network_contract_with_topology(&config, true);
+        let unauthorized = template_options(&["--network-egress", "allow"]);
+        assert!(effective_microvm_network(&unauthorized, Some(&contract)).is_err());
+        contract
+            .microvm_network
+            .as_mut()
+            .unwrap()
+            .egress_policy_mode = "allow-all".to_owned();
+        assert!(effective_microvm_network(&template_options(&[]), Some(&contract)).is_err());
     }
 
     #[test]

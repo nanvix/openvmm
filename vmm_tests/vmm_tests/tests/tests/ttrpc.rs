@@ -1570,7 +1570,7 @@ async fn launch_openvmm(
 /// dropped. Without this guard, any test that fails or panics before reaching
 /// its `TeardownVM`/`Quit` calls leaves an orphaned OpenVMM process behind,
 /// still running its VM and still holding the ttrpc socket.
-struct OpenvmmChild(PolledChild<std::process::Child>);
+pub(super) struct OpenvmmChild(pub(super) PolledChild<std::process::Child>);
 
 impl Deref for OpenvmmChild {
     type Target = PolledChild<std::process::Child>;

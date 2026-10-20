@@ -84,6 +84,14 @@ impl MockQueueHandle {
 struct ForkMockEndpoint {
     endpoint: MockEndpoint,
     egress_policy: Option<EgressPolicy>,
+    restore_probe: Option<RestorePolicyProbe>,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct RestorePolicyProbe {
+    pub(super) policies: Arc<Mutex<Vec<EgressPolicy>>>,
+    pub(super) fail_bind: bool,
+    pub(super) fail_install: bool,
 }
 
 impl InspectMut for ForkMockEndpoint {
@@ -104,6 +112,13 @@ impl Endpoint for ForkMockEndpoint {
         _rss: Option<&RssConfig<'_>>,
         queues: &mut Vec<Box<dyn net_backend::Queue>>,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self
+                .restore_probe
+                .as_ref()
+                .is_some_and(|probe| probe.fail_bind),
+            "injected listener bind failure"
+        );
         let (queue, mut handle) = new_mock_queue();
         let queue = ForkMockQueue {
             queue,
@@ -117,6 +132,14 @@ impl Endpoint for ForkMockEndpoint {
     }
 
     fn set_egress_policy(&mut self, policy: EgressPolicy) -> anyhow::Result<()> {
+        if let Some(probe) = &self.restore_probe {
+            let mut policies = probe.policies.lock();
+            anyhow::ensure!(
+                !probe.fail_install || policies.is_empty(),
+                "injected policy install failure"
+            );
+            policies.push(policy.clone());
+        }
         self.egress_policy = Some(policy);
         Ok(())
     }
@@ -249,6 +272,7 @@ impl TestHarness {
                 is_ordered: true,
             },
             egress_policy: None,
+            restore_probe: None,
         };
         let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
         let mac = MacAddress::new([0x00, 0x15, 0x5d, 0xaa, 0xbb, 0xcc]);
@@ -274,6 +298,7 @@ impl TestHarness {
                 is_ordered: true,
             },
             egress_policy: None,
+            restore_probe: None,
         };
         let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
         let mac = MacAddress::new([0x52, 0x54, 0, 0, 0, 2]);
@@ -291,6 +316,52 @@ impl TestHarness {
             .unwrap();
         harness.queue_handle_rx = queue_handle_rx;
         harness
+    }
+
+    pub(super) fn new_restore_policy(
+        driver: &DefaultDriver,
+        policy: EgressPolicy,
+        probe: RestorePolicyProbe,
+    ) -> Self {
+        let mut harness = Self::new(driver);
+        let (queue_tx, queue_handle_rx) = mesh::channel();
+        let endpoint = ForkMockEndpoint {
+            endpoint: MockEndpoint {
+                queue_tx,
+                is_ordered: true,
+            },
+            egress_policy: None,
+            restore_probe: Some(probe),
+        };
+        let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
+        harness.device = Device::builder()
+            .save_restore(
+                net_backend_resources::consomme::static_ipv4::StaticIpv4Config {
+                    guest_ipv4: std::net::Ipv4Addr::new(10, 0, 0, 2),
+                    prefix_length: 24,
+                    gateway_ipv4: std::net::Ipv4Addr::new(10, 0, 0, 1),
+                    gateway_mac: MacAddress::new([0x52, 0x54, 0, 0, 0, 1]),
+                },
+                (1 << 5) | (1 << 32),
+            )
+            .restore_egress_policy(policy)
+            .build(
+                &driver_source,
+                Box::new(endpoint),
+                MacAddress::new([0x52, 0x54, 0, 0, 0, 2]),
+            )
+            .unwrap();
+        harness.queue_handle_rx = queue_handle_rx;
+        harness
+    }
+
+    pub(super) async fn prepare_restore_policy(&mut self) -> anyhow::Result<()> {
+        self.device.prepare_restore().await?;
+        self.queue_handle_rx
+            .next()
+            .await
+            .expect("missing preparation queue");
+        Ok(())
     }
 
     pub(super) async fn start_rx_queue(&mut self, features: &VirtioDeviceFeatures) {

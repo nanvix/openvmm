@@ -163,8 +163,17 @@ impl VmController {
             );
             if self.microvm.resources.sandbox_block_sources.is_empty() {
                 anyhow::ensure!(
-                    self.microvm.snapshot_tier.is_none(),
-                    "blockless microVM snapshot capture does not use a tier"
+                    self.microvm.snapshot_tier.is_none()
+                        || (self.microvm.snapshot_tier
+                            == Some(crate::cli_args::microvm::SnapshotTierCli::Platform)
+                            && self.microvm.effective_command_line.as_deref().is_some_and(
+                                |command_line| {
+                                    command_line.split_ascii_whitespace().any(|token| {
+                                        token == openvmm_defs::microvm::MICROVM_PLATFORM_TEMPLATE_COMMAND_LINE_TOKEN
+                                    })
+                                }
+                            )),
+                    "blockless microVM snapshot capture uses a tier only for a platform template"
                 );
             } else {
                 let tier = self

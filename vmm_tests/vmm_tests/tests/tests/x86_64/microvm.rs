@@ -3,6 +3,8 @@
 
 //! microVM lifecycle integration tests.
 
+mod network;
+
 use anyhow::Context;
 use mesh::CancelContext;
 use petri::PetriHaltReason;

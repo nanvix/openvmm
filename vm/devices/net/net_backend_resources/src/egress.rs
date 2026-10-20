@@ -806,6 +806,22 @@ impl EgressPolicy {
         self
     }
 
+    /// Returns a deny-all policy for the same link, without host access,
+    /// proxy exceptions, ingress, or tenant rules.
+    pub fn deny_all(&self) -> Result<Self, InvalidEgressPolicy> {
+        let mut policy = Self::bind(
+            self.guest_ipv4,
+            self.prefix_length,
+            self.guest_mac,
+            self.gateway_ipv4,
+            EgressPolicyMode::DenyAll,
+        )?;
+        if let Some(link) = self.ipv6 {
+            policy = policy.with_ipv6(link.guest(), link.prefix_length(), link.gateway())?;
+        }
+        policy.with_host_loopback(EgressAction::Deny, None)
+    }
+
     /// Revalidates canonical fields after a serialized policy crosses a boundary.
     pub fn validate(&self) -> Result<(), InvalidEgressPolicy> {
         let mut rebound = Self::bind(

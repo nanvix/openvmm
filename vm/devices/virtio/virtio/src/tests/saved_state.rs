@@ -37,6 +37,8 @@ struct PrivateStateProbe {
     initial_used: Arc<AtomicUsize>,
     value_at_start: Arc<AtomicUsize>,
     fail_restore: Arc<AtomicBool>,
+    prepare_count: Arc<AtomicUsize>,
+    fail_prepare: Arc<AtomicBool>,
 }
 
 impl PrivateStateTestDevice {
@@ -50,6 +52,8 @@ impl PrivateStateTestDevice {
             initial_used: Arc::new(AtomicUsize::new(usize::MAX)),
             value_at_start: Arc::new(AtomicUsize::new(usize::MAX)),
             fail_restore: Arc::new(AtomicBool::new(fail_restore)),
+            prepare_count: Arc::new(AtomicUsize::new(0)),
+            fail_prepare: Arc::new(AtomicBool::new(false)),
         };
         (
             Self {
@@ -71,6 +75,15 @@ impl PrivateStateProbe {
 }
 
 impl VirtioDevice for PrivateStateTestDevice {
+    async fn prepare_restore(&mut self) -> anyhow::Result<()> {
+        self.probe.prepare_count.fetch_add(1, Ordering::Relaxed);
+        anyhow::ensure!(
+            !self.probe.fail_prepare.load(Ordering::Relaxed),
+            "injected restore preparation failure"
+        );
+        Ok(())
+    }
+
     fn traits(&self) -> DeviceTraits {
         DeviceTraits {
             device_id: VirtioDeviceType::CONSOLE,
@@ -325,6 +338,7 @@ async fn mmio_private_state_round_trip(driver: DefaultDriver) {
         .restore(saved)
         .expect("private state restore should validate");
     destination.start_fallible().await.unwrap();
+    assert_eq!(probe.prepare_count.load(Ordering::Relaxed), 1);
     assert_eq!(probe.value.load(Ordering::Relaxed), 0);
     assert_eq!(probe.restore_count.load(Ordering::Relaxed), 0);
 
@@ -351,6 +365,27 @@ async fn mmio_private_state_round_trip(driver: DefaultDriver) {
         }
         assert_eq!(probe.value.load(Ordering::Relaxed), 42);
         assert_eq!(probe.restore_count.load(Ordering::Relaxed), expected_count);
+    }
+
+    #[async_test]
+    async fn inactive_restore_preparation_failure_propagates_before_queue_or_private_state_activation(
+        driver: DefaultDriver,
+    ) {
+        use vmcore::save_restore::SaveRestore;
+
+        let (source_device, _) = PrivateStateTestDevice::new(42, 0, false);
+        let mut source = MmioTestTransport::new(Box::new(source_device), &driver, 0);
+        source.stop().await;
+        let saved = source.dev.save().unwrap();
+        let (destination_device, probe) = PrivateStateTestDevice::new(0, 0, false);
+        probe.fail_prepare.store(true, Ordering::Relaxed);
+        let mut destination = MmioTestTransport::new(Box::new(destination_device), &driver, 0);
+        destination.dev.restore(saved).unwrap();
+        let error = destination.dev.start_fallible().await.unwrap_err();
+        assert!(format!("{error:#}").contains("injected restore preparation failure"));
+        assert_eq!(probe.prepare_count.load(Ordering::Relaxed), 1);
+        assert_eq!(probe.restore_count.load(Ordering::Relaxed), 0);
+        assert_eq!(probe.start_count.load(Ordering::Relaxed), 0);
     }
 
     destination.stop().await;

@@ -308,6 +308,13 @@ pub struct MicrovmCli {
     )]
     pub snapshot_tier: Option<SnapshotTierCli>,
 
+    /// Capture a platform template with a fixed, unconfigured deny-all NIC.
+    ///
+    /// Requires --snapshot-tier platform, --net and --network-profile
+    /// portable. Tenant network policy is supplied only on restore.
+    #[clap(long, requires_all = ["snapshot_tier", "net"])]
+    pub platform_template: bool,
+
     /// Sandbox-block identity policy for this capture.
     ///
     /// `sha256` is the default. `generation` avoids whole-file hashing and
@@ -377,7 +384,7 @@ pub struct MicrovmCli {
     /// addresses are not globally reachable. Globally reachable clients are
     /// refused, and so is the host itself unless `--host-loopback allow`
     /// admits it. Replies to admitted traffic pass regardless of the egress
-    /// policy. Snapshots do not support it.
+    /// policy. Only platform-template restores support it with snapshots.
     #[clap(long, value_enum, value_name = "ACTION")]
     pub network_ingress: Option<MicrovmNetworkActionCli>,
 
@@ -407,7 +414,8 @@ pub struct MicrovmCli {
     /// replies to the host pass regardless of the egress policy. With
     /// `--network-ingress allow`, the listeners published to the host's
     /// private networks admit the host instead. Explicit forwards may publish
-    /// further ports. Snapshots do not support explicit `allow`.
+    /// further ports. Only platform-template restores support explicit
+    /// `allow` with snapshots.
     #[clap(long, value_enum, value_name = "ACTION")]
     pub host_loopback: Option<MicrovmNetworkActionCli>,
 
@@ -731,8 +739,8 @@ impl Options {
         anyhow::ensure!(
             self.machine != MachineProfileCli::Microvm
                 || self.microvm.host_loopback != Some(MicrovmNetworkActionCli::Allow)
-                || (self.microvm.snapshot_destination.is_none() && self.restore_snapshot.is_none()),
-            "microVM snapshots do not support --host-loopback allow, whose published guest listeners are live host attachments"
+                || self.microvm.snapshot_destination.is_none(),
+            "microVM snapshot capture does not support --host-loopback allow, whose published guest listeners are live host attachments"
         );
         Ok(())
     }
@@ -742,6 +750,7 @@ impl Options {
         if self.machine != MachineProfileCli::Microvm {
             anyhow::ensure!(
                 self.microvm.net_tap.is_none()
+                    && !self.microvm.platform_template
                     && self.microvm.network_profile.is_none()
                     && self.microvm.network_egress.is_none()
                     && self.microvm.network_ingress.is_none()
@@ -820,8 +829,9 @@ impl Options {
             );
             anyhow::ensure!(
                 self.microvm.snapshot_tier.is_some()
-                    != self.microvm.microvm_sandbox_block.is_empty(),
-                "--snapshot-tier is required exactly for microVM snapshot capture with sandbox blocks"
+                    == (!self.microvm.microvm_sandbox_block.is_empty()
+                        || self.microvm.platform_template),
+                "--snapshot-tier is required exactly for microVM snapshot capture with sandbox blocks or --platform-template"
             );
             let identity = self
                 .microvm
@@ -885,6 +895,19 @@ impl Options {
                 );
             }
         }
+        if self.microvm.platform_template {
+            anyhow::ensure!(
+                self.microvm.snapshot_tier == Some(SnapshotTierCli::Platform)
+                    && self.microvm.snapshot_destination.is_some()
+                    && self.restore_snapshot.is_none()
+                    && self.net.len() == 1,
+                "--platform-template requires platform-tier capture with one fixed --net identity"
+            );
+            anyhow::ensure!(
+                !self.microvm_network_policy_requested(),
+                "--platform-template captures deny-all without tenant network policy"
+            );
+        }
         if self.restore_snapshot.is_some() {
             anyhow::ensure!(
                 self.microvm.microvm_workload_identity.is_none(),
@@ -893,10 +916,6 @@ impl Options {
             anyhow::ensure!(
                 self.microvm.microvm_lifecycle.is_none(),
                 "--microvm-lifecycle is fixed by the captured microVM command line"
-            );
-            anyhow::ensure!(
-                self.net.is_empty(),
-                "microVM restore takes network addressing from saved state; do not pass --net"
             );
             anyhow::ensure!(
                 self.microvm.restore_gate_timeout_ms != 0,
@@ -1221,8 +1240,8 @@ impl Options {
         );
         anyhow::ensure!(
             self.microvm.network_ingress != Some(MicrovmNetworkActionCli::Allow)
-                || (self.microvm.snapshot_destination.is_none() && self.restore_snapshot.is_none()),
-            "microVM snapshots do not support --network-ingress allow, whose published guest listeners are live host attachments"
+                || self.microvm.snapshot_destination.is_none(),
+            "microVM snapshot capture does not support --network-ingress allow, whose published guest listeners are live host attachments"
         );
         anyhow::ensure!(
             self.microvm.network_egress_allow.len() <= 256
@@ -1239,8 +1258,8 @@ impl Options {
                 "--host-loopback-forward requires explicit --host-loopback allow"
             );
             anyhow::ensure!(
-                self.microvm.snapshot_destination.is_none() && self.restore_snapshot.is_none(),
-                "microVM snapshots do not support live host-loopback port forwards"
+                self.microvm.snapshot_destination.is_none(),
+                "microVM snapshot capture does not support live host-loopback port forwards"
             );
             let mut forwards = self.microvm.host_loopback_forward.clone();
             forwards.sort_unstable();
@@ -1254,6 +1273,15 @@ impl Options {
                     pair[0].protocol != pair[1].protocol || pair[0].host_port != pair[1].host_port
                 }),
                 "microVM host-loopback forwards cannot bind one protocol and host port more than once"
+            );
+        }
+        if let Some(proxy) = self.microvm.network_proxy {
+            anyhow::ensure!(
+                !self.microvm.host_loopback_forward.iter().any(|forward| {
+                    forward.protocol == MicrovmLoopbackForwardProtocol::Tcp
+                        && forward.host_port == proxy.port()
+                }),
+                "microVM network proxy conflicts with a TCP host-loopback forward"
             );
         }
         anyhow::ensure!(
@@ -1341,17 +1369,47 @@ impl Options {
         net_backend_resources::egress::EgressPolicy,
         net_backend_resources::egress::InvalidEgressPolicy,
     > {
+        self.microvm_egress_policy_with_default(network, MicrovmNetworkActionCli::Allow)
+    }
+
+    pub(crate) fn microvm_template_egress_policy(
+        &self,
+        network: &openvmm_defs::microvm::MicrovmNetworkConfig,
+    ) -> Result<
+        net_backend_resources::egress::EgressPolicy,
+        net_backend_resources::egress::InvalidEgressPolicy,
+    > {
+        self.microvm_egress_policy_with_default(network, MicrovmNetworkActionCli::Deny)
+    }
+
+    pub(crate) fn microvm_network_policy_requested(&self) -> bool {
+        self.microvm.network_egress.is_some()
+            || self.microvm.network_ingress.is_some()
+            || !self.microvm.allow_host.is_empty()
+            || !self.microvm.block_host.is_empty()
+            || !self.microvm.allow_endpoint.is_empty()
+            || !self.microvm.network_egress_allow.is_empty()
+            || !self.microvm.network_egress_deny.is_empty()
+            || self.microvm.host_loopback.is_some()
+            || self.microvm.network_proxy.is_some()
+            || !self.microvm.host_loopback_forward.is_empty()
+    }
+
+    fn microvm_egress_policy_with_default(
+        &self,
+        network: &openvmm_defs::microvm::MicrovmNetworkConfig,
+        default: MicrovmNetworkActionCli,
+    ) -> Result<
+        net_backend_resources::egress::EgressPolicy,
+        net_backend_resources::egress::InvalidEgressPolicy,
+    > {
         use net_backend_resources::egress::EgressPolicyMode;
 
         let mode = if !self.microvm.network_egress_allow.is_empty()
             || !self.microvm.network_egress_deny.is_empty()
         {
             EgressPolicyMode::Rules {
-                default_action: self
-                    .microvm
-                    .network_egress
-                    .unwrap_or(MicrovmNetworkActionCli::Allow)
-                    .into(),
+                default_action: self.microvm.network_egress.unwrap_or(default).into(),
                 allow: self.microvm.network_egress_allow.clone(),
                 deny: self.microvm.network_egress_deny.clone(),
             }
@@ -1361,7 +1419,7 @@ impl Options {
             EgressPolicyMode::BlockList(self.microvm.block_host.clone())
         } else if !self.microvm.allow_endpoint.is_empty() {
             EgressPolicyMode::TcpEndpoints(self.microvm.allow_endpoint.clone())
-        } else if self.microvm.network_egress == Some(MicrovmNetworkActionCli::Deny) {
+        } else if self.microvm.network_egress.unwrap_or(default) == MicrovmNetworkActionCli::Deny {
             EgressPolicyMode::DenyAll
         } else {
             EgressPolicyMode::AllowAll
@@ -1369,10 +1427,7 @@ impl Options {
         network.bind_egress_policy(mode).and_then(|policy| {
             Ok(policy
                 .with_host_loopback(
-                    self.microvm
-                        .host_loopback
-                        .unwrap_or(MicrovmNetworkActionCli::Allow)
-                        .into(),
+                    self.microvm.host_loopback.unwrap_or(default).into(),
                     self.microvm.network_proxy,
                 )?
                 .with_ingress(
@@ -1430,6 +1485,72 @@ mod tests {
         assert!(Options::try_parse_from(["openvmm", "--machine", "microvm-v3"]).is_err());
         assert!(Options::try_parse_from(["openvmm", "--machine", "nvx"]).is_err());
         assert!(Options::try_parse_from(["openvmm", "--machine", "unknown"]).is_err());
+    }
+
+    #[test]
+    fn test_platform_template_requires_explicit_topology_and_no_tenant_policy() {
+        let capture = [
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--snapshot-destination",
+            "snapshot",
+            "--snapshot-tier",
+            "platform",
+            "--platform-template",
+            "--net",
+            "10.0.0.2/24",
+            "--network-profile",
+            "portable",
+        ];
+        Options::try_parse_from(capture)
+            .unwrap()
+            .validate_microvm_options()
+            .unwrap();
+        for policy in [
+            &["--network-egress", "allow"][..],
+            &["--network-egress", "deny"][..],
+            &["--host-loopback", "allow"][..],
+            &["--allow-host", "192.0.2.0/24"][..],
+            &["--network-proxy", "10.0.0.1:8443"][..],
+        ] {
+            let options =
+                Options::try_parse_from(capture.into_iter().chain(policy.iter().copied())).unwrap();
+            assert!(options.validate_microvm_options().is_err());
+        }
+        for tier in ["workload-start", "instance-checkpoint"] {
+            let mut arguments = capture;
+            arguments[6] = tier;
+            assert!(
+                Options::try_parse_from(arguments)
+                    .unwrap()
+                    .validate_microvm_options()
+                    .is_err()
+            );
+        }
+        assert!(Options::try_parse_from(["openvmm", "--platform-template"]).is_err());
+    }
+
+    #[test]
+    fn test_template_restore_rejects_proxy_forward_conflict_before_binding() {
+        let options = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--restore-snapshot",
+            "snapshot",
+            "--network-profile",
+            "portable",
+            "--host-loopback",
+            "allow",
+            "--network-proxy",
+            "10.0.0.1:8443",
+            "--host-loopback-forward",
+            "tcp:8443:443",
+        ])
+        .unwrap();
+        let error = options.validate_microvm_options().unwrap_err();
+        assert!(error.to_string().contains("proxy conflicts"), "{error}");
     }
 
     #[test]
@@ -2314,18 +2435,24 @@ mod tests {
             assert_eq!(policy.host_loopback_ingress_action(), EgressAction::Allow);
             assert_eq!(options.microvm_private_network_ingress(), None);
         }
-        // Snapshots cannot carry published listeners.
-        for extra in [
-            vec!["--net", "10.0.0.2/24", "--snapshot-destination", "snapshot"],
-            vec!["--restore-snapshot", "snapshot"],
-        ] {
-            let options = Options::try_parse_from(common.into_iter().chain(extra)).unwrap();
-            let error = options.validate_microvm_options().unwrap_err();
-            assert!(
-                error.to_string().contains("--host-loopback allow"),
-                "{error}"
-            );
-        }
+        // Capture cannot carry published listeners. Restore defers the
+        // template-versus-workload check until its contract is available.
+        let options = Options::try_parse_from(common.into_iter().chain([
+            "--net",
+            "10.0.0.2/24",
+            "--snapshot-destination",
+            "snapshot",
+        ]))
+        .unwrap();
+        let error = options.validate_microvm_options().unwrap_err();
+        assert!(
+            error.to_string().contains("--host-loopback allow"),
+            "{error}"
+        );
+        Options::try_parse_from(common.into_iter().chain(["--restore-snapshot", "snapshot"]))
+            .unwrap()
+            .validate_microvm_options()
+            .unwrap();
         // Omitted or denied host loopback publishes nothing.
         for host_loopback in [None, Some("deny")] {
             let options = Options::try_parse_from(
@@ -3069,31 +3196,29 @@ mod tests {
         );
         assert_eq!(denied.microvm_private_network_ingress(), None);
 
-        // Snapshots cannot carry published listeners.
-        for arguments in [
-            [
-                "--net",
-                "10.0.0.2/24",
-                "--network-ingress",
-                "allow",
-                "--snapshot-destination",
-                "snapshot",
-            ]
-            .as_slice(),
-            [
-                "--restore-snapshot",
-                "snapshot",
-                "--network-ingress",
-                "allow",
-            ]
-            .as_slice(),
-        ] {
-            let error = parse(arguments).validate_microvm_options().unwrap_err();
-            assert!(
-                error.to_string().contains("--network-ingress allow"),
-                "{error}"
-            );
-        }
+        // Capture cannot carry published listeners.
+        let error = parse(&[
+            "--net",
+            "10.0.0.2/24",
+            "--network-ingress",
+            "allow",
+            "--snapshot-destination",
+            "snapshot",
+        ])
+        .validate_microvm_options()
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("--network-ingress allow"),
+            "{error}"
+        );
+        parse(&[
+            "--restore-snapshot",
+            "snapshot",
+            "--network-ingress",
+            "allow",
+        ])
+        .validate_microvm_options()
+        .unwrap();
     }
 
     #[test]

@@ -83,6 +83,9 @@ impl DeviceTask {
     ) -> anyhow::Result<()> {
         let device_state =
             std::mem::replace(&mut params.device_state, DeviceRestoreState::NotRestored);
+        if device_state.is_restored() {
+            self.device.prepare_restore().await?;
+        }
         self.stage_restore(device_state, params.active);
         if !params.active {
             return Ok(());

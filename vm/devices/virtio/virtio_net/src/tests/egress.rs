@@ -5,12 +5,14 @@
 //! reaching the endpoint, and the endpoint checks the bytes it transmits.
 
 use super::TestHarness;
+use super::harness::RestorePolicyProbe;
 use net_backend_resources::egress::EgressPolicy;
 use net_backend_resources::egress::EgressPolicyMode;
 use net_backend_resources::mac_address::MacAddress;
 use pal_async::DefaultDriver;
 use pal_async::async_test;
 use test_with_tracing::test;
+use virtio::VirtioDevice;
 
 #[async_test]
 async fn denied_tx_completes_without_backend_ownership(driver: DefaultDriver) {
@@ -84,6 +86,77 @@ fn endpoint_policy() -> EgressPolicy {
         ]),
     )
     .unwrap()
+}
+
+#[async_test]
+async fn restore_policy_barrier_denies_packets_then_installs_one_of_two_policies(
+    driver: DefaultDriver,
+) {
+    let first = endpoint_policy();
+    let second = EgressPolicy::bind(
+        std::net::Ipv4Addr::new(10, 0, 0, 2),
+        24,
+        MacAddress::new([0x52, 0x54, 0, 0, 0, 2]),
+        std::net::Ipv4Addr::new(10, 0, 0, 1),
+        EgressPolicyMode::TcpEndpoints(vec!["192.0.2.7:80".parse().unwrap()]),
+    )
+    .unwrap();
+    for (policy, allowed_port) in [
+        (first.clone(), Some(443)),
+        (second, Some(80)),
+        (first.deny_all().unwrap(), None),
+    ] {
+        let probe = RestorePolicyProbe::default();
+        let mut harness = TestHarness::new_restore_policy(&driver, policy.clone(), probe.clone());
+        {
+            let installed = probe.policies.lock();
+            assert_eq!(installed.as_slice(), &[policy.deny_all().unwrap()]);
+            for port in [443, 80] {
+                let frame = policy_tcp_frame(port);
+                assert!(installed[0].authorize_frame(&frame, frame.len()).is_err());
+            }
+        }
+        assert!(harness.device.restore_policy.ensure_ready().is_err());
+        harness.prepare_restore_policy().await.unwrap();
+        assert_eq!(
+            probe.policies.lock().as_slice(),
+            &[policy.deny_all().unwrap(), policy]
+        );
+        harness.device.restore_policy.ensure_ready().unwrap();
+        let handle = harness.enable_and_get_handle().await;
+        for (descriptor, port) in [(0, 443), (2, 80)] {
+            harness.post_tx_frame_and_signal(descriptor, &policy_tcp_frame(port));
+            assert_eq!(harness.wait_for_used().await.0, descriptor);
+            assert_eq!(
+                !handle.take_tx_avail_log().is_empty(),
+                allowed_port == Some(port),
+            );
+        }
+        harness.device.stop_queue(0).await;
+        harness.device.stop_queue(1).await;
+    }
+}
+
+#[async_test]
+async fn restore_policy_bind_or_install_failure_is_terminal_and_keeps_deny_all(
+    driver: DefaultDriver,
+) {
+    for (fail_bind, fail_install) in [(true, false), (false, true)] {
+        let probe = RestorePolicyProbe {
+            fail_bind,
+            fail_install,
+            ..Default::default()
+        };
+        let policy = endpoint_policy();
+        let mut harness = TestHarness::new_restore_policy(&driver, policy.clone(), probe.clone());
+        assert!(harness.device.prepare_restore().await.is_err());
+        assert!(harness.device.prepare_restore().await.is_err());
+        assert!(harness.device.restore_policy.ensure_ready().is_err());
+        assert_eq!(
+            probe.policies.lock().as_slice(),
+            &[policy.deny_all().unwrap()]
+        );
+    }
 }
 
 #[async_test]

@@ -248,6 +248,7 @@ pub struct Device {
     /// Per-pair state tracking.
     pairs: Vec<QueuePairState>,
     lifecycle: saved_state::Lifecycle,
+    restore_policy: egress::RestorePolicyState,
 }
 
 /// Tracks the state of a queue pair through the start_queue lifecycle.
@@ -273,6 +274,10 @@ enum QueuePairState {
 }
 
 impl VirtioDevice for Device {
+    async fn prepare_restore(&mut self) -> anyhow::Result<()> {
+        self.prepare_restore_policy().await
+    }
+
     fn traits(&self) -> DeviceTraits {
         let offloads = &self.adapter.tx_offload_support;
 
@@ -342,6 +347,7 @@ impl VirtioDevice for Device {
         features: &VirtioDeviceFeatures,
         initial_state: Option<QueueState>,
     ) -> anyhow::Result<()> {
+        self.restore_policy.ensure_ready()?;
         let guest_memory = resources.guest_memory.clone();
         let queue_size = resources.params.size;
         let queue_event = PolledWait::new(&self.adapter.driver, resources.event)
@@ -580,6 +586,7 @@ pub struct NicBuilder {
     max_queue_pairs: u16,
     egress_policy: Option<EgressPolicy>,
     save_restore: Option<saved_state::SaveRestoreConfig>,
+    restore_policy: bool,
 }
 
 impl NicBuilder {
@@ -655,6 +662,11 @@ impl NicBuilder {
                 .map(|_| QueuePairState::Empty)
                 .collect(),
             lifecycle: Default::default(),
+            restore_policy: if self.restore_policy {
+                egress::RestorePolicyState::Held
+            } else {
+                egress::RestorePolicyState::Disabled
+            },
         })
     }
 }
@@ -665,6 +677,7 @@ impl Device {
             max_queue_pairs: !0,
             egress_policy: None,
             save_restore: None,
+            restore_policy: false,
         }
     }
 }
