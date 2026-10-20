@@ -4,6 +4,22 @@
 use std::fs::File;
 use std::io;
 
+/// Returns the read and write data access of an opened descriptor.
+pub fn file_data_access(file: &File) -> io::Result<(bool, bool)> {
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: F_GETFL only queries the live descriptor and takes no pointer.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    #[cfg(target_os = "linux")]
+    if flags & libc::O_PATH != 0 {
+        return Ok((false, false));
+    }
+    let access = flags & libc::O_ACCMODE;
+    Ok((access != libc::O_WRONLY, access != libc::O_RDONLY))
+}
+
 /// Clones all file extents into an independently writable destination.
 pub fn reflink(source: &File, destination: &File) -> io::Result<()> {
     #[cfg(target_os = "linux")]

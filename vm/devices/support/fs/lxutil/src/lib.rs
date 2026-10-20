@@ -73,6 +73,29 @@ impl LxVolume {
         Self::new_with_options(root_path, &LxVolumeOptions::new())
     }
 
+    /// Uses an already-opened directory or regular file as a confined root.
+    /// A file root exposes only the empty relative path, never its directory.
+    /// No operation resolves the root's original host pathname.
+    pub fn from_opened(root: std::fs::File, options: &LxVolumeOptions) -> lx::Result<Self> {
+        if !options.confine_paths {
+            return Err(lx::Error::EINVAL);
+        }
+        let metadata = root.metadata()?;
+        if !metadata.is_dir() && !metadata.is_file() {
+            return Err(lx::Error::EINVAL);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return Err(lx::Error::ELOOP);
+            }
+        }
+        Ok(Self {
+            inner: sys::LxVolume::from_opened(root, options)?,
+        })
+    }
+
     /// Indicates whether the file IDs (inode numbers) on this file system are stable.
     ///
     /// # Windows

@@ -58,6 +58,71 @@ fn microvm_state_restores_against_the_same_attachment() {
 }
 
 #[test]
+fn pinned_single_root_restores_its_identity_binding_and_subtree_policy() {
+    use super::saved_state::OBJECT_PINNED_SCHEMA_VERSION;
+    use virtio_resources::attachment::*;
+    use virtio_resources::fs::microvm::MicrovmFsRoot;
+    let directory = tempdir().unwrap();
+    for child in ["hidden", "out"] {
+        std::fs::create_dir(directory.path().join(child)).unwrap();
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    let file = options.open(directory.path()).unwrap();
+    let grant = AttachmentGrant {
+        role: MICROVM_ATTACHMENT_ID.to_owned(),
+        kind: AttachmentKind::Directory,
+        read_only: false,
+        binding: AttachmentBinding::ObjectPinned {
+            identity: AttachmentIdentity::query(&file).unwrap(),
+        },
+        length: None,
+        geometry: None,
+    };
+    let receipt = grant
+        .verify_opened(&file, &grant.role, grant.kind, false, None)
+        .unwrap();
+    let roots = [MicrovmFsRoot::ObjectPinned(OpenedAttachment {
+        file,
+        receipt,
+    })];
+    let profile = MicroVmVirtioFsProfile::from_attachment_with_policy(
+        MICROVM_ATTACHMENT_ID.to_owned(),
+        microvm_root_identity(directory.path()).unwrap(),
+        false,
+        vec!["hidden".to_owned()],
+        Vec::new(),
+        vec!["out".to_owned()],
+    )
+    .unwrap();
+    let source = VirtioFs::new_microvm_verified(&roots, profile.clone()).unwrap();
+    let pinned = source.microvm_profile().unwrap().clone();
+    let state = source
+        .save_microvm_state(&pinned, SessionState::default())
+        .unwrap();
+    assert_eq!(state.schema_version, OBJECT_PINNED_SCHEMA_VERSION);
+    assert!(state.object_pinned);
+    assert_eq!(state.denied_paths, ["hidden"]);
+    assert_eq!(state.writable_paths, ["out"]);
+    let destination = VirtioFs::new_microvm_verified(&roots, profile.clone()).unwrap();
+    let session = Session::new(destination.clone());
+    destination
+        .restore_microvm_state(&pinned, state, &session)
+        .unwrap();
+    let state = source
+        .save_microvm_state(&pinned, SessionState::default())
+        .unwrap();
+    assert!(validate_microvm_state(&state, &profile).is_err());
+    assert!(VirtioFs::new_microvm(directory.path(), pinned).is_err());
+}
+
+#[test]
 fn initialized_microvm_negotiation_restores() {
     let temporary_directory = tempdir().unwrap();
     let profile = profile(temporary_directory.path());

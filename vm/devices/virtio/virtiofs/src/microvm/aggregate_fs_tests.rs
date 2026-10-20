@@ -867,6 +867,303 @@ fn a_file_child_follows_its_name_but_stays_a_file() {
     assert_eq!(read_node(&fs, lookup(&fs, "output").unwrap()), b"output");
 }
 
+fn opened_root(child: &Child<'_>) -> virtio_resources::fs::microvm::MicrovmFsRoot {
+    use virtio_resources::attachment::*;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(child.file && !child.read_only);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    let file = options.open(child.root).unwrap();
+    let role = format!("{MICROVM_ATTACHMENT_ID}/{}", child.name);
+    let kind = if child.file {
+        AttachmentKind::File
+    } else {
+        AttachmentKind::Directory
+    };
+    let grant = AttachmentGrant {
+        role: role.clone(),
+        kind,
+        read_only: child.read_only,
+        binding: AttachmentBinding::ObjectPinned {
+            identity: AttachmentIdentity::query(&file).unwrap(),
+        },
+        length: None,
+        geometry: None,
+    };
+    let receipt = grant
+        .verify_opened(&file, &role, kind, child.read_only, None)
+        .unwrap();
+    virtio_resources::fs::microvm::MicrovmFsRoot::ObjectPinned(OpenedAttachment { file, receipt })
+}
+
+#[test]
+fn pinned_file_children_never_follow_replacement_names_for_held_or_new_nodes() {
+    let files = Files::new();
+    let children = files.children();
+    let roots = children.iter().map(opened_root).collect::<Vec<_>>();
+    let fs = VirtioFs::new_microvm_verified(&roots, profile(&children)).unwrap();
+    drop(roots);
+    let settings = lookup(&fs, "settings").unwrap();
+    let output = lookup(&fs, "output").unwrap();
+    let held = open(&fs, settings, lx::O_RDONLY).unwrap();
+    let original_settings = files.config.join("authorized.json");
+    let original_output = files.results.join("authorized.txt");
+    std::fs::rename(&files.settings, &original_settings).unwrap();
+    std::fs::rename(&files.output, &original_output).unwrap();
+    std::fs::write(&files.settings, b"SUBSTITUTED").unwrap();
+    std::fs::write(&files.output, b"SUBSTITUTED").unwrap();
+
+    let mut read = fuse_read_in::new_zeroed();
+    read.fh = held;
+    read.size = 64;
+    assert_eq!(fs.read(&request(settings), &read).unwrap(), b"settings");
+    release(&fs, settings, held);
+    for node in [settings, lookup(&fs, "settings").unwrap()] {
+        assert_eq!(read_node(&fs, node), b"settings");
+        assert_eq!(error(open(&fs, node, lx::O_RDWR)), lx::Error::EROFS);
+        assert_eq!(
+            error(open(&fs, node, lx::O_RDONLY | lx::O_TRUNC)),
+            lx::Error::EROFS
+        );
+    }
+    let handle = open(&fs, output, lx::O_RDWR).unwrap();
+    write(&fs, output, handle, b"PINNED").unwrap();
+    release(&fs, output, handle);
+    assert_eq!(read_node(&fs, lookup(&fs, "output").unwrap()), b"PINNED");
+    fs.set_attr(&request(output), &setattr(FATTR_SIZE, |arg| arg.size = 3))
+        .unwrap();
+    assert_eq!(std::fs::read(&original_output).unwrap(), b"PIN");
+    assert_eq!(std::fs::read(&files.output).unwrap(), b"SUBSTITUTED");
+    assert_eq!(std::fs::read(&original_settings).unwrap(), b"settings");
+    for node in [settings, output] {
+        assert_eq!(
+            error(fs.lookup(&request(node), name("secret"))),
+            lx::Error::ENOTDIR
+        );
+    }
+}
+
+#[test]
+fn pinned_file_atomic_replacement_never_exposes_the_replacement() {
+    let files = Files::new();
+    let children = files.children();
+    let roots = [opened_root(&children[0])];
+    let fs = VirtioFs::new_microvm_verified(&roots, profile(&children[..1])).unwrap();
+    let node = lookup(&fs, "settings").unwrap();
+    let held = open(&fs, node, lx::O_RDONLY).unwrap();
+    let replacement = files.config.join("replacement");
+    std::fs::write(&replacement, b"SUBSTITUTE").unwrap();
+    std::fs::rename(&replacement, &files.settings).unwrap();
+    let mut read = fuse_read_in::new_zeroed();
+    read.fh = held;
+    read.size = 64;
+    assert_eq!(fs.read(&request(node), &read).unwrap(), b"settings");
+    release(&fs, node, held);
+    for node in [node, lookup(&fs, "settings").unwrap()] {
+        match open(&fs, node, lx::O_RDONLY) {
+            Ok(handle) => {
+                read.fh = handle;
+                assert_eq!(fs.read(&request(node), &read).unwrap(), b"settings");
+                release(&fs, node, handle);
+            }
+            #[cfg(windows)]
+            Err(error) => {
+                assert!(
+                    matches!(
+                        error,
+                        lx::Error::EACCES | lx::Error::ENOENT | lx::Error::EBUSY
+                    ),
+                    "{error:?}"
+                );
+            }
+            #[cfg(not(windows))]
+            Err(error) => panic!("failed to reopen the retained file: {error:?}"),
+        }
+    }
+}
+
+#[test]
+fn pinned_directory_root_keeps_its_identity_and_mutable_subtree_policy() {
+    let roots = Roots::new();
+    std::fs::create_dir(roots.work.join("private")).unwrap();
+    std::fs::write(roots.work.join("private").join("secret"), b"secret").unwrap();
+    let mut child = Child::new("work", &roots.work, false);
+    child.denied = &["private"];
+    let root = opened_root(&child);
+    let profile = profile(&[child]);
+    let original = roots.work.with_file_name("authorized");
+    std::fs::rename(&roots.work, &original).unwrap();
+    std::fs::create_dir(&roots.work).unwrap();
+    std::fs::write(roots.work.join("substitute"), b"wrong root").unwrap();
+    let fs = VirtioFs::new_microvm_verified(&[root], profile).unwrap();
+    let work = lookup(&fs, "work").unwrap();
+    assert_eq!(list(&fs, work), ["file"]);
+    assert_eq!(read_node(&fs, lookup(&fs, "work/file").unwrap()), b"host");
+    std::fs::write(original.join("new"), b"new contents").unwrap();
+    assert_eq!(
+        read_node(&fs, lookup(&fs, "work/new").unwrap()),
+        b"new contents"
+    );
+    assert_eq!(error(lookup(&fs, "work/private")), lx::Error::EACCES);
+    assert_eq!(error(lookup(&fs, "work/substitute")), lx::Error::ENOENT);
+    let (node, handle) = create(&fs, work, "guest").unwrap();
+    write(&fs, node, handle, b"guest").unwrap();
+    release(&fs, node, handle);
+    assert_eq!(std::fs::read(original.join("guest")).unwrap(), b"guest");
+    assert!(!roots.work.join("guest").exists());
+}
+
+#[test]
+fn pinned_attachment_restore_requires_exact_binding_policy() {
+    use super::saved_state::OBJECT_PINNED_SCHEMA_VERSION;
+    let files = Files::new();
+    let children = files.children();
+    let roots = children.iter().map(opened_root).collect::<Vec<_>>();
+    let source = VirtioFs::new_microvm_verified(&roots, profile(&children)).unwrap();
+    let pinned_profile = source.microvm_profile().unwrap().clone();
+    let settings = lookup(&source, "settings").unwrap();
+    let handle = open(&source, settings, lx::O_RDONLY).unwrap();
+    let state = || {
+        source
+            .save_microvm_state(&pinned_profile, SessionState::default())
+            .unwrap()
+    };
+    assert_eq!(state().schema_version, OBJECT_PINNED_SCHEMA_VERSION);
+    let destination = VirtioFs::new_microvm_verified(&roots, profile(&children)).unwrap();
+    let session = Session::new(destination.clone());
+    destination
+        .restore_microvm_state(&pinned_profile, state(), &session)
+        .unwrap();
+    let mut read = fuse_read_in::new_zeroed();
+    read.fh = handle;
+    read.size = 64;
+    assert_eq!(
+        destination.read(&request(settings), &read).unwrap(),
+        b"settings"
+    );
+    assert!(validate_microvm_state(&state(), &profile(&children)).is_err());
+    let mut downgraded = state();
+    downgraded.schema_version = FILE_CHILD_SCHEMA_VERSION;
+    assert!(validate_microvm_state(&downgraded, &pinned_profile).is_err());
+    let live = aggregate(&children);
+    let old_state = live
+        .save_microvm_state(&profile(&children), SessionState::default())
+        .unwrap();
+    assert!(validate_microvm_state(&old_state, &pinned_profile).is_err());
+}
+
+#[test]
+fn a_substituted_or_mislabelled_transferred_handle_is_rejected() {
+    use virtio_resources::attachment::*;
+    use virtio_resources::fs::microvm::MicrovmFsRoot;
+    let files = Files::new();
+    let children = files.children();
+    let MicrovmFsRoot::ObjectPinned(mut root) = opened_root(&children[0]) else {
+        unreachable!()
+    };
+    root.file = std::fs::File::open(&files.output).unwrap();
+    assert!(
+        VirtioFs::new_microvm_verified(
+            &[MicrovmFsRoot::ObjectPinned(root)],
+            profile(&children[..1])
+        )
+        .is_err()
+    );
+    for binding in [
+        AttachmentBinding::LivePath,
+        AttachmentBinding::ObjectPinned {
+            identity: AttachmentIdentity::Unix {
+                device: 0,
+                inode: 0,
+            },
+        },
+    ] {
+        let MicrovmFsRoot::ObjectPinned(mut root) = opened_root(&children[0]) else {
+            unreachable!()
+        };
+        root.receipt.binding = binding;
+        assert!(
+            VirtioFs::new_microvm_verified(
+                &[MicrovmFsRoot::ObjectPinned(root)],
+                profile(&children[..1])
+            )
+            .is_err()
+        );
+    }
+    let MicrovmFsRoot::ObjectPinned(mut root) = opened_root(&children[0]) else {
+        unreachable!()
+    };
+    root.receipt.read_only = false;
+    assert!(
+        VirtioFs::new_microvm_verified(
+            &[MicrovmFsRoot::ObjectPinned(root)],
+            profile(&children[..1])
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn mixed_pinned_and_explicit_live_file_children_keep_separate_replacement_policies() {
+    use virtio_resources::fs::microvm::MicrovmFsRoot;
+    let files = Files::new();
+    let children = files.children();
+    let roots = vec![
+        opened_root(&children[0]),
+        MicrovmFsRoot::LivePath(files.output.to_str().unwrap().to_owned()),
+        opened_root(&children[2]),
+    ];
+    let fs = VirtioFs::new_microvm_verified(&roots, profile(&children)).unwrap();
+    let settings = lookup(&fs, "settings").unwrap();
+    let output = lookup(&fs, "output").unwrap();
+    std::fs::rename(&files.settings, files.config.join("authorized.json")).unwrap();
+    std::fs::rename(&files.output, files.results.join("authorized.txt")).unwrap();
+    std::fs::write(&files.settings, b"new settings").unwrap();
+    std::fs::write(&files.output, b"new output").unwrap();
+    assert_eq!(read_node(&fs, settings), b"settings");
+    assert_eq!(
+        read_node(&fs, lookup(&fs, "settings").unwrap()),
+        b"settings"
+    );
+    assert_eq!(read_node(&fs, output), b"new output");
+    assert_eq!(
+        read_node(&fs, lookup(&fs, "output").unwrap()),
+        b"new output"
+    );
+    let profile = fs.microvm_profile().unwrap();
+    assert_eq!(
+        profile
+            .children()
+            .iter()
+            .map(MicroVmAggregateChild::is_object_pinned)
+            .collect::<Vec<_>>(),
+        [true, false, true]
+    );
+}
+
+#[test]
+fn directory_only_state_cannot_be_relabelled_as_file_child_or_pinned_state() {
+    use super::saved_state::OBJECT_PINNED_SCHEMA_VERSION;
+    let roots = Roots::new();
+    let children = [Child::new("work", &roots.work, true)];
+    let profile = profile(&children);
+    let fs = aggregate(&children);
+    let save = || {
+        fs.save_microvm_state(&profile, SessionState::default())
+            .unwrap()
+    };
+    for version in [FILE_CHILD_SCHEMA_VERSION, OBJECT_PINNED_SCHEMA_VERSION] {
+        let mut state = save();
+        state.schema_version = version;
+        assert!(validate_microvm_state(&state, &profile).is_err());
+    }
+    assert!(VirtioFs::new_microvm(&roots.work, profile).is_err());
+}
+
 #[test]
 fn file_child_state_restores_and_rejects_changes() {
     let files = Files::new();

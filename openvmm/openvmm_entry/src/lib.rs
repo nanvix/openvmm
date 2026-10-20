@@ -2975,7 +2975,7 @@ async fn run_control_inner(
         None => openvmm_helpers::hypervisor::choose_hypervisor()?,
     };
     let source_hypervisor = hypervisor.id().to_owned();
-    let vm_worker = {
+    let mut vm_worker = {
         let vm_host = mesh.make_host("vm", opt.log_file.clone()).await?;
 
         let (shared_memory, saved_state) = if opt.restore_snapshot.is_some() {
@@ -3024,6 +3024,16 @@ async fn run_control_inner(
         }
         launched.inspect(|_| snapshot_restore::worker_launched(worker_launch))?
     };
+
+    if let Err(error) = microvm.publish_attachment_receipts() {
+        vm_worker.stop();
+        if let Err(teardown) = vm_worker.join().await {
+            return Err(error.context(format!(
+                "attachment admission failed; VM teardown also failed: {teardown:#}"
+            )));
+        }
+        return Err(error.context("attachment admission failed; VM stopped before resume"));
+    }
 
     if opt.restore_snapshot.is_some() {
         tracing::info!("restoring VM from snapshot");

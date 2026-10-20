@@ -144,6 +144,7 @@ pub enum MicroVmProfileError {
 pub struct MicroVmAggregateChild {
     name: String,
     file: bool,
+    object_pinned: bool,
     root_identity: Vec<u8>,
     access_mode: MicroVmAccessMode,
     policy: SubtreePolicy,
@@ -178,6 +179,7 @@ impl MicroVmAggregateChild {
         Ok(Self {
             name,
             file: false,
+            object_pinned: false,
             root_identity,
             access_mode: access_mode(read_only),
             policy: subtree_policy(denied_paths, allowed_paths, writable_paths, read_only)?,
@@ -215,6 +217,11 @@ impl MicroVmAggregateChild {
     /// directory.
     pub fn is_file(&self) -> bool {
         self.file
+    }
+
+    /// Whether the root is served through its verified opened handle.
+    pub fn is_object_pinned(&self) -> bool {
+        self.object_pinned
     }
 
     /// Returns the opaque, platform-specific identity of the child's host
@@ -258,6 +265,13 @@ impl MicroVmAggregateChild {
             return Err(MicroVmProfileError::RootIdentityMismatch);
         }
         validate_opened_object(&self.root_identity, root_path, stat, self.file)
+    }
+
+    pub(crate) fn validate_pinned_identity(
+        &self,
+        stat: &lx::Stat,
+    ) -> Result<(), MicroVmProfileError> {
+        validate_opened_identity(&self.root_identity, stat)
     }
 }
 
@@ -383,6 +397,14 @@ fn validate_opened_object(
     stat: &lx::Stat,
     file: bool,
 ) -> Result<(), MicroVmProfileError> {
+    validate_opened_identity(root_identity, stat)?;
+    validate_object_path(root_identity, root_path, file)
+}
+
+fn validate_opened_identity(
+    root_identity: &[u8],
+    stat: &lx::Stat,
+) -> Result<(), MicroVmProfileError> {
     #[cfg(unix)]
     {
         let mut identity = b"openvmm-microvm-fs-unix-v1\0".to_vec();
@@ -418,7 +440,7 @@ fn validate_opened_object(
         }
     }
 
-    validate_object_path(root_identity, root_path, file)
+    Ok(())
 }
 
 /// Immutable profile settings for the microVM virtio-fs device.
@@ -438,6 +460,7 @@ pub struct MicroVmVirtioFsProfile {
     access_mode: MicroVmAccessMode,
     policy: SubtreePolicy,
     owner_mode: MicroVmOwnerMode,
+    object_pinned: bool,
     children: Vec<MicroVmAggregateChild>,
 }
 
@@ -487,6 +510,7 @@ impl MicroVmVirtioFsProfile {
             access_mode: access_mode(read_only),
             policy,
             owner_mode: MicroVmOwnerMode::Vmm,
+            object_pinned: false,
             children: Vec::new(),
         })
     }
@@ -518,6 +542,7 @@ impl MicroVmVirtioFsProfile {
             access_mode: access_mode(children.iter().all(MicroVmAggregateChild::is_readonly)),
             policy: SubtreePolicy::default(),
             owner_mode: MicroVmOwnerMode::Vmm,
+            object_pinned: false,
             children,
         })
     }
@@ -555,6 +580,44 @@ impl MicroVmVirtioFsProfile {
     /// share.
     pub fn children(&self) -> &[MicroVmAggregateChild] {
         &self.children
+    }
+
+    /// Whether a single root is served through its verified opened handle.
+    pub fn is_object_pinned(&self) -> bool {
+        self.object_pinned
+    }
+
+    pub(crate) fn with_pinned_roots(
+        mut self,
+        pinned: &[bool],
+    ) -> Result<Self, MicroVmProfileError> {
+        if self.is_aggregate() {
+            if pinned.len() != self.children.len() {
+                return Err(MicroVmProfileError::InvalidAggregateChildren);
+            }
+            for (child, pinned) in self.children.iter_mut().zip(pinned) {
+                if child.object_pinned && !pinned {
+                    return Err(MicroVmProfileError::RootIdentityMismatch);
+                }
+                child.object_pinned = *pinned;
+            }
+        } else {
+            let [pinned] = pinned else {
+                return Err(MicroVmProfileError::InvalidAggregateChildren);
+            };
+            if self.object_pinned && !pinned {
+                return Err(MicroVmProfileError::RootIdentityMismatch);
+            }
+            self.object_pinned = *pinned;
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn validate_pinned_identity(
+        &self,
+        stat: &lx::Stat,
+    ) -> Result<(), MicroVmProfileError> {
+        validate_opened_identity(&self.root_identity, stat)
     }
 
     /// Validates that `root_path` is the host attachment identified by this

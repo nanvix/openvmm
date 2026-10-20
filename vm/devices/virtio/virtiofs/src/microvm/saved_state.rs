@@ -31,6 +31,8 @@ pub(crate) const AGGREGATE_SCHEMA_VERSION: u32 = 8;
 /// predate file children would take the file's identity for a directory's, so
 /// they must reject its state.
 pub(crate) const FILE_CHILD_SCHEMA_VERSION: u32 = 9;
+/// Older readers must not restore a pinned attachment as a live pathname.
+pub(crate) const OBJECT_PINNED_SCHEMA_VERSION: u32 = 10;
 /// The [`SavedAggregateChild::kind`] of a child that exposes a host directory,
 /// which states that predate file children imply.
 pub(crate) const SAVED_DIRECTORY_CHILD: u32 = 0;
@@ -113,6 +115,8 @@ pub(crate) struct SavedState {
     /// restores them.
     #[mesh(22)]
     pub aggregate_children: Vec<SavedAggregateChild>,
+    #[mesh(23)]
+    pub object_pinned: bool,
 }
 
 /// The identity and access policy of one child of an aggregate attachment.
@@ -137,6 +141,8 @@ pub(crate) struct SavedAggregateChild {
     /// rejects any other value.
     #[mesh(7)]
     pub kind: u32,
+    #[mesh(8)]
+    pub object_pinned: bool,
 }
 
 #[derive(Protobuf)]

@@ -10211,7 +10211,13 @@ version = "0.0.0"
 dependencies = [
  "mesh",
  "net_backend_resources",
+ "pal",
+ "serde",
+ "serde_json",
  "serial_core",
+ "tempfile",
+ "test_with_tracing",
+ "thiserror 2.0.16",
  "unix_socket",
  "vm_resource",
 ]

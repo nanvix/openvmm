@@ -43,6 +43,30 @@ pub struct FileIdentity {
     pub end_of_file: u64,
 }
 
+/// Returns the read and write data access granted to an opened handle.
+pub fn file_data_access(file: &fs::File) -> io::Result<(bool, bool)> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_APPEND_DATA;
+    use windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA;
+    use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA;
+    let mut access = 0_u32;
+    let mut status = IO_STATUS_BLOCK::default();
+    // SAFETY: FileAccessInformation is one ACCESS_MASK. The live handle and
+    // correctly sized output buffers remain valid throughout the query.
+    unsafe {
+        chk_status(ntioapi::NtQueryInformationFile(
+            file.as_raw_handle(),
+            &mut status,
+            (&raw mut access).cast(),
+            size_of_val(&access) as u32,
+            ntioapi::FileAccessInformation,
+        ))?;
+    }
+    Ok((
+        access & FILE_READ_DATA != 0,
+        access & (FILE_WRITE_DATA | FILE_APPEND_DATA) != 0,
+    ))
+}
+
 /// Opens an existing regular file relative to an opened directory.
 ///
 /// The resulting handle allows read sharing only, so writers and
@@ -259,8 +283,8 @@ pub fn directory_entry_names(directory: &fs::File) -> io::Result<Vec<std::ffi::O
     Ok(names)
 }
 
-/// Queries `FILE_ID_INFO` and the current EOF for an opened file.
-pub fn file_identity(file: &fs::File) -> io::Result<FileIdentity> {
+/// Queries `FILE_ID_INFO` and EOF for an opened file or directory.
+pub fn object_identity(file: &fs::File) -> io::Result<FileIdentity> {
     let mut identity = FILE_ID_INFO::default();
     let result = unsafe {
         GetFileInformationByHandleEx(
@@ -286,10 +310,10 @@ pub fn file_identity(file: &fs::File) -> io::Result<FileIdentity> {
     if result == 0 {
         return Err(io::Error::last_os_error());
     }
-    if standard.Directory || standard.DeletePending {
+    if standard.DeletePending {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "handle is not an available regular file",
+            "handle is pending deletion",
         ));
     }
     let end_of_file = u64::try_from(standard.EndOfFile)
@@ -299,4 +323,15 @@ pub fn file_identity(file: &fs::File) -> io::Result<FileIdentity> {
         file_id: identity.FileId.Identifier,
         end_of_file,
     })
+}
+
+/// Queries `FILE_ID_INFO` and the current EOF for an opened regular file.
+pub fn file_identity(file: &fs::File) -> io::Result<FileIdentity> {
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "handle is not an available regular file",
+        ));
+    }
+    object_identity(file)
 }

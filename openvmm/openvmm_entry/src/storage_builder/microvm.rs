@@ -17,6 +17,9 @@ use openvmm_defs::microvm::MachineProfile;
 use openvmm_defs::microvm::MicrovmSandboxBlockConfig;
 use openvmm_defs::microvm::MicrovmSandboxBlockRole;
 use std::time::Duration;
+use virtio_resources::attachment::AttachmentGeometry;
+use virtio_resources::attachment::AttachmentKind;
+use virtio_resources::attachment::OpenedAttachment;
 use virtio_resources::blk::VirtioBlkHandle;
 use vm_resource::IntoResource;
 use vm_resource::Resource;
@@ -34,6 +37,24 @@ pub(crate) struct MicrovmSandboxBlockSource {
     pub(crate) logical_block_size: u32,
     pub(crate) physical_block_size: u32,
     pub(crate) file: std::fs::File,
+}
+
+pub(crate) fn sandbox_block_geometry(file: &std::fs::File) -> anyhow::Result<AttachmentGeometry> {
+    #[cfg(target_os = "linux")]
+    let physical_sector_size = {
+        use std::os::unix::fs::MetadataExt as _;
+        u32::try_from(file.metadata()?.blksize())
+            .context("sandbox block filesystem block size does not fit in u32")?
+    };
+    #[cfg(not(target_os = "linux"))]
+    let physical_sector_size = {
+        let _ = file;
+        if cfg!(windows) { 4096 } else { 512 }
+    };
+    Ok(AttachmentGeometry {
+        logical_sector_size: 512,
+        physical_sector_size,
+    })
 }
 
 pub(crate) fn capture_snapshot_block_contract(
@@ -172,8 +193,9 @@ impl StorageBuilder {
         kind: &DiskCliKind,
         read_only: bool,
         snapshot_capable: bool,
+        verified: Option<OpenedAttachment>,
     ) -> anyhow::Result<()> {
-        if !snapshot_capable {
+        if !snapshot_capable && verified.is_none() {
             self.vtl0_virtio_blk_disks.push(VirtioBlkDisk {
                 disk: disk_open(kind, read_only).await?,
                 read_only,
@@ -184,6 +206,7 @@ impl StorageBuilder {
             });
             return Ok(());
         }
+
         let (kind, delay_ms) = match kind {
             DiskCliKind::DelayDiskWrapper { delay_ms, disk } => (disk.as_ref(), Some(*delay_ms)),
             kind => (kind, None),
@@ -230,9 +253,22 @@ impl StorageBuilder {
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE);
         }
-        let file = options
-            .open(path)
-            .with_context(|| format!("failed to open sandbox block {}", path.display()))?;
+        let file = if let Some(opened) = verified {
+            anyhow::ensure!(
+                create_with_len.is_none(),
+                "verified media cannot be created or truncated"
+            );
+            opened.verify(
+                &format!("block:{}", role.as_str()),
+                AttachmentKind::BlockMedia,
+                read_only,
+            )?;
+            opened.file
+        } else {
+            options
+                .open(path)
+                .with_context(|| format!("failed to open sandbox block {}", path.display()))?
+        };
         if let Some(length) = create_with_len {
             file.set_len(*length)
                 .with_context(|| format!("failed to size sandbox block {}", path.display()))?;
@@ -250,17 +286,9 @@ impl StorageBuilder {
             length != 0 && length % 512 == 0,
             "microVM sandbox block length must be nonzero and 512-byte aligned"
         );
-        let logical_block_size: u32 = 512;
-        #[cfg(target_os = "linux")]
-        let physical_block_size = {
-            use std::os::unix::fs::MetadataExt as _;
-            u32::try_from(metadata.blksize())
-                .context("sandbox block filesystem block size does not fit in u32")?
-        };
-        #[cfg(windows)]
-        let physical_block_size: u32 = 4096;
-        #[cfg(not(any(target_os = "linux", windows)))]
-        let physical_block_size = logical_block_size;
+        let geometry = sandbox_block_geometry(&file)?;
+        let logical_block_size = geometry.logical_sector_size;
+        let physical_block_size = geometry.physical_sector_size;
         anyhow::ensure!(
             physical_block_size >= logical_block_size && physical_block_size.is_power_of_two(),
             "microVM sandbox block has unsupported physical block geometry"
@@ -339,5 +367,86 @@ impl StorageBuilder {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pal_async::DefaultDriver;
+    use pal_async::async_test;
+    use std::io::Read as _;
+    use virtio_resources::attachment::AttachmentBinding;
+    use virtio_resources::attachment::AttachmentGrant;
+    use virtio_resources::attachment::AttachmentIdentity;
+
+    #[async_test]
+    async fn cold_and_restore_raw_media_use_the_verified_handle_not_its_name(
+        _driver: DefaultDriver,
+    ) {
+        for snapshot_capable in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("image.gpt");
+            std::fs::write(&path, vec![7; 4096]).unwrap();
+            let file = std::fs::File::open(&path).unwrap();
+            let geometry = sandbox_block_geometry(&file).unwrap();
+            let grant = AttachmentGrant {
+                role: "block:distro".to_owned(),
+                kind: AttachmentKind::BlockMedia,
+                read_only: true,
+                binding: AttachmentBinding::ObjectPinned {
+                    identity: AttachmentIdentity::query(&file).unwrap(),
+                },
+                length: Some(4096),
+                geometry: Some(geometry),
+            };
+            let receipt = grant
+                .verify_opened(&file, &grant.role, grant.kind, true, grant.geometry)
+                .unwrap();
+            std::fs::rename(&path, directory.path().join("authorized.gpt")).unwrap();
+            std::fs::write(&path, vec![9; 4096]).unwrap();
+            let mut storage = StorageBuilder::new(None);
+            storage
+                .add_microvm_sandbox_block(
+                    MicrovmSandboxBlockRole::Distro,
+                    &DiskCliKind::File {
+                        path: path.clone(),
+                        create_with_len: None,
+                        direct: false,
+                    },
+                    true,
+                    snapshot_capable,
+                    Some(OpenedAttachment {
+                        file,
+                        receipt: receipt.clone(),
+                    }),
+                )
+                .await
+                .unwrap();
+            let source = storage.vtl0_virtio_blk_disks[0]
+                .microvm
+                .as_ref()
+                .unwrap()
+                .snapshot_source
+                .as_ref()
+                .unwrap();
+            assert!(source.read_only);
+            assert_eq!(source.length, 4096);
+            assert_eq!(
+                AttachmentIdentity::query(&source.file).unwrap(),
+                receipt.identity
+            );
+            assert_eq!(source.logical_block_size, geometry.logical_sector_size);
+            assert_eq!(source.physical_block_size, geometry.physical_sector_size);
+            let mut bytes = Vec::new();
+            source
+                .file
+                .try_clone()
+                .unwrap()
+                .read_to_end(&mut bytes)
+                .unwrap();
+            assert_eq!(bytes, vec![7; 4096]);
+            assert_eq!(std::fs::read(&path).unwrap(), vec![9; 4096]);
+        }
     }
 }

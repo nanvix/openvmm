@@ -346,6 +346,57 @@ describes the source definitions.
   guest must then explicitly run `mount -t virtiofs microvm <GUEST_TARGET>`
   because its cold-boot mount hook has already completed.
   See [virtio-fs](../../devices/virtio/virtio-fs.md).
+* `--microvm-attachment-grants <PATH>` and
+  `--microvm-attachment-receipts <PATH>`: Opt into version 1 host-object
+  grants and opened-handle receipts on cold boot or restore. Both flags are
+  required together, with a live `--microvm-control-console` and
+  `--microvm-control-auth-stdin`. The default, without either flag, preserves
+  the existing pathname attachment behavior.
+  Keep the grant file and receipt directory in a caller-owned private launch
+  directory, protected against writes by other identities. These are trusted
+  local handoff files, not signed guest attestations.
+
+  `PATH` for grants is a bounded JSON `AttachmentGrantSet` from
+  [`virtio_resources::attachment`](https://openvmm.dev/rustdoc/linux/virtio_resources/attachment/index.html).
+  It contains `version: 1`, a fresh nonzero 16-byte `activation_id`,
+  `protected_roots`, and `attachments`. Unknown fields and versions fail.
+  Each protected root supplies an absolute `path` and its expected opened
+  `identity`; the set must cover the caller's private runtime, state, cache,
+  image, and template roots. Filesystem exports may neither contain nor lie
+  inside them, including identity aliases. Block media may reside there.
+
+  Each attachment specifies `role`, `kind`, `read_only`, `binding`, `length`,
+  and `geometry`. Stable roles are `block:distro`, `block:runtime`,
+  `block:custom`, `block:scratch`, `fs:microvm0` for a single directory, and
+  `fs:microvm0/<CHILD_NAME>` for aggregate children. Every actual attachment
+  needs exactly one grant; extra or duplicate grants fail.
+  Kinds are `block-media`, `directory`, or `file`. Binding is either
+  `{"policy":"object-pinned","identity":<IDENTITY>}` or
+  `{"policy":"live-path"}`. An identity is
+  `{"platform":"unix","device":<U64>,"inode":<U64>}` or
+  `{"platform":"windows","volume":<U64>,"file_id":<16-BYTE-ARRAY>}`.
+
+  Media must be object-pinned existing regular raw files, without creation,
+  truncation, direct I/O, or container-format wrappers. Their required
+  `length` must match the opened handle and be nonzero and 512-byte aligned.
+  Their required `geometry` contains `logical_sector_size` (512) and the
+  backend's `physical_sector_size` (4096 on Windows, the filesystem block
+  size on Linux). A file grant may constrain its admission length or use
+  `null`; directory length and all filesystem geometry must be `null`.
+  Filesystem contents are not hashed, nor is media or guest RAM rehashed by
+  this handoff. Object identity does not prevent in-place content changes;
+  the storage owner remains responsible for immutable media.
+
+  The receipt destination must not exist and must be outside exports.
+  OpenVMM atomically publishes an `AttachmentReceiptSet` with the same
+  version and activation ID and the observed opened identities, kinds,
+  lengths, geometry, modes, and bindings in grant order. The authenticated
+  control-console instance ID is this activation ID. The caller must verify
+  the complete receipt set and authenticated instance before accepting
+  activation/Ready. Admission receipts are not a guest Ready event.
+  Worker admission, restore, or receipt-publication failure never falls
+  back to a cold boot; publication failure stops the verified VM before
+  resume. This handoff adds no guest protocol or image-slot binding RPC.
 * `--snapshot-destination <DIR>`: Publish a microVM snapshot when the guest
   writes to PMIO port `0x605`. The destination must not exist and its parent
   must already be a directory. OpenVMM automatically creates file-backed RAM

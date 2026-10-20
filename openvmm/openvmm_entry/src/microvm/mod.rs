@@ -3,6 +3,7 @@
 
 //! MicroVM machine profile support for the OpenVMM entry point.
 
+mod attachment;
 mod config;
 mod console;
 mod filesystem;
@@ -90,6 +91,8 @@ impl MicrovmFilesystemHost {
 /// and consumed by the snapshot, restore, and teardown paths.
 #[derive(Default)]
 pub(crate) struct MicrovmResources {
+    /// Run-scoped attachment receipts and protected-root handle guards.
+    pub(crate) verified_attachments: Option<attachment::VerifiedAttachments>,
     /// Drains portb and its host output relay before a guest-requested exit.
     pub(crate) output_drain: Option<MicrovmOutputDrain>,
     /// Guest-requested snapshot boundaries from the snapshot-request port.

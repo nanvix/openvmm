@@ -5,8 +5,10 @@
 
 use super::profile::MicroVmAggregateChild;
 use super::profile::MicroVmOwnerMode;
+use super::profile::MicroVmVirtioFsProfile;
 use super::profile::microvm_mount_tag;
 use crate::virtio::VirtioFsDevice;
+use anyhow::Context as _;
 use virtio_resources::fs::VirtioFsBackend;
 use virtio_resources::fs::VirtioFsHandle;
 use virtio_resources::fs::microvm::MicrovmAggregateChildKind;
@@ -37,6 +39,54 @@ pub(crate) fn resolve(
     resource: &VirtioFsHandle,
     driver_source: &VmTaskDriverSource,
 ) -> anyhow::Result<Option<VirtioFsDevice>> {
+    if let VirtioFsBackend::MicrovmVerified { roots } = &resource.fs {
+        let profile = match &resource.profile {
+            VirtioFsProfile::Microvm {
+                stable_id,
+                root_identity,
+                read_only,
+                denied_paths,
+                allowed_paths,
+                writable_paths,
+                caller_identity,
+            } => {
+                validate_tag(resource, stable_id)?;
+                MicroVmVirtioFsProfile::from_attachment_with_policy(
+                    stable_id.clone(),
+                    root_identity.clone(),
+                    *read_only,
+                    denied_paths.clone(),
+                    allowed_paths.clone(),
+                    writable_paths.clone(),
+                )?
+                .with_owner_mode(owner_mode(*caller_identity))?
+            }
+            VirtioFsProfile::MicrovmAggregate {
+                stable_id,
+                children,
+                caller_identity,
+            } => {
+                validate_tag(resource, stable_id)?;
+                MicroVmVirtioFsProfile::from_aggregate(
+                    stable_id.clone(),
+                    aggregate_children(children)?,
+                )?
+                .with_owner_mode(owner_mode(*caller_identity))?
+            }
+            _ => anyhow::bail!("verified roots require an active microVM filesystem profile"),
+        };
+        let fs = crate::VirtioFs::new_microvm_verified(roots, profile)?;
+        let profile = fs
+            .microvm_profile()
+            .context("verified filesystem has no microVM profile")?
+            .clone();
+        return Ok(Some(VirtioFsDevice::new_microvm(
+            driver_source,
+            profile,
+            fs,
+            None,
+        )?));
+    }
     let device = match &resource.profile {
         VirtioFsProfile::Standard => return Ok(None),
         VirtioFsProfile::MicrovmDormant { stable_id } => {
@@ -102,7 +152,27 @@ pub(crate) fn resolve(
                 roots.iter().all(|root| root.mount_options.is_empty()),
                 "microVM aggregate virtio-fs does not accept HostFs mount options"
             );
-            let children = children
+            let children = aggregate_children(children)?;
+            VirtioFsDevice::new_microvm_aggregate(
+                driver_source,
+                stable_id.clone(),
+                children,
+                owner_mode(*caller_identity),
+                &roots
+                    .iter()
+                    .map(|root| root.root_path.as_str())
+                    .collect::<Vec<_>>(),
+                None,
+            )?
+        }
+    };
+    Ok(Some(device))
+}
+
+fn aggregate_children(
+    children: &[virtio_resources::fs::microvm::MicrovmAggregateChild],
+) -> anyhow::Result<Vec<MicroVmAggregateChild>> {
+    children
                 .iter()
                 .map(|child| match child.kind {
                     MicrovmAggregateChildKind::Directory => Ok(MicroVmAggregateChild::new(
@@ -128,21 +198,7 @@ pub(crate) fn resolve(
                         )?)
                     }
                 })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            VirtioFsDevice::new_microvm_aggregate(
-                driver_source,
-                stable_id.clone(),
-                children,
-                owner_mode(*caller_identity),
-                &roots
-                    .iter()
-                    .map(|root| root.root_path.as_str())
-                    .collect::<Vec<_>>(),
-                None,
-            )?
-        }
-    };
-    Ok(Some(device))
+                .collect()
 }
 
 #[cfg(test)]

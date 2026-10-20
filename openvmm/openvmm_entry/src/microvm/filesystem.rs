@@ -65,7 +65,7 @@ impl<'a> MicrovmFilesystemRequest<'a> {
 /// `kind`: a plain directory, or a regular file that an aggregate child
 /// exposes. Returns its canonical path and its identity, with the identity's
 /// kind.
-fn canonical_microvm_filesystem_root(
+pub(super) fn canonical_microvm_filesystem_root(
     path: &Path,
     kind: openvmm_defs::microvm::MicrovmFilesystemChildKind,
 ) -> anyhow::Result<(PathBuf, &'static str, Vec<u8>)> {
@@ -476,7 +476,7 @@ fn microvm_filesystem_child_from_root(
 /// access policy. Equal root identities catch one directory or file reached
 /// through two canonical paths, such as a bind mount or a hard link. A
 /// regular file overlaps only a directory that contains it.
-fn validate_microvm_filesystem_roots(
+pub(super) fn validate_microvm_filesystem_roots(
     roots: &[(
         String,
         openvmm_helpers::snapshot::microvm::SnapshotAttachment,
@@ -1063,7 +1063,7 @@ pub(super) fn effective_microvm_filesystem(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::Options;
     use crate::microvm::network::tests::network_contract;
@@ -1114,8 +1114,8 @@ mod tests {
         share_contract(Some((&filesystem, root)))
     }
 
-    fn dormant_filesystem_contract() -> openvmm_helpers::snapshot::microvm::SnapshotMachineContract
-    {
+    pub(crate) fn dormant_filesystem_contract()
+    -> openvmm_helpers::snapshot::microvm::SnapshotMachineContract {
         share_contract(None)
     }
 
@@ -1141,7 +1141,7 @@ mod tests {
 
     /// Builds the contract of a cold-booted machine with `filesystem`
     /// attached to the virtio-fs slot, or with a dormant slot.
-    fn effective_contract(
+    pub(crate) fn effective_contract(
         filesystem: Option<&EffectiveMicrovmFilesystem>,
     ) -> openvmm_helpers::snapshot::microvm::SnapshotMachineContract {
         let slot = &openvmm_defs::microvm::MICROVM_FILESYSTEM_SLOTS[0];

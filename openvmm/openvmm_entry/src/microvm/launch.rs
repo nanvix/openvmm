@@ -47,6 +47,15 @@ pub(crate) struct MicrovmLaunch {
 }
 
 impl MicrovmLaunch {
+    /// Called only after the worker has resolved every transferred handle and
+    /// validated restored device state, and before any vCPU can run.
+    pub(crate) fn publish_attachment_receipts(&self) -> anyhow::Result<()> {
+        if let Some(attachments) = &self.resources.verified_attachments {
+            attachments.publish()?;
+        }
+        Ok(())
+    }
+
     /// Captures the microVM state of `vm_config` and prepares the RAM backing
     /// used by guest-requested snapshot capture.
     pub(crate) fn new(

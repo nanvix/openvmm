@@ -25,6 +25,7 @@ use super::saved_state::MAX_DIRECTORY_ENTRIES_PER_HANDLE;
 use super::saved_state::MAX_HANDLES;
 use super::saved_state::MAX_INODES;
 use super::saved_state::MAX_PATH_BYTES;
+use super::saved_state::OBJECT_PINNED_SCHEMA_VERSION;
 use super::saved_state::PREVIOUS_SCHEMA_VERSION;
 use super::saved_state::SAVED_DIRECTORY_CHILD;
 use super::saved_state::SAVED_FILE_CHILD;
@@ -155,7 +156,14 @@ pub(crate) fn saved_policy_paths(paths: &[PathBuf]) -> Vec<String> {
 /// Returns the oldest schema version that can record the state of `profile`'s
 /// attachment, so that releases that cannot enforce its policy reject it.
 pub(crate) fn schema_version(profile: &MicroVmVirtioFsProfile) -> u32 {
-    if profile
+    if profile.is_object_pinned()
+        || profile
+            .children()
+            .iter()
+            .any(MicroVmAggregateChild::is_object_pinned)
+    {
+        OBJECT_PINNED_SCHEMA_VERSION
+    } else if profile
         .children()
         .iter()
         .any(MicroVmAggregateChild::is_file)
@@ -265,6 +273,7 @@ pub(crate) fn save_dormant_microvm_state(
         allowed_paths: Vec::new(),
         writable_paths: Vec::new(),
         aggregate_children: Vec::new(),
+        object_pinned: false,
     })
 }
 
@@ -298,7 +307,8 @@ pub(crate) fn validate_dormant_microvm_state(
             && state.denied_paths.is_empty()
             && state.allowed_paths.is_empty()
             && state.writable_paths.is_empty()
-            && state.aggregate_children.is_empty(),
+            && state.aggregate_children.is_empty()
+            && !state.object_pinned,
         "dormant virtio-fs state contains active filesystem policy or objects"
     );
     let session_state = session_state_from_saved(&state.negotiation)?;
@@ -330,6 +340,7 @@ pub(crate) fn saved_aggregate_children(
                 } else {
                     SAVED_DIRECTORY_CHILD
                 },
+                object_pinned: child.is_object_pinned(),
             }
         })
         .collect()
@@ -366,6 +377,7 @@ pub(crate) fn validate_microvm_state(
                 | SUBTREE_POLICY_SCHEMA_VERSION
                 | AGGREGATE_SCHEMA_VERSION
                 | FILE_CHILD_SCHEMA_VERSION
+                | OBJECT_PINNED_SCHEMA_VERSION
         ) && !state.dormant,
         "unsupported virtio-fs state schema version {}",
         state.schema_version
@@ -373,17 +385,40 @@ pub(crate) fn validate_microvm_state(
     let aggregate_state = matches!(
         state.schema_version,
         AGGREGATE_SCHEMA_VERSION | FILE_CHILD_SCHEMA_VERSION
+    ) || state.schema_version == OBJECT_PINNED_SCHEMA_VERSION
+        && !state.aggregate_children.is_empty();
+    anyhow::ensure!(
+        (state.schema_version == OBJECT_PINNED_SCHEMA_VERSION)
+            == (profile.is_object_pinned()
+                || profile
+                    .children()
+                    .iter()
+                    .any(MicroVmAggregateChild::is_object_pinned))
+            && state.object_pinned == profile.is_object_pinned()
+            && (state.schema_version == OBJECT_PINNED_SCHEMA_VERSION
+                || !state.object_pinned
+                    && state
+                        .aggregate_children
+                        .iter()
+                        .all(|child| !child.object_pinned)),
+        "saved object pinning policy does not match the restore profile or schema"
     );
     anyhow::ensure!(
         aggregate_state == profile.is_aggregate(),
         "saved aggregate layout does not match the restore profile"
     );
     anyhow::ensure!(
-        (state.schema_version == FILE_CHILD_SCHEMA_VERSION)
-            == profile
-                .children()
+        (if state.schema_version == OBJECT_PINNED_SCHEMA_VERSION {
+            state
+                .aggregate_children
                 .iter()
-                .any(MicroVmAggregateChild::is_file),
+                .any(|child| child.kind == SAVED_FILE_CHILD)
+        } else {
+            state.schema_version == FILE_CHILD_SCHEMA_VERSION
+        }) == profile
+            .children()
+            .iter()
+            .any(MicroVmAggregateChild::is_file),
         "saved aggregate file children do not match the restore profile"
     );
     anyhow::ensure!(
@@ -392,6 +427,7 @@ pub(crate) fn validate_microvm_state(
             SUBTREE_POLICY_SCHEMA_VERSION
             | AGGREGATE_SCHEMA_VERSION
             | FILE_CHILD_SCHEMA_VERSION => true,
+            OBJECT_PINNED_SCHEMA_VERSION => true,
             _ => !state.caller_identity,
         },
         "saved ownership mode does not match the virtio-fs state schema version"
@@ -426,10 +462,13 @@ pub(crate) fn validate_microvm_state(
                 && state.aggregate_children == saved_aggregate_children(profile),
             "saved aggregate children do not match the restore profile"
         );
-    } else if state.schema_version == SUBTREE_POLICY_SCHEMA_VERSION {
+    } else if matches!(
+        state.schema_version,
+        SUBTREE_POLICY_SCHEMA_VERSION | OBJECT_PINNED_SCHEMA_VERSION
+    ) {
         let policy = profile.subtree_policy();
         anyhow::ensure!(
-            policy.restricts_writes()
+            (state.schema_version == OBJECT_PINNED_SCHEMA_VERSION || policy.restricts_writes())
                 && saved_policy
                     == (
                         &saved_policy_paths(policy.denied_paths()),

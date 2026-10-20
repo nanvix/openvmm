@@ -5,6 +5,7 @@
 
 use super::MicrovmResources;
 use super::MicrovmRestore;
+use super::attachment::VerifiedAttachments;
 use super::console::ConsoleEndpoint;
 use super::console::effective_microvm_console;
 use super::console::effective_microvm_control_console;
@@ -79,6 +80,8 @@ pub(crate) struct MicrovmConfigBuilder<'a> {
     control_console_backend: Option<Resource<SerialBackendHandle>>,
     portb: Option<(Resource<SerialBackendHandle>, OutputCompletion)>,
     resources: MicrovmResources,
+    verified_attachments: Option<VerifiedAttachments>,
+    verified_filesystem_roots: Option<Vec<virtio_resources::fs::microvm::MicrovmFsRoot>>,
 }
 
 impl<'a> MicrovmConfigBuilder<'a> {
@@ -91,6 +94,7 @@ impl<'a> MicrovmConfigBuilder<'a> {
             openvmm_helpers::snapshot::microvm::validate_supported_microvm_contract(contract)?;
         }
         opt.validate_microvm_options()?;
+        let mut verified_attachments = VerifiedAttachments::from_options(opt)?;
         let network = if active {
             effective_microvm_network(opt, restore_machine_contract)?
         } else {
@@ -121,6 +125,11 @@ impl<'a> MicrovmConfigBuilder<'a> {
         } else {
             None
         };
+        let verified_filesystem_roots = verified_attachments
+            .as_mut()
+            .zip(filesystem.as_ref())
+            .map(|(attachments, filesystem)| attachments.filesystem_roots(filesystem))
+            .transpose()?;
         if opt.microvm.snapshot_destination.is_some()
             && let Some(filesystem) = &filesystem
         {
@@ -160,10 +169,16 @@ impl<'a> MicrovmConfigBuilder<'a> {
             None
         };
         opt.validate_control_stdin_console(console.as_ref().map(|(config, _, _)| config))?;
-        let control_broker_config = control_console
+        let mut control_broker_config = control_console
             .as_ref()
             .map(|(endpoint, _, _)| microvm_control_broker_config(opt, endpoint))
             .transpose()?;
+        if let Some(attachments) = &verified_attachments {
+            control_broker_config
+                .as_mut()
+                .context("verified attachments require a live authenticated control console")?
+                .instance_id = attachments.activation_id();
+        }
         anyhow::ensure!(
             control_console.is_none() || console.is_some(),
             "microVM control console requires the boot virtio-console"
@@ -232,6 +247,8 @@ impl<'a> MicrovmConfigBuilder<'a> {
             control_console_backend: None,
             portb: None,
             resources,
+            verified_attachments,
+            verified_filesystem_roots,
         })
     }
 
@@ -369,7 +386,7 @@ impl<'a> MicrovmConfigBuilder<'a> {
 
     /// Adds the fixed-role sandbox block devices.
     pub(crate) async fn add_sandbox_blocks(
-        &self,
+        &mut self,
         storage: &mut StorageBuilder,
     ) -> anyhow::Result<()> {
         let opt = self.opt;
@@ -392,6 +409,12 @@ impl<'a> MicrovmConfigBuilder<'a> {
                     &disk.kind,
                     disk.read_only,
                     opt.microvm.snapshot_destination.is_some() || opt.restore_snapshot.is_some(),
+                    self.verified_attachments
+                        .as_mut()
+                        .map(|attachments| {
+                            attachments.block(block.role, &disk.kind, disk.read_only)
+                        })
+                        .transpose()?,
                 )
                 .await?;
         }
@@ -628,6 +651,10 @@ impl<'a> MicrovmConfigBuilder<'a> {
                     },
                 ),
             };
+            let fs = match self.verified_filesystem_roots.take() {
+                Some(roots) => virtio_resources::fs::VirtioFsBackend::MicrovmVerified { roots },
+                None => fs,
+            };
             add_virtio_device(
                 VirtioBusCli::Mmio,
                 virtio_resources::fs::VirtioFsHandle {
@@ -696,6 +723,10 @@ impl<'a> MicrovmConfigBuilder<'a> {
         resources: &mut VmResources,
     ) -> anyhow::Result<()> {
         let opt = self.opt;
+        if let Some(attachments) = self.verified_attachments.take() {
+            attachments.validate_complete()?;
+            self.resources.verified_attachments = Some(attachments);
+        }
         let restore_machine_contract = self.restore.machine_contract.as_ref();
         if self.active {
             cfg.processor_topology.vps_per_socket = Some(opt.processors);

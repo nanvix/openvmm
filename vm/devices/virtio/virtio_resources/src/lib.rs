@@ -15,6 +15,8 @@ use vm_resource::ResourceId;
 use vm_resource::kind::PciDeviceHandleKind;
 use vm_resource::kind::VirtioDeviceHandle;
 
+pub mod attachment;
+
 /// A resource for mapping a virtio device as a PCI device.
 #[derive(MeshPayload)]
 pub struct VirtioPciDeviceHandle(pub Resource<VirtioDeviceHandle>);
@@ -70,6 +72,11 @@ pub mod fs {
             children: Vec<VirtioFsAggregateChild>,
         },
         Dormant,
+        /// Verified microVM roots, in profile order. Opened roots are consumed
+        /// without reopening their host names.
+        MicrovmVerified {
+            roots: Vec<microvm::MicrovmFsRoot>,
+        },
     }
 
     /// A single host folder exposed as a named child of a [`VirtioFsBackend::Aggregate`].

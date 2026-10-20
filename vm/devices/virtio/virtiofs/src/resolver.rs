@@ -35,6 +35,9 @@ impl ResolveResource<VirtioDeviceHandle, VirtioFsHandle> for VirtioFsResolver {
             return Ok(device.into());
         }
         let device = match &resource.fs {
+            VirtioFsBackend::MicrovmVerified { .. } => {
+                anyhow::bail!("verified roots require a microVM filesystem profile")
+            }
             VirtioFsBackend::Dormant => {
                 anyhow::bail!("standard virtio-fs requires an active backend")
             }

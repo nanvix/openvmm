@@ -10,6 +10,14 @@
 
 use mesh::MeshPayload;
 
+/// A root selected by a versioned microVM attachment handoff. A live path
+/// deliberately retains the historical follow-name behavior for file children.
+#[derive(MeshPayload)]
+pub enum MicrovmFsRoot {
+    ObjectPinned(crate::attachment::OpenedAttachment),
+    LivePath(String),
+}
+
 #[derive(MeshPayload)]
 pub enum VirtioFsProfile {
     Standard,

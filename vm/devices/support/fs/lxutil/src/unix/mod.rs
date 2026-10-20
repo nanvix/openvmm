@@ -28,6 +28,7 @@ const STATX_BTIME: u32 = 0x00000800;
 // See crate::LxVolume for more detailed comments.
 pub struct LxVolume {
     root: std::fs::File,
+    file_root: bool,
     /// Set when paths must be resolved without following symbolic links.
     resolver: Option<confine::Resolver>,
 }
@@ -51,7 +52,27 @@ impl LxVolume {
             .confine_paths
             .then(|| confine::Resolver::probe(&root));
 
-        Ok(Self { root, resolver })
+        Ok(Self {
+            root,
+            resolver,
+            file_root: false,
+        })
+    }
+
+    pub fn from_opened(root: std::fs::File, options: &super::LxVolumeOptions) -> lx::Result<Self> {
+        let file_root = root.metadata()?.is_file();
+        let resolver = options.confine_paths.then(|| {
+            if file_root {
+                confine::Resolver::Walk
+            } else {
+                confine::Resolver::probe(&root)
+            }
+        });
+        Ok(Self {
+            root,
+            resolver,
+            file_root,
+        })
     }
 
     /// Splits `path` into the directory and name used by "*at" functions.
@@ -60,6 +81,9 @@ impl LxVolume {
     /// so the kernel follows symbolic links in every component except the last.
     fn at_path(&self, path: &Path) -> lx::Result<AtPath<'_>> {
         assert!(path.is_relative());
+        if self.file_root && !path.as_os_str().is_empty() {
+            return Err(lx::Error::ENOTDIR);
+        }
         match self.resolver {
             Some(resolver) => confine::resolve(&self.root, resolver, path),
             None => Ok(AtPath {
@@ -118,7 +142,13 @@ impl LxVolume {
     ) -> lx::Result<LxFile> {
         assert!(path.is_relative());
 
-        let fd = if self.resolver.is_some() {
+        let fd = if self.file_root {
+            if !path.as_os_str().is_empty() || flags & libc::O_CREAT != 0 {
+                return Err(lx::Error::ENOTDIR);
+            }
+            // Follow only the kernel-owned descriptor link, not the old name.
+            util::reopen(&self.root, flags & !libc::O_NOFOLLOW)?
+        } else if self.resolver.is_some() {
             // A confined open never follows the final component, and reopens the root through
             // its own descriptor rather than its host path.
             let path = self.at_path(path)?;
@@ -350,19 +380,28 @@ impl LxVolume {
         value: &[u8],
         flags: i32,
     ) -> lx::Result<()> {
-        // There is no *at version of the xattr APIs.
-        let path = self.xattr_path(path)?;
+        let path = self.xattr_target(path)?;
         let name = util::create_cstr(name.as_bytes())?;
 
         // SAFETY: Calling C API as documented, with no special requirements.
         unsafe {
-            util::check_lx_errno(libc::lsetxattr(
-                path.path.as_ptr(),
-                name.as_ptr(),
-                value.as_ptr().cast::<ffi::c_void>(),
-                value.len(),
-                flags,
-            ))?;
+            util::check_lx_errno(if let Some(path) = &path {
+                libc::lsetxattr(
+                    path.path.as_ptr(),
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    flags,
+                )
+            } else {
+                libc::fsetxattr(
+                    self.root.as_raw_fd(),
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    flags,
+                )
+            })?;
         }
 
         Ok(())
@@ -374,8 +413,7 @@ impl LxVolume {
         name: &lx::LxStr,
         value: Option<&mut [u8]>,
     ) -> lx::Result<usize> {
-        // There is no *at version of the xattr APIs.
-        let path = self.xattr_path(path)?;
+        let path = self.xattr_target(path)?;
         let name = util::create_cstr(name.as_bytes())?;
 
         // Set the pointer to NULL if no value buffer is provided, to query the attribute's size.
@@ -387,12 +425,11 @@ impl LxVolume {
 
         // SAFETY: Calling C API as documented, with no special requirements.
         let size = unsafe {
-            util::check_lx_errno(libc::lgetxattr(
-                path.path.as_ptr(),
-                name.as_ptr(),
-                value_ptr.cast::<ffi::c_void>(),
-                size,
-            ))?
+            util::check_lx_errno(if let Some(path) = &path {
+                libc::lgetxattr(path.path.as_ptr(), name.as_ptr(), value_ptr.cast(), size)
+            } else {
+                libc::fgetxattr(self.root.as_raw_fd(), name.as_ptr(), value_ptr.cast(), size)
+            })?
         };
 
         // Size is guaranteed positive after the check.
@@ -400,8 +437,7 @@ impl LxVolume {
     }
 
     pub fn list_xattr(&self, path: &Path, list: Option<&mut [u8]>) -> lx::Result<usize> {
-        // There is no *at version of the xattr APIs.
-        let path = self.xattr_path(path)?;
+        let path = self.xattr_target(path)?;
 
         // Set the list pointer to NULL if no list buffer was provided, to query the size.
         let (list_ptr, size) = if let Some(list) = list {
@@ -412,7 +448,11 @@ impl LxVolume {
 
         // SAFETY: Calling C API as documented, with no special requirements.
         let size = unsafe {
-            util::check_lx_errno(libc::llistxattr(path.path.as_ptr(), list_ptr.cast(), size))?
+            util::check_lx_errno(if let Some(path) = &path {
+                libc::llistxattr(path.path.as_ptr(), list_ptr.cast(), size)
+            } else {
+                libc::flistxattr(self.root.as_raw_fd(), list_ptr.cast(), size)
+            })?
         };
 
         // Size is guaranteed positive after the check.
@@ -420,13 +460,16 @@ impl LxVolume {
     }
 
     pub fn remove_xattr(&self, path: &Path, name: &lx::LxStr) -> lx::Result<()> {
-        // There is no *at version of the xattr APIs.
-        let path = self.xattr_path(path)?;
+        let path = self.xattr_target(path)?;
         let name = util::create_cstr(name.as_bytes())?;
 
         // SAFETY: Calling C API as documented, with no special requirements.
         unsafe {
-            util::check_lx_errno(libc::lremovexattr(path.path.as_ptr(), name.as_ptr()))?;
+            util::check_lx_errno(if let Some(path) = &path {
+                libc::lremovexattr(path.path.as_ptr(), name.as_ptr())
+            } else {
+                libc::fremovexattr(self.root.as_raw_fd(), name.as_ptr())
+            })?;
         }
 
         Ok(())
@@ -436,6 +479,17 @@ impl LxVolume {
         let mut full_path = util::get_fd_path(&self.root)?;
         full_path.push(path);
         util::path_to_cstr(&full_path)
+    }
+
+    fn xattr_target(&self, path: &Path) -> lx::Result<Option<XattrPath<'_>>> {
+        if self.file_root {
+            if !path.as_os_str().is_empty() {
+                return Err(lx::Error::ENOTDIR);
+            }
+            Ok(None)
+        } else {
+            self.xattr_path(path).map(Some)
+        }
     }
 
     /// Returns a path for the `l*xattr` functions, which act on a final symbolic link itself.

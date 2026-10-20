@@ -101,6 +101,20 @@ impl LxVolume {
             None,
         )?;
 
+        #[expect(clippy::disallowed_methods, reason = "need actual canonical path here")]
+        let root_path = root_path.canonicalize()?;
+        Self::from_root(root, root_path, options)
+    }
+
+    pub fn from_opened(root: std::fs::File, options: &super::LxVolumeOptions) -> lx::Result<Self> {
+        Self::from_root(root.into(), PathBuf::new(), options)
+    }
+
+    fn from_root(
+        root: OwnedHandle,
+        root_path: PathBuf,
+        options: &super::LxVolumeOptions,
+    ) -> lx::Result<Self> {
         // Determine the capabilities of the file system.
         let fs_context = fs::FsContext::new(&root, fs::LX_DRVFS_DISABLE_NONE, false)?;
 
@@ -119,8 +133,7 @@ impl LxVolume {
         let block_size = fs::get_fs_block_size(&root);
         Ok(Self {
             root,
-            #[expect(clippy::disallowed_methods, reason = "need actual canonical path here")]
-            root_path: root_path.canonicalize()?,
+            root_path,
             state: VolumeState::new(fs_context, options, block_size),
         })
     }

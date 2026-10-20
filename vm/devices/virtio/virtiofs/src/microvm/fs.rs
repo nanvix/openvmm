@@ -15,6 +15,7 @@ use super::saved_state::MAX_DIRECTORY_BYTES;
 use super::saved_state::MAX_DIRECTORY_ENTRIES;
 use super::saved_state::MAX_HANDLES;
 use super::saved_state::MAX_INODES;
+use super::saved_state::OBJECT_PINNED_SCHEMA_VERSION;
 use super::saved_state::SUBTREE_POLICY_SCHEMA_VERSION;
 use super::saved_state::SavedHandle;
 use super::saved_state::SavedInode;
@@ -59,6 +60,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use virtio_resources::attachment::AttachmentKind;
+use virtio_resources::attachment::OpenedAttachment;
+use virtio_resources::fs::microvm::MicrovmFsRoot;
 
 pub(crate) fn attribute_timeout(fs: &VirtioFs) -> Duration {
     fs.microvm_profile().map_or(
@@ -150,8 +154,15 @@ fn open_microvm_volume(
     policy: &SubtreePolicy,
     volume_id: u32,
     file: bool,
+    opened: Option<&OpenedAttachment>,
 ) -> anyhow::Result<(Arc<VirtioFsVolume>, VirtioFsInode, lx::Stat)> {
-    let (directory, exposed_file, policy) = if file {
+    let (directory, exposed_file, policy) = if file && opened.is_some() {
+        anyhow::ensure!(
+            *policy == SubtreePolicy::default(),
+            "a pinned file child takes no subtree policy paths"
+        );
+        (root_path, Some(PathBuf::new()), policy.clone())
+    } else if file {
         anyhow::ensure!(
             *policy == SubtreePolicy::default(),
             "a microVM virtio-fs file child takes no denied, allowed, or writable paths"
@@ -178,7 +189,17 @@ fn open_microvm_volume(
         .readonly(read_only)
         .sandbox(true)
         .confine_paths(true);
-    let volume = mount_options.new_volume(directory)?;
+    let volume = if let Some(opened) = opened {
+        lxutil::LxVolume::from_opened(
+            opened
+                .file
+                .try_clone()
+                .context("failed to retain verified filesystem root")?,
+            &mount_options,
+        )?
+    } else {
+        mount_options.new_volume(directory)?
+    };
     let mut pinned_identities = HashMap::new();
     for (path, reachable_at) in policy.pinned_paths() {
         let stat = volume.lstat(&path)?;
@@ -222,20 +243,67 @@ impl VirtioFs {
         root_path: impl AsRef<Path>,
         profile: MicroVmVirtioFsProfile,
     ) -> anyhow::Result<Self> {
-        let root_path = root_path.as_ref();
         anyhow::ensure!(
             !profile.is_aggregate(),
             "microVM aggregate virtio-fs requires one host root per child"
         );
-        profile.validate_root_path(root_path)?;
+        Self::new_microvm_roots(&[(root_path.as_ref(), None)], profile)
+    }
+
+    /// Constructs an attachment from transferred pinned handles and explicit
+    /// live paths. The profile records the binding policy for save/restore.
+    pub fn new_microvm_verified(
+        roots: &[MicrovmFsRoot],
+        profile: MicroVmVirtioFsProfile,
+    ) -> anyhow::Result<Self> {
+        let roots = roots
+            .iter()
+            .map(|root| match root {
+                MicrovmFsRoot::LivePath(path) => (Path::new(path), None),
+                MicrovmFsRoot::ObjectPinned(opened) => (Path::new(""), Some(opened)),
+            })
+            .collect::<Vec<_>>();
+        Self::new_microvm_roots(&roots, profile)
+    }
+
+    fn new_microvm_roots(
+        roots: &[(&Path, Option<&OpenedAttachment>)],
+        profile: MicroVmVirtioFsProfile,
+    ) -> anyhow::Result<Self> {
+        let pinned = roots
+            .iter()
+            .map(|(_, opened)| opened.is_some())
+            .collect::<Vec<_>>();
+        let profile = profile.with_pinned_roots(&pinned)?;
+        if profile.is_aggregate() {
+            return Self::new_microvm_aggregate_roots(roots, profile);
+        }
+        let [root] = roots else {
+            anyhow::bail!("a single microVM filesystem requires exactly one root");
+        };
+        let (root_path, opened) = *root;
+        if let Some(opened) = opened {
+            opened.verify(
+                profile.attachment_id(),
+                AttachmentKind::Directory,
+                profile.is_readonly(),
+            )?;
+        } else {
+            profile.validate_root_path(root_path)?;
+        }
         let (_, root_inode, root_stat) = open_microvm_volume(
             root_path,
             profile.is_readonly(),
             profile.subtree_policy(),
             0,
             false,
+            opened,
         )?;
-        profile.validate_opened_root(root_path, &root_stat)?;
+        if opened.is_some() {
+            profile.validate_pinned_identity(&root_stat)?;
+        } else {
+            profile.validate_opened_root(root_path, &root_stat)?;
+        }
         let caller_identity = match profile.owner_mode() {
             MicroVmOwnerMode::Vmm => None,
             MicroVmOwnerMode::Caller => Some(CallerIdentity::for_export_root_owner(
@@ -274,19 +342,37 @@ impl VirtioFs {
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             profile.is_aggregate(),
-            "microVM virtio-fs with one host root is not an aggregate"
+            "microVM filesystem is not an aggregate"
         );
-        anyhow::ensure!(
-            root_paths.len() == profile.children().len(),
-            "microVM aggregate virtio-fs requires one host root per child"
-        );
-        let mut children = Vec::with_capacity(root_paths.len());
+        let roots = root_paths
+            .iter()
+            .map(|path| (path.as_ref(), None))
+            .collect::<Vec<_>>();
+        Self::new_microvm_roots(&roots, profile)
+    }
+
+    fn new_microvm_aggregate_roots(
+        roots: &[(&Path, Option<&OpenedAttachment>)],
+        profile: MicroVmVirtioFsProfile,
+    ) -> anyhow::Result<Self> {
+        let mut children = Vec::with_capacity(roots.len());
         let mut root_owner = None;
-        for (index, (child, root_path)) in profile.children().iter().zip(root_paths).enumerate() {
-            let root_path = root_path.as_ref();
-            child
-                .validate_root_path(root_path)
-                .with_context(|| format!("microVM aggregate child '{}'", child.name()))?;
+        for (index, (child, &(root_path, opened))) in
+            profile.children().iter().zip(roots).enumerate()
+        {
+            if let Some(opened) = opened {
+                let role = format!("{}/{}", profile.attachment_id(), child.name());
+                let kind = if child.is_file() {
+                    AttachmentKind::File
+                } else {
+                    AttachmentKind::Directory
+                };
+                opened.verify(&role, kind, child.is_readonly())?;
+            } else {
+                child
+                    .validate_root_path(root_path)
+                    .with_context(|| format!("microVM aggregate child '{}'", child.name()))?;
+            }
             let volume_id = u32::try_from(index + 1).context("too many aggregate children")?;
             let (volume, _, root_stat) = open_microvm_volume(
                 root_path,
@@ -294,10 +380,13 @@ impl VirtioFs {
                 child.subtree_policy(),
                 volume_id,
                 child.is_file(),
+                opened,
             )?;
-            child
-                .validate_opened_root(root_path, &root_stat)
-                .with_context(|| format!("microVM aggregate child '{}'", child.name()))?;
+            if opened.is_some() {
+                child.validate_pinned_identity(&root_stat)?;
+            } else {
+                child.validate_opened_root(root_path, &root_stat)?;
+            }
             // Caller ownership squashes guest root to one host identity, so
             // every child root must have the same owner.
             let owner = (root_stat.uid, root_stat.gid);
@@ -540,16 +629,19 @@ impl VirtioFs {
         );
         let schema_version = schema_version(profile);
         let policy = profile.subtree_policy();
-        let (denied_paths, allowed_paths, writable_paths) =
-            if schema_version == SUBTREE_POLICY_SCHEMA_VERSION {
-                (
-                    saved_policy_paths(policy.denied_paths()),
-                    saved_policy_paths(policy.allowed_paths()),
-                    saved_policy_paths(policy.writable_paths()),
-                )
-            } else {
-                (Vec::new(), Vec::new(), Vec::new())
-            };
+        let (denied_paths, allowed_paths, writable_paths) = if !profile.is_aggregate()
+            && matches!(
+                schema_version,
+                SUBTREE_POLICY_SCHEMA_VERSION | OBJECT_PINNED_SCHEMA_VERSION
+            ) {
+            (
+                saved_policy_paths(policy.denied_paths()),
+                saved_policy_paths(policy.allowed_paths()),
+                saved_policy_paths(policy.writable_paths()),
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
         Ok(SavedState {
             schema_version,
             attachment_id: profile.attachment_id().to_owned(),
@@ -576,6 +668,7 @@ impl VirtioFs {
             allowed_paths,
             writable_paths,
             aggregate_children: saved_aggregate_children(profile),
+            object_pinned: profile.is_object_pinned(),
         })
     }
 

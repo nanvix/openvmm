@@ -346,6 +346,16 @@ pub struct MicrovmCli {
     #[clap(long, value_name = "ROLE:DISK")]
     pub microvm_sandbox_block: Vec<MicrovmSandboxBlockCli>,
 
+    /// Version 1 caller-approved opened-object grants for every mapped root
+    /// and sandbox block. Requires the authenticated control console.
+    #[clap(long, value_name = "PATH", requires_all = ["microvm_control_auth_stdin", "microvm_attachment_receipts"])]
+    pub microvm_attachment_grants: Option<PathBuf>,
+
+    /// Atomically publish opened-object admission receipts before vCPU resume.
+    /// The destination must not exist. This is not a guest Ready notification.
+    #[clap(long, value_name = "PATH", requires = "microvm_attachment_grants")]
+    pub microvm_attachment_receipts: Option<PathBuf>,
+
     /// Run guest workloads under this fixed non-root numeric identity.
     ///
     /// The identity is part of the initial-boot command line and cannot be
@@ -761,6 +771,8 @@ impl Options {
                     && self.microvm.microvm_mount_write.is_empty()
                     && self.microvm.microvm_mount_owner.is_none()
                     && self.microvm.microvm_sandbox_block.is_empty()
+                    && self.microvm.microvm_attachment_grants.is_none()
+                    && self.microvm.microvm_attachment_receipts.is_none()
                     && self.microvm.microvm_workload_identity.is_none()
                     && self.microvm.microvm_lifecycle.is_none()
                     && self.microvm.microvm_report.is_none()
@@ -780,6 +792,13 @@ impl Options {
         anyhow::ensure!(
             cfg!(guest_arch = "x86_64"),
             "microVM requires an x86-64 guest"
+        );
+        anyhow::ensure!(
+            self.microvm.microvm_attachment_grants.is_some()
+                == self.microvm.microvm_attachment_receipts.is_some()
+                && (self.microvm.microvm_attachment_grants.is_none()
+                    || self.microvm.microvm_control_auth_stdin),
+            "attachment grants and receipts require each other and the authenticated control console"
         );
         let ramfs_overlay =
             openvmm_defs::microvm::ramfs_overlay_requested(&self.cmdline.join(" "))?;

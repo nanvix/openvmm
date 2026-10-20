@@ -138,7 +138,8 @@ openvmm --machine microvm \
   child. `--mount` shares only a directory, because the guest mounts the
   device's root, which is always a directory.
 
-HostFs opens the file's directory and resolves the file by its name for each
+Without a versioned object-pinned grant, HostFs opens the file's directory
+and resolves the file by its name for each
 request, as it resolves a path inside a shared directory, but the guest
 receives no node of the directory, and HostFs also hides the directory's
 root behind the file. A host program that replaces the file by renaming
@@ -153,6 +154,40 @@ guest's mount can carry the read-write children, and the profile adds
 `virtfs_aggregate=1`, so the guest can tell the aggregate's root from a
 single shared directory. Active attachment policies and their canonical
 absolute host paths become snapshot-authoritative.
+
+### Verified opened roots
+
+`--microvm-attachment-grants <PATH>` opts a launch into version 1
+opened-object authorization. It requires
+`--microvm-attachment-receipts <PATH>` and the capability-authenticated
+control console. The grant set explicitly selects `object-pinned` or
+`live-path` for each filesystem root. Without this option, existing pathname
+semantics are unchanged.
+
+For `object-pinned`, OpenVMM compares the caller's device/inode identity on
+Linux, or volume serial number and 128-bit file ID on Windows, against the
+handle it actually opens. It checks the object kind and RO/RW mode, rejects
+overlap with the caller's mandatory protected-root set, and transfers that
+same handle to HostFs. A file child serves only that object, including through
+held guest nodes and new lookups after its host pathname is replaced. It
+never reopens that pathname. A directory root stays pinned, while permitted
+changes below it continue to follow its subtree policy. Failure to retain or
+reopen the authorized object is an error, not permission to follow its name.
+
+An explicit `live-path` file child keeps the replacement behavior described
+above. One aggregate can contain both policies. New pinned device state
+records the policy under schema version 10, so a restore cannot downgrade it
+to live paths, and readers that cannot enforce pinning reject it. Existing
+snapshots retain their exact identity, path, kind, mode, and policy checks;
+this option does not enable dormant-to-aggregate restore.
+
+Receipts record the observed identities, stable roles and modes, and share
+the control console's authenticated instance ID. They are published only
+after the VM worker has resolved the attachments and validated restored
+device state, before vCPU resume. Receipt publication failure stops the VM.
+A receipt proves attachment admission, not guest Ready: the caller must also
+authenticate that instance and complete its own activation/Ready protocol.
+See the [CLI contract](../../openvmm/management/cli.md) for the handoff format.
 
 ### Access policy
 
